@@ -228,7 +228,7 @@ def get_all_positions() -> list:
     })
     if result.get("code") != "00000":
         return []
-    return [p for p in result.get("data", [])
+    return [p for p in (result.get("data") or [])
             if float(p.get("total", 0)) > 0]
 
 
@@ -241,7 +241,7 @@ def get_recent_fills_all(since_ms: int) -> list:
     })
     if result.get("code") != "00000":
         return []
-    return result.get("data", {}).get("fillList", [])
+    return (result.get("data") or {}).get("fillList") or []
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -449,7 +449,6 @@ def set_sl_at_entry(symbol: str, direction: str, entry_price: float):
         "holdSide":             direction,
         "stopLossTriggerPrice": sl_str,
         "stopLossTriggerType":  "mark_price",
-        "stopLossExecutePrice": "0",
     })
 
     if result.get("code") == "00000":
