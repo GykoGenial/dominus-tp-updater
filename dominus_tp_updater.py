@@ -7,6 +7,7 @@ Finanzmathematische Optimierungen:
   ② R:R-Filter        — kein Trade unter 1.5 R:R
   ③ Kelly-Kriterium   — optimale Positionsgrösse
   ④ Asymm. TPs        — 15/20/25/40% statt 25/25/25/25%
+  ⑤ Telegram Polling  — /berechnen /trade /status /hilfe
 
 WAS PASSIERT AUTOMATISCH:
   1. Neuer Trade erkannt → Hebel-Check + R:R-Check
@@ -87,6 +88,7 @@ last_known_size:  dict = {}   # {symbol: position_size}
 sl_at_entry:      dict = {}   # {symbol: bool}
 new_trade_done:   dict = {}   # {symbol: bool} — DCA bereits gesetzt?
 price_decimals_cache: dict = {}
+last_update_id:   int  = 0    # Telegram: letzter verarbeiteter Update-ID
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -750,6 +752,310 @@ def update_tp_for_position(pos: dict, reason: str):
 
 
 # ═══════════════════════════════════════════════════════════════
+# TELEGRAM BOT — EINGEHENDE BEFEHLE
+# ═══════════════════════════════════════════════════════════════
+
+def get_telegram_updates() -> list:
+    """Holt neue Nachrichten vom Telegram Bot (Long Polling)."""
+    global last_update_id
+    if not TELEGRAM_TOKEN:
+        return []
+    try:
+        r = requests.get(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
+            params={"offset": last_update_id + 1, "timeout": 1, "limit": 10},
+            timeout=5
+        )
+        data = r.json()
+        if not data.get("ok"):
+            return []
+        updates = data.get("result", [])
+        if updates:
+            last_update_id = updates[-1]["update_id"]
+        return updates
+    except Exception:
+        return []
+
+
+def reply(text: str):
+    """Sendet Antwort an den Telegram Chat."""
+    telegram(text)
+
+
+def cmd_berechnen():
+    """
+    /berechnen — Kontostand + offene Positionen + Money-Management Check
+    """
+    balance  = get_futures_balance()
+    max_10   = balance * 0.10
+    per_ord  = max_10 / 3
+    kelly    = kelly_recommendation(balance, WINRATE)
+    positions = get_all_positions()
+
+    lines = [
+        "💰 <b>Kontostand & Status</b>",
+        f"━━━━━━━━━━━━━━━━━━━━━━",
+        f"Konto:        {balance:.2f} USDT",
+        f"10%-Limit:    {max_10:.2f} USDT",
+        f"Pro Order (÷3): {per_ord:.2f} USDT",
+        f"",
+        f"📊 Kelly ({WINRATE*100:.0f}% Winrate):",
+        f"  Empfohlen:  {kelly['kelly_pct']}% = {kelly['kelly_usdt']:.2f} USDT",
+        f"  Half-Kelly: {kelly['half_kelly_pct']}% = {kelly['half_kelly_usdt']:.2f} USDT",
+    ]
+
+    if positions:
+        lines += ["", f"📈 <b>Offene Positionen ({len(positions)}):</b>"]
+        all_secured = True
+        for pos in positions:
+            sym  = pos.get("symbol", "?")
+            qty  = float(pos.get("total", 0))
+            avg  = float(pos.get("openPriceAvg", 0))
+            lev  = int(float(pos.get("leverage", 10)))
+            drct = pos.get("holdSide", "?").upper()
+            pnl  = float(pos.get("unrealizedPL", 0))
+            secured = sl_at_entry.get(sym, False)
+            if not secured:
+                all_secured = False
+            icon = "🔒" if secured else "⚠️"
+            lines.append(
+                f"{icon} {sym} {drct} {lev}x | "
+                f"Qty={qty} | Avg={avg:.4f} | PnL={pnl:+.2f}"
+            )
+
+        if all_secured:
+            lines += ["", "✅ Alle Positionen gesichert → neuer Trade möglich"]
+        else:
+            lines += [
+                "",
+                "⚠️ Noch nicht alle Positionen auf SL=Entry",
+                "→ Kein neuer Trade empfohlen (DOMINUS-Regel)"
+            ]
+    else:
+        lines += ["", "✅ Keine offenen Positionen → bereit für neuen Trade"]
+
+    lines += [
+        "",
+        "📋 <b>Befehle:</b>",
+        "/berechnen — dieser Status",
+        "/trade SYMBOL LONG|SHORT HEBEL ENTRY SL",
+        "   Beispiel: /trade ETHUSDT LONG 10 2850 2700",
+        "/hilfe — alle Befehle"
+    ]
+    reply("\n".join(lines))
+
+
+def cmd_trade(parts: list):
+    """
+    /trade ETHUSDT LONG 10 2850 2700
+    Berechnet Setup-Vorschau ohne etwas auszuführen.
+    """
+    if len(parts) < 6:
+        reply(
+            "❌ Falsches Format\n"
+            "Korrekt: /trade SYMBOL LONG|SHORT HEBEL ENTRY SL\n"
+            "Beispiel: /trade ETHUSDT LONG 10 2850 2700"
+        )
+        return
+
+    try:
+        symbol    = parts[1].upper().replace("/", "").replace("-", "")
+        if not symbol.endswith("USDT"):
+            symbol += "USDT"
+        direction = parts[2].lower()
+        leverage  = int(parts[3])
+        entry     = float(parts[4])
+        sl        = float(parts[5])
+    except (ValueError, IndexError):
+        reply("❌ Ungültige Werte. Zahlen für Hebel, Entry und SL eingeben.")
+        return
+
+    if direction not in ("long", "short"):
+        reply("❌ Richtung muss LONG oder SHORT sein.")
+        return
+
+    # Validierungen
+    if direction == "long" and sl >= entry:
+        reply(f"❌ SL ({sl}) muss bei Long unter Entry ({entry}) liegen.")
+        return
+    if direction == "short" and sl <= entry:
+        reply(f"❌ SL ({sl}) muss bei Short über Entry ({entry}) liegen.")
+        return
+
+    # Berechnungen
+    balance      = get_futures_balance()
+    max_margin   = balance * 0.10
+    per_order    = max_margin / 3
+    sl_dist_pct  = abs(entry - sl) / entry * 100
+    opt_leverage = calc_optimal_leverage(entry, sl)
+    rr           = calc_rr(entry, sl, leverage, direction)
+    kelly        = kelly_recommendation(balance, WINRATE)
+
+    # Position pro Order
+    contracts = (per_order * leverage) / entry
+
+    # DCA Preise
+    sl_dist = abs(entry - sl)
+    if direction == "long":
+        dca1 = entry - sl_dist * DCA1_RATIO
+        dca2 = entry - sl_dist * DCA2_RATIO
+    else:
+        dca1 = entry + sl_dist * DCA1_RATIO
+        dca2 = entry + sl_dist * DCA2_RATIO
+
+    # TPs
+    tps = []
+    for roi, label in [
+        (TP1_ROI, "TP1 (10%)"),
+        (TP2_ROI, "TP2 (20%)"),
+        (TP3_ROI, "TP3 (30%)"),
+        (TP4_ROI, "TP4 (40%)")
+    ]:
+        factor = roi / leverage
+        if direction == "long":
+            tp = entry * (1 + factor)
+        else:
+            tp = entry * (1 - factor)
+        tps.append(f"  {label}: {tp:.4f}")
+
+    # Warnungen
+    warnings = []
+    if rr < MIN_RR:
+        warnings.append(f"⚠️ R:R {rr} unter Minimum {MIN_RR}!")
+    if abs(leverage - opt_leverage) > 2:
+        warnings.append(
+            f"⚠️ Empfohlener Hebel: {opt_leverage}x (aktuell: {leverage}x)"
+        )
+    if per_order * 3 > max_margin * 1.05:
+        warnings.append("⚠️ Setup überschreitet 10%-Limit!")
+
+    rr_icon = "✅" if rr >= MIN_RR else "⚠️"
+    lev_icon = "✅" if abs(leverage - opt_leverage) <= 2 else "⚠️"
+
+    lines = [
+        f"🧮 <b>Trade-Berechnung — {symbol}</b>",
+        f"━━━━━━━━━━━━━━━━━━━━━━",
+        f"Richtung: {direction.upper()} | Hebel: {leverage}x",
+        f"Entry: {entry} | SL: {sl} ({sl_dist_pct:.1f}%)",
+        f"",
+        f"📐 <b>Analyse:</b>",
+        f"{rr_icon} R:R: {rr} (Min: {MIN_RR})",
+        f"{lev_icon} Empf. Hebel: {opt_leverage}x",
+        f"",
+        f"📦 <b>Orders (je {contracts:.2f} Kontrakte):</b>",
+        f"  Market:  {entry}",
+        f"  DCA1:    {dca1:.4f}",
+        f"  DCA2:    {dca2:.4f}",
+        f"  SL:      {sl}",
+        f"",
+        f"🎯 <b>Take-Profits (15/20/25/40%):</b>",
+    ] + tps + [
+        f"",
+        f"💰 <b>Money Management:</b>",
+        f"  Konto:        {balance:.2f} USDT",
+        f"  Pro Order:    {per_order:.2f} USDT",
+        f"  Total Setup:  {per_order*3:.2f} USDT ({per_order*3/balance*100:.1f}%)",
+        f"  Kelly:        {kelly['kelly_pct']}% empfohlen",
+    ]
+
+    if warnings:
+        lines += ["", "⚠️ <b>Warnungen:</b>"] + warnings
+
+    lines += [
+        "",
+        "✅ Platziere Market Order + SL auf Bitget.",
+        "Script setzt DCA + TPs automatisch."
+    ]
+
+    reply("\n".join(lines))
+
+
+def cmd_hilfe():
+    reply(
+        "🤖 <b>DOMINUS Bot — Befehle</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "/berechnen — Kontostand, offene Positionen, Money-Management\n"
+        "/trade SYMBOL LONG|SHORT HEBEL ENTRY SL\n"
+        "   → Berechnet Trade-Setup (führt nichts aus)\n"
+        "   Beispiel: /trade ETHUSDT LONG 10 2850 2700\n"
+        "/status — Kurzstatus aller Positionen\n"
+        "/hilfe — diese Übersicht\n"
+        "\n"
+        "Das Script setzt nach deinem Einstieg automatisch:\n"
+        "• DCA1 + DCA2 Limit-Orders\n"
+        "• TP1–TP4 (15/20/25/40%)\n"
+        "• SL auf Entry nach TP1"
+    )
+
+
+def cmd_status():
+    """Kurzer Positionsstatus."""
+    positions = get_all_positions()
+    if not positions:
+        reply("✅ Keine offenen Positionen.")
+        return
+    lines = [f"📊 <b>{len(positions)} offene Position(en):</b>"]
+    for pos in positions:
+        sym  = pos.get("symbol", "?")
+        qty  = float(pos.get("total", 0))
+        drct = pos.get("holdSide", "?").upper()
+        lev  = int(float(pos.get("leverage", 10)))
+        pnl  = float(pos.get("unrealizedPL", 0))
+        mark = get_mark_price(sym)
+        secured = sl_at_entry.get(sym, False)
+        icon = "🔒" if secured else "📈"
+        lines.append(
+            f"{icon} {sym} {drct} {lev}x | "
+            f"Qty={qty:.2f} | Mark={mark} | PnL={pnl:+.2f} USDT"
+        )
+    reply("\n".join(lines))
+
+
+def poll_telegram_commands():
+    """
+    Prüft auf neue Telegram-Nachrichten und führt Befehle aus.
+    Wird jeden Loop-Durchlauf aufgerufen.
+    Nur Nachrichten von TELEGRAM_CHAT_ID werden akzeptiert (Sicherheit).
+    """
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+
+    updates = get_telegram_updates()
+    for update in updates:
+        msg = update.get("message") or update.get("edited_message")
+        if not msg:
+            continue
+
+        # Sicherheit: nur eigene Chat-ID
+        chat_id = str(msg.get("chat", {}).get("id", ""))
+        if chat_id != str(TELEGRAM_CHAT_ID):
+            continue
+
+        text = msg.get("text", "").strip()
+        if not text.startswith("/"):
+            continue
+
+        parts = text.split()
+        cmd   = parts[0].lower().split("@")[0]  # /berechnen@BotName → /berechnen
+
+        log(f"Telegram Befehl empfangen: {text}")
+
+        if cmd == "/berechnen":
+            cmd_berechnen()
+        elif cmd == "/trade":
+            cmd_trade(parts)
+        elif cmd == "/status":
+            cmd_status()
+        elif cmd == "/hilfe" or cmd == "/start" or cmd == "/help":
+            cmd_hilfe()
+        else:
+            reply(
+                f"❓ Unbekannter Befehl: {cmd}\n"
+                "Sende /hilfe für alle Befehle."
+            )
+
+
+# ═══════════════════════════════════════════════════════════════
 # MAIN LOOP
 # ═══════════════════════════════════════════════════════════════
 
@@ -788,6 +1094,9 @@ def main():
     while True:
         time.sleep(POLL_INTERVAL)
         try:
+            # ── 0. Telegram-Befehle prüfen ─────────────────
+            poll_telegram_commands()
+
             # ── 1. Neue Fills (Nachkäufe / Einstiege) ──────
             fills      = get_recent_fills_all(last_check_ms)
             open_fills = [f for f in fills if f.get("tradeSide") == "open"]
