@@ -53,6 +53,10 @@ BASE_URL = "https://api.bitget.com"
 
 # Cache: letzter bekannter Avg-Preis pro Symbol
 last_known_avg: dict = {}
+# Cache: letzte bekannte Positionsgrösse pro Symbol (für TP1-Erkennung)
+last_known_size: dict = {}
+# Cache: ob SL bereits auf Entry gezogen wurde
+sl_at_entry: dict = {}
 # Cache: Preis-Präzision pro Symbol (Anzahl Dezimalstellen)
 price_decimals_cache: dict = {}
 
@@ -341,6 +345,36 @@ def place_tp_orders(symbol: str, avg: float, size: float,
 # HAUPT-UPDATE FUNKTION
 # ═══════════════════════════════════════════════════════════════
 
+def set_sl_at_entry(symbol: str, direction: str, entry_price: float):
+    """
+    Setzt den Stop Loss auf den Einstiegspreis (Break-Even).
+    Wird nach TP1-Auslösung aufgerufen — DOMINUS-Regel.
+    """
+    decimals = get_price_decimals(symbol)
+    sl_str   = round_price(entry_price, decimals)
+
+    result = api_post("/api/v2/mix/order/place-pos-tpsl", {
+        "symbol":               symbol,
+        "productType":          PRODUCT_TYPE,
+        "marginCoin":           MARGIN_COIN,
+        "holdSide":             direction,
+        "stopLossTriggerPrice": sl_str,
+        "stopLossTriggerType":  "mark_price",
+        "stopLossExecutePrice": "0",
+    })
+
+    if result.get("code") == "00000":
+        log(f"  ✓ SL auf Entry gezogen: {sl_str} USDT ({symbol})")
+        telegram(
+            f"🔒 <b>SL auf Entry — {symbol}</b>\n"
+            f"TP1 ausgelöst → SL auf {sl_str} USDT\n"
+            f"Position abgesichert."
+        )
+        sl_at_entry[symbol] = True
+    else:
+        log(f"  ✗ SL-Anpassung fehlgeschlagen: {result.get('msg', result)}")
+
+
 def update_tp_for_position(pos: dict, reason: str):
     symbol    = pos.get("symbol", "?")
     direction = pos.get("holdSide", "long")
@@ -383,6 +417,7 @@ def update_tp_for_position(pos: dict, reason: str):
 
     # Immer setzen — verhindert Endlos-Loop wenn TPs fehlschlagen
     last_known_avg[symbol] = avg
+    last_known_size[symbol] = total  # Grösse für TP1-Erkennung speichern
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -433,16 +468,38 @@ def main():
                             pos, f"Nachkauf ({len(open_fills)} Fill(s))"
                         )
             else:
-                # 2. Fallback: Avg-Preis-Änderung erkennen
+                # 2. Positionen auf Änderungen prüfen
                 for pos in get_all_positions():
-                    sym     = pos.get("symbol", "")
-                    cur_avg = float(pos.get("openPriceAvg", 0))
-                    kno_avg = last_known_avg.get(sym, 0)
-                    if cur_avg > 0 and cur_avg != kno_avg:
+                    sym      = pos.get("symbol", "")
+                    cur_avg  = float(pos.get("openPriceAvg", 0))
+                    cur_size = float(pos.get("total", 0))
+                    kno_avg  = last_known_avg.get(sym, 0)
+                    kno_size = last_known_size.get(sym, 0)
+                    direction = pos.get("holdSide", "long")
+
+                    # TP1-Erkennung: Grösse um ~25% gesunken + SL noch nicht gesetzt
+                    if (kno_size > 0
+                            and cur_size < kno_size * 0.85
+                            and not sl_at_entry.get(sym, False)):
+                        reduction = (kno_size - cur_size) / kno_size * 100
+                        log(f"TP1 erkannt ({sym}): "
+                            f"Grösse {kno_size:.2f} → {cur_size:.2f} "
+                            f"(-{reduction:.0f}%) → SL auf Entry ziehen")
+                        set_sl_at_entry(sym, direction, cur_avg)
+                        last_known_size[sym] = cur_size
+
+                    # Avg-Preis Änderung: Nachkauf ohne Fill erkannt
+                    elif cur_avg > 0 and cur_avg != kno_avg:
                         log(f"Avg-Preis geändert ({sym}): "
                             f"{kno_avg} → {cur_avg}")
                         log(f"══ TP-Anpassung: {sym} ══")
+                        # SL-Status zurücksetzen (neuer Entry)
+                        sl_at_entry[sym] = False
                         update_tp_for_position(pos, "Avg-Preis Änderung")
+
+                    # Grösse aktualisieren ohne TP1-Trigger (erste Erkennung)
+                    elif kno_size == 0 and cur_size > 0:
+                        last_known_size[sym] = cur_size
 
         except requests.exceptions.ConnectionError:
             log("Verbindungsfehler. Retry in 30s...")
