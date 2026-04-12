@@ -1,0 +1,1 @@
+worker: python dominus_tp_updater.py
