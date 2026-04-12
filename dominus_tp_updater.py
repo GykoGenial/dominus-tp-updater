@@ -1,26 +1,24 @@
 """
-DOMINUS TP Auto-Updater
+DOMINUS TP Auto-Updater v2
 ══════════════════════════════════════════════════════════════
-Erkennt automatisch wenn eine Nachkauf-Limit-Order auf Bitget
-ausgeführt wird und passt die 4 TP-Level (TP1–TP4) entsprechend
-dem neuen Durchschnittspreis an.
+Erkennt automatisch ALLE offenen Positionen auf Bitget und
+passt die TP-Level bei jedem Nachkauf automatisch an.
+
+Kein fixes SYMBOL nötig — das Script scannt alle Positionen.
 
 DOMINUS-Logik:
-  TP1 = Avg + (Avg * 10% / Hebel) → schliesst 25% der Position
-  TP2 = Avg + (Avg * 20% / Hebel) → schliesst 25% der Position
-  TP3 = Avg + (Avg * 30% / Hebel) → schliesst 25% der Position
-  TP4 = Avg + (Avg * 40% / Hebel) → schliesst 25% der Position
+  TP1 = Avg + (Avg * 10% / Hebel) → schliesst 25%
+  TP2 = Avg + (Avg * 20% / Hebel) → schliesst 25%
+  TP3 = Avg + (Avg * 30% / Hebel) → schliesst 25%
+  TP4 = Avg + (Avg * 40% / Hebel) → schliesst 25%
 
-EINRICHTUNG:
-  1. Python 3.8+ installieren
-  2. pip install requests
-  3. Konfiguration unten anpassen (API_KEY, SECRET_KEY etc.)
-  4. Script starten: python dominus_tp_updater.py
-
-SICHERHEIT:
-  - API-Key: nur "Lesen" + "Futures Trading" Berechtigung nötig
-  - KEIN Withdraw-Recht vergeben!
-  - IP-Whitelist in Bitget setzen (empfohlen)
+RAILWAY VARIABLES:
+  API_KEY           → Bitget API Key
+  SECRET_KEY        → Bitget Secret Key
+  PASSPHRASE        → Bitget Passphrase
+  LEVERAGE          → Hebel (Standard: 10)
+  TELEGRAM_TOKEN    → optional
+  TELEGRAM_CHAT_ID  → optional
 ══════════════════════════════════════════════════════════════
 """
 
@@ -29,51 +27,48 @@ import hmac
 import base64
 import time
 import json
+import os
 import requests
 import math
 from datetime import datetime
 
 # ═══════════════════════════════════════════════════════════════
-# KONFIGURATION — hier anpassen
+# KONFIGURATION — aus Railway Variables (keine fixen Werte nötig)
 # ═══════════════════════════════════════════════════════════════
 
-API_KEY      = "DEIN_API_KEY"        # Bitget API Key
-SECRET_KEY   = "DEIN_SECRET_KEY"     # Bitget Secret Key
-PASSPHRASE   = "DEIN_PASSPHRASE"     # Bitget API Passphrase
+API_KEY    = os.environ.get("API_KEY", "")
+SECRET_KEY = os.environ.get("SECRET_KEY", "")
+PASSPHRASE = os.environ.get("PASSPHRASE", "")
 
-SYMBOL       = "ETHUSDT"             # z.B. BTCUSDT, SOLUSDT, ETHUSDT
-PRODUCT_TYPE = "usdt-futures"        # immer so lassen für USDT Perps
+PRODUCT_TYPE = "usdt-futures"
 MARGIN_COIN  = "USDT"
-LEVERAGE     = 10                    # dein Hebel
-DIRECTION    = "long"                # "long" oder "short"
 
-# TP-Levels nach DOMINUS (% ROI auf eingesetztes Kapital)
-TP1_ROI = 0.10   # 10% → TP1
-TP2_ROI = 0.20   # 20% → TP2
-TP3_ROI = 0.30   # 30% → TP3
-TP4_ROI = 0.40   # 40% → TP4
-
-# Jede TP-Stufe schliesst 25% der Position
+TP1_ROI      = 0.10
+TP2_ROI      = 0.20
+TP3_ROI      = 0.30
+TP4_ROI      = 0.40
 TP_CLOSE_PCT = 0.25
 
-# Wie oft prüfen? (Sekunden)
 POLL_INTERVAL = 20
 
-# Telegram-Benachrichtigung (optional, leer lassen wenn nicht gewünscht)
-TELEGRAM_TOKEN  = ""    # z.B. "123456789:ABCdef..."
-TELEGRAM_CHAT_ID = ""   # z.B. "-1001234567890"
+TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-# ═══════════════════════════════════════════════════════════════
 BASE_URL = "https://api.bitget.com"
+
+# Speichert letzten bekannten Avg-Preis pro Symbol
+last_known_avg: dict = {}
+
+
+# ═══════════════════════════════════════════════════════════════
+# HILFSFUNKTIONEN
 # ═══════════════════════════════════════════════════════════════
 
+def log(msg: str):
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
-def log(msg):
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
 
-
-def telegram(msg):
-    """Sendet Nachricht an Telegram wenn konfiguriert."""
+def telegram(msg: str):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
     try:
@@ -87,7 +82,6 @@ def telegram(msg):
 
 
 def sign(timestamp: str, method: str, path: str, body: str = "") -> str:
-    """Erstellt HMAC-SHA256 Signatur für Bitget API."""
     message = timestamp + method.upper() + path + body
     signature = hmac.new(
         SECRET_KEY.encode("utf-8"),
@@ -97,8 +91,7 @@ def sign(timestamp: str, method: str, path: str, body: str = "") -> str:
     return base64.b64encode(signature).decode("utf-8")
 
 
-def headers(method: str, path: str, body: str = "") -> dict:
-    """Erstellt authentifizierte Header für Bitget API."""
+def make_headers(method: str, path: str, body: str = "") -> dict:
     ts = str(int(time.time() * 1000))
     return {
         "ACCESS-KEY":        API_KEY,
@@ -111,55 +104,52 @@ def headers(method: str, path: str, body: str = "") -> dict:
 
 
 def api_get(path: str, params: dict = None) -> dict:
-    """GET Request zur Bitget API."""
     query = ""
     if params:
         query = "?" + "&".join(f"{k}={v}" for k, v in params.items())
     full_path = path + query
     r = requests.get(
         BASE_URL + full_path,
-        headers=headers("GET", full_path),
+        headers=make_headers("GET", full_path),
         timeout=10
     )
     return r.json()
 
 
 def api_post(path: str, body: dict) -> dict:
-    """POST Request zur Bitget API."""
     body_str = json.dumps(body)
     r = requests.post(
         BASE_URL + path,
-        headers=headers("POST", path, body_str),
+        headers=make_headers("POST", path, body_str),
         data=body_str,
         timeout=10
     )
     return r.json()
 
 
-def get_position() -> dict | None:
-    """Holt aktuelle Position (avg Preis, Grösse, etc.)."""
-    result = api_get("/api/v2/mix/position/single-position", {
-        "symbol":      SYMBOL,
+# ═══════════════════════════════════════════════════════════════
+# KERNFUNKTIONEN
+# ═══════════════════════════════════════════════════════════════
+
+def get_all_positions() -> list:
+    """Holt ALLE offenen Positionen – kein fixes Symbol nötig."""
+    result = api_get("/api/v2/mix/position/all-position", {
         "productType": PRODUCT_TYPE,
         "marginCoin":  MARGIN_COIN,
     })
     if result.get("code") != "00000":
-        log(f"Fehler beim Abrufen der Position: {result}")
-        return None
-    data = result.get("data", [])
-    for pos in data:
-        if pos.get("holdSide") == DIRECTION:
-            return pos
-    return None
+        log(f"Fehler beim Abrufen der Positionen: {result}")
+        return []
+    positions = result.get("data", [])
+    return [p for p in positions if float(p.get("total", 0)) > 0]
 
 
-def get_recent_fills(since_ms: int) -> list:
-    """Holt kürzlich ausgeführte Orders (Fills)."""
+def get_recent_fills_all(since_ms: int) -> list:
+    """Holt kürzlich ausgeführte Orders über ALLE Symbole."""
     result = api_get("/api/v2/mix/order/fill-history", {
-        "symbol":      SYMBOL,
         "productType": PRODUCT_TYPE,
         "startTime":   str(since_ms),
-        "limit":       "20",
+        "limit":       "50",
     })
     if result.get("code") != "00000":
         log(f"Fehler beim Abrufen der Fills: {result}")
@@ -167,201 +157,180 @@ def get_recent_fills(since_ms: int) -> list:
     return result.get("data", {}).get("fillList", [])
 
 
-def cancel_all_tp_orders():
-    """Storniert alle bestehenden TP-Orders für dieses Symbol."""
+def cancel_all_tp_orders(symbol: str):
+    """Storniert alle bestehenden TP-Orders für ein Symbol."""
     result = api_get("/api/v2/mix/order/tpsl-pending-orders", {
-        "symbol":      SYMBOL,
+        "symbol":      symbol,
         "productType": PRODUCT_TYPE,
         "isPlan":      "profit_plan",
     })
     if result.get("code") != "00000":
-        log(f"Fehler beim Abrufen der TP-Orders: {result}")
+        log(f"  Fehler TP-Orders abrufen ({symbol}): {result}")
         return
 
-    orders = result.get("data", {}).get("entrustedList", [])
+    orders    = result.get("data", {}).get("entrustedList", [])
     tp_orders = [o for o in orders if o.get("planType") == "profit_plan"]
-    log(f"Bestehende TP-Orders: {len(tp_orders)} gefunden, werden storniert...")
 
+    if not tp_orders:
+        log(f"  Keine bestehenden TP-Orders für {symbol}.")
+        return
+
+    log(f"  {len(tp_orders)} TP-Order(s) für {symbol} stornieren...")
     for order in tp_orders:
-        cancel_result = api_post("/api/v2/mix/order/cancel-plan-order", {
-            "symbol":      SYMBOL,
+        res = api_post("/api/v2/mix/order/cancel-plan-order", {
+            "symbol":      symbol,
             "productType": PRODUCT_TYPE,
             "marginCoin":  MARGIN_COIN,
             "orderId":     order.get("orderId"),
         })
-        if cancel_result.get("code") == "00000":
-            log(f"  ✓ TP storniert: {order.get('orderId')}")
-        else:
-            log(f"  ✗ Stornierung fehlgeschlagen: {cancel_result}")
+        status = "✓" if res.get("code") == "00000" else "✗"
+        log(f"    {status} {order.get('orderId')}")
 
 
-def calc_tp_price(avg_price: float, roi_pct: float) -> float:
-    """
-    Berechnet TP-Preis basierend auf avg Preis, ROI und Hebel.
-    Long:  avg * (1 + roi / leverage)
-    Short: avg * (1 - roi / leverage)
-    """
-    factor = roi_pct / LEVERAGE
-    if DIRECTION == "long":
-        return avg_price * (1 + factor)
-    else:
-        return avg_price * (1 - factor)
+def calc_tp_price(avg: float, roi: float, direction: str, leverage: int) -> float:
+    factor = roi / leverage
+    return avg * (1 + factor) if direction == "long" else avg * (1 - factor)
 
 
 def round_price(price: float) -> str:
-    """Rundet auf sinnvolle Dezimalstellen."""
-    if price >= 1000:
-        return f"{price:.1f}"
-    elif price >= 10:
-        return f"{price:.3f}"
-    else:
-        return f"{price:.5f}"
+    if price >= 10000: return f"{price:.1f}"
+    if price >= 1000:  return f"{price:.2f}"
+    if price >= 10:    return f"{price:.3f}"
+    if price >= 1:     return f"{price:.4f}"
+    return f"{price:.5f}"
 
 
-def place_tp_orders(avg_price: float, total_size: float):
-    """
-    Setzt 4 neue TP-Orders nach DOMINUS-Schema:
-    TP1: 25% @ 10% ROI
-    TP2: 25% @ 20% ROI
-    TP3: 25% @ 30% ROI
-    TP4: 25% @ 40% ROI
-    """
-    # Grösse pro TP-Stufe (25% der Position, mind. 1 Kontrakt)
-    size_per_tp = max(1, math.floor(total_size * TP_CLOSE_PCT))
-
-    tps = [
-        (TP1_ROI, "TP1 (10%)", size_per_tp),
-        (TP2_ROI, "TP2 (20%)", size_per_tp),
-        (TP3_ROI, "TP3 (30%)", size_per_tp),
-        (TP4_ROI, "TP4 (40%)", size_per_tp),
+def place_tp_orders(symbol: str, avg: float, size: float, direction: str, leverage: int):
+    per_tp = max(1, math.floor(size * TP_CLOSE_PCT))
+    tps    = [
+        (TP1_ROI, "TP1 (10%)", per_tp),
+        (TP2_ROI, "TP2 (20%)", per_tp),
+        (TP3_ROI, "TP3 (30%)", per_tp),
+        (TP4_ROI, "TP4 (40%)", per_tp),
     ]
+    count  = 0
+    prices = []
 
-    success_count = 0
-    tp_prices = []
-
-    for roi, label, size in tps:
-        tp_price = calc_tp_price(avg_price, roi)
-        tp_price_str = round_price(tp_price)
-
-        result = api_post("/api/v2/mix/order/place-tpsl-order", {
-            "symbol":       SYMBOL,
+    for roi, label, qty in tps:
+        tp_str = round_price(calc_tp_price(avg, roi, direction, leverage))
+        res = api_post("/api/v2/mix/order/place-tpsl-order", {
+            "symbol":       symbol,
             "productType":  PRODUCT_TYPE,
             "marginCoin":   MARGIN_COIN,
             "planType":     "profit_plan",
-            "triggerPrice": tp_price_str,
+            "triggerPrice": tp_str,
             "triggerType":  "mark_price",
-            "executePrice": "0",           # Market Order bei Trigger
-            "holdSide":     DIRECTION,
-            "size":         str(size),
+            "executePrice": "0",
+            "holdSide":     direction,
+            "size":         str(qty),
         })
-
-        if result.get("code") == "00000":
-            log(f"  ✓ {label} gesetzt @ {tp_price_str} USDT (Grösse: {size})")
-            success_count += 1
-            tp_prices.append(f"{label}: {tp_price_str}")
+        if res.get("code") == "00000":
+            log(f"    ✓ {label} @ {tp_str} USDT (Qty: {qty})")
+            count += 1
+            prices.append(f"{label}: {tp_str}")
         else:
-            log(f"  ✗ {label} FEHLER: {result.get('msg', result)}")
+            log(f"    ✗ {label} FEHLER: {res.get('msg', res)}")
 
-    return success_count, tp_prices
+    return count, prices
 
 
-def update_tp(reason: str = "Nachkauf"):
-    """Hauptfunktion: Position holen → TPs stornieren → neue TPs setzen."""
-    log(f"══ TP-Anpassung gestartet (Grund: {reason}) ══")
+def update_tp_for_position(pos: dict, reason: str):
+    symbol    = pos.get("symbol", "?")
+    direction = pos.get("holdSide", "long")
+    avg       = float(pos.get("openPriceAvg", 0))
+    total     = float(pos.get("total", 0))
+    pnl       = float(pos.get("unrealizedPL", 0))
+    leverage  = int(float(pos.get("leverage", 10)))  # direkt aus Position
 
-    pos = get_position()
-    if not pos:
-        log("Keine offene Position gefunden. Überspringe.")
+    log(f"  {symbol} | {direction.upper()} | Avg={avg} | "
+        f"Qty={total} | Hebel={leverage}x | PnL={pnl:.2f} USDT")
+
+    if avg == 0 or total == 0:
+        log("  Ungültige Position. Überspringe.")
         return
 
-    avg_price  = float(pos.get("openPriceAvg", 0))
-    total_size = float(pos.get("total", 0))
-    unrealized = float(pos.get("unrealizedPL", 0))
+    cancel_all_tp_orders(symbol)
+    time.sleep(1)
 
-    log(f"Position: Avg={avg_price:.4f} | Grösse={total_size} | PnL={unrealized:.2f} USDT")
-
-    if avg_price == 0 or total_size == 0:
-        log("Ungültige Position. Überspringe.")
-        return
-
-    # Alte TPs stornieren
-    cancel_all_tp_orders()
-    time.sleep(1)  # kurz warten
-
-    # Neue TPs setzen
-    count, prices = place_tp_orders(avg_price, total_size)
+    count, prices = place_tp_orders(symbol, avg, total, direction, leverage)
 
     if count == 4:
-        msg = (
-            f"✅ <b>TP aktualisiert — {SYMBOL}</b>\n"
-            f"Avg-Preis: {avg_price:.4f} USDT\n"
+        telegram(
+            f"✅ <b>TP aktualisiert — {symbol}</b>\n"
+            f"Richtung: {direction.upper()}\n"
+            f"Avg-Preis: {avg} USDT\n"
+            f"Hebel: {leverage}x\n"
             f"Grund: {reason}\n\n"
             + "\n".join(prices)
         )
-        telegram(msg)
-        log(f"✓ Alle 4 TP-Orders erfolgreich gesetzt.")
+        log(f"  ✓ Alle 4 TPs für {symbol} gesetzt.")
+        last_known_avg[symbol] = avg
     else:
-        log(f"⚠ Nur {count}/4 TP-Orders gesetzt.")
+        log(f"  ⚠ Nur {count}/4 TPs für {symbol} gesetzt.")
 
+
+# ═══════════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════════
 
 def main():
-    log(f"DOMINUS TP-Updater gestartet")
-    log(f"Symbol: {SYMBOL} | Richtung: {DIRECTION} | Hebel: {LEVERAGE}x")
-    log(f"Poll-Intervall: {POLL_INTERVAL}s")
-    log("─" * 50)
+    if not API_KEY or not SECRET_KEY or not PASSPHRASE:
+        log("FEHLER: API_KEY, SECRET_KEY oder PASSPHRASE fehlen!")
+        log("In Railway unter Variables eintragen.")
+        return
 
-    # Beim Start direkt prüfen ob Position offen
-    pos = get_position()
-    if pos and float(pos.get("total", 0)) > 0:
-        log("Offene Position gefunden beim Start.")
-        update_tp("Script-Start")
+    log("DOMINUS TP-Updater v2 gestartet")
+    log(f"Intervall: {POLL_INTERVAL}s | Hebel wird pro Position automatisch erkannt")
+    log("Modus: Alle offenen Positionen werden automatisch erkannt")
+    log("─" * 55)
+
+    # Beim Start alle offenen Positionen sofort behandeln
+    positions = get_all_positions()
+    if positions:
+        log(f"{len(positions)} offene Position(en) beim Start:")
+        for pos in positions:
+            update_tp_for_position(pos, "Script-Start")
     else:
-        log("Keine offene Position beim Start. Warte auf Nachkauf...")
+        log("Keine offenen Positionen. Warte auf Trades...")
 
-    # Zeitstempel der letzten geprüften Order
     last_check_ms = int(time.time() * 1000)
-    last_known_avg = float(pos.get("openPriceAvg", 0)) if pos else 0
 
     while True:
         time.sleep(POLL_INTERVAL)
-
         try:
-            # Neue Fills seit letztem Check holen
-            new_fills = get_recent_fills(last_check_ms)
+            # 1. Neue Fills prüfen
+            fills      = get_recent_fills_all(last_check_ms)
+            open_fills = [f for f in fills if f.get("tradeSide") == "open"]
 
-            # Nur Buy-Orders für diese Richtung filtern
-            relevant_fills = [
-                f for f in new_fills
-                if f.get("side") == "buy" and f.get("tradeSide") == "open"
-            ]
-
-            if relevant_fills:
-                log(f"{len(relevant_fills)} neuer Nachkauf erkannt!")
+            if open_fills:
+                affected = set(f.get("symbol") for f in open_fills if f.get("symbol"))
+                log(f"Nachkauf erkannt: {', '.join(affected)}")
                 last_check_ms = int(time.time() * 1000)
-
-                # Kurz warten damit Bitget die Position aktualisiert
                 time.sleep(2)
 
-                # TP anpassen
-                update_tp(f"Nachkauf ({len(relevant_fills)} Fill(s))")
-                last_check_ms = int(time.time() * 1000)
-
+                all_pos = get_all_positions()
+                for pos in all_pos:
+                    if pos.get("symbol") in affected:
+                        log(f"══ TP-Anpassung: {pos.get('symbol')} ══")
+                        update_tp_for_position(
+                            pos, f"Nachkauf ({len(open_fills)} Fill(s))"
+                        )
             else:
-                # Stille Prüfung ob avg Preis sich verändert hat
-                pos = get_position()
-                if pos:
-                    current_avg = float(pos.get("openPriceAvg", 0))
-                    if current_avg != last_known_avg and current_avg > 0:
-                        log(f"Avg-Preis hat sich geändert: {last_known_avg:.4f} → {current_avg:.4f}")
-                        update_tp("Avg-Preis Änderung")
-                        last_known_avg = current_avg
-                        last_check_ms = int(time.time() * 1000)
+                # 2. Fallback: Avg-Preis-Änderung erkennen
+                for pos in get_all_positions():
+                    sym     = pos.get("symbol", "")
+                    cur_avg = float(pos.get("openPriceAvg", 0))
+                    kno_avg = last_known_avg.get(sym, 0)
+                    if cur_avg > 0 and cur_avg != kno_avg:
+                        log(f"Avg-Preis geändert ({sym}): {kno_avg} → {cur_avg}")
+                        log(f"══ TP-Anpassung: {sym} ══")
+                        update_tp_for_position(pos, "Avg-Preis Änderung")
 
         except requests.exceptions.ConnectionError:
-            log("Verbindungsfehler. Versuche erneut in 30s...")
+            log("Verbindungsfehler. Retry in 30s...")
             time.sleep(30)
         except requests.exceptions.Timeout:
-            log("Timeout. Versuche erneut...")
+            log("Timeout. Retry...")
         except Exception as e:
             log(f"Unerwarteter Fehler: {e}")
             time.sleep(10)
