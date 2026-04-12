@@ -690,6 +690,42 @@ def update_tp_for_position(pos: dict, reason: str):
         log("  Ungültige Position.")
         return
 
+    # Position zu klein für individuelle TP-Orders (< 4 Kontrakte)
+    if total < 4:
+        log(f"  ⚠ Position zu klein (Qty={total}) — "
+            f"setze nur 1 kombinierten TP für Gesamtposition")
+        # Einen einzigen TP für die gesamte Restposition
+        decimals = get_price_decimals(symbol)
+        tp_raw   = calc_tp_price(avg, TP2_ROI, direction, leverage)
+        tp_str   = round_price(tp_raw, decimals)
+        tp_val   = float(tp_str)
+        if mark_price > 0:
+            valid = (direction == "long" and tp_val > mark_price) or                     (direction == "short" and tp_val < mark_price)
+            if not valid:
+                log(f"  ⏭ Einzel-TP @ {tp_str} bereits überschritten")
+                last_known_avg[symbol]  = avg
+                last_known_size[symbol] = total
+                return
+        size_int = max(1, round(total))
+        res = api_post("/api/v2/mix/order/place-tpsl-order", {
+            "symbol":       symbol,
+            "productType":  PRODUCT_TYPE,
+            "marginCoin":   MARGIN_COIN,
+            "planType":     "profit_plan",
+            "triggerPrice": tp_str,
+            "triggerType":  "mark_price",
+            "executePrice": "0",
+            "holdSide":     direction,
+            "size":         str(size_int),
+        })
+        if res.get("code") == "00000":
+            log(f"  ✓ Einzel-TP @ {tp_str} USDT gesetzt (Qty: {size_int})")
+        else:
+            log(f"  ✗ Einzel-TP Fehler: {res.get('msg', res)}")
+        last_known_avg[symbol]  = avg
+        last_known_size[symbol] = total
+        return
+
     cancel_all_tp_orders(symbol)
     time.sleep(1)
     count, prices = place_tp_orders(
