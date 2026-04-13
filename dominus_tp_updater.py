@@ -854,18 +854,8 @@ def update_tp_for_position(pos: dict, reason: str):
         log("  Ungültige Position.")
         return
 
-    # ── 1. Bestehende TPs prüfen ─────────────────────────────
-    existing = get_existing_tps(symbol)
-    log(f"  Bestehende TPs: {len(existing)}")
-
-    if tps_are_correct(existing, avg, total, direction,
-                       leverage, decimals, mark):
-        log(f"  ✓ TPs sind korrekt — kein Update nötig")
-        last_known_avg[symbol]  = avg
-        last_known_size[symbol] = total
-        return
-
-    log(f"  TPs stimmen nicht — werden neu gesetzt (Grund: {reason})")
+    # TPs bei Nachkauf immer neu setzen (alter Avg-Preis → neuer Avg-Preis)
+    log(f"  Setze TPs neu (Grund: {reason})")
 
     # Position zu klein für individuelle TP-Orders (< 4 Kontrakte)
     if total < 4:
@@ -1400,21 +1390,22 @@ def main():
     t.start()
 
     # Beim Start: bestehende Positionen als bekannt markieren
-    # (kein neues Setup — Trades laufen bereits)
+    # Keine TP-Anpassung beim Start — TPs werden nur bei
+    # neuem Trade oder Nachkauf gesetzt/angepasst.
     positions = get_all_positions()
     if positions:
-        log(f"{len(positions)} bestehende Position(en) beim Start "
-            f"(werden nicht neu aufgesetzt):")
+        log(f"{len(positions)} bestehende Position(en) beim Start:")
         for pos in positions:
             sym  = pos.get("symbol", "?")
             avg  = float(pos.get("openPriceAvg", 0))
             size = float(pos.get("total", 0))
-            log(f"  {sym} | Avg={avg} | Qty={size}")
+            lev  = int(float(pos.get("leverage", 10)))
+            drct = pos.get("holdSide", "?").upper()
+            log(f"  {sym} | {drct} | Avg={avg} | Qty={size} | {lev}x")
             last_known_avg[sym]  = avg
             last_known_size[sym] = size
-            new_trade_done[sym]  = True  # keine DCA-Orders mehr setzen
-            # TPs dennoch setzen falls fehlend
-            update_tp_for_position(pos, "Script-Start")
+            new_trade_done[sym]  = True
+            sl_at_entry[sym]     = False
     else:
         log("Keine offenen Positionen. Warte auf ersten Trade...")
 
@@ -1454,22 +1445,21 @@ def main():
                         )
 
             else:
-                # ── 2. Positionen auf Änderungen prüfen ────
+                # ── 2. Positionen überwachen ────────────────
                 for pos in get_all_positions():
                     sym       = pos.get("symbol", "")
                     cur_avg   = float(pos.get("openPriceAvg", 0))
                     cur_size  = float(pos.get("total", 0))
-                    kno_avg   = last_known_avg.get(sym, 0)
                     kno_size  = last_known_size.get(sym, 0)
                     direction = pos.get("holdSide", "long")
 
-                    # Neuer Trade (noch nie gesehen)
+                    # Neuer Trade (noch nie via Fill gesehen)
                     if kno_size == 0 and cur_size > 0 and cur_avg > 0:
                         if not new_trade_done.get(sym, False):
                             log(f"Neuer Trade erkannt: {sym}")
                             setup_new_trade(pos)
 
-                    # TP1-Erkennung: Grösse ~25% kleiner
+                    # TP1-Erkennung: Grösse ~25% kleiner → SL auf Entry
                     elif (kno_size > 0
                             and cur_size < kno_size * 0.85
                             and not sl_at_entry.get(sym, False)):
@@ -1480,15 +1470,9 @@ def main():
                         set_sl_at_entry(sym, direction, cur_avg)
                         last_known_size[sym] = cur_size
 
-                    # Avg-Preis geändert: Nachkauf (Fill-History missed)
-                    elif (kno_size > 0
-                            and cur_avg > 0
-                            and cur_avg != kno_avg):
-                        log(f"Avg-Preis geändert ({sym}): "
-                            f"{kno_avg} → {cur_avg}")
-                        log(f"══ TP-Anpassung: {sym} ══")
-                        sl_at_entry[sym] = False
-                        update_tp_for_position(pos, "Avg-Preis Änderung")
+                    # Grösse aktualisieren (Position teilweise geschlossen)
+                    elif kno_size > 0 and cur_size != kno_size:
+                        last_known_size[sym] = cur_size
 
         except requests.exceptions.ConnectionError:
             log("Verbindungsfehler. Retry in 30s...")
