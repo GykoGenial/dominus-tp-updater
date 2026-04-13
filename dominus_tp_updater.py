@@ -1180,9 +1180,18 @@ def start_webhook_server():
             return jsonify({"error": "invalid json"}), 400
 
         raw_symbol = data.get("symbol", "").upper()
-        direction  = data.get("direction", "").lower()
         entry      = float(data.get("entry", 0) or 0)
         timeframe  = data.get("timeframe", "H2").upper()
+
+        # Richtung: explizit ODER aus Buy/Sell Plot-Werten
+        direction = data.get("direction", "").lower()
+        if direction not in ("long", "short"):
+            buy_val  = float(data.get("buy",  0) or 0)
+            sell_val = float(data.get("sell", 0) or 0)
+            if buy_val > 0 and sell_val == 0:
+                direction = "long"
+            elif sell_val > 0 and buy_val == 0:
+                direction = "short"
 
         # Symbol bereinigen: BITGET:ETHUSDT.P → ETHUSDT
         symbol = raw_symbol
@@ -1193,7 +1202,10 @@ def start_webhook_server():
             symbol += "USDT"
 
         if not symbol or direction not in ("long", "short"):
-            return jsonify({"error": "missing symbol or direction"}), 400
+            log(f"⚠ Webhook ignoriert: kein Signal "
+                f"(buy={data.get('buy',0)} sell={data.get('sell',0)} "
+                f"dir={data.get('direction','')})")
+            return jsonify({"status": "ignored", "reason": "no signal"}), 200
 
         log(f"📡 TradingView Alert: {symbol} {direction.upper()} "
             f"@ {entry} [{timeframe}]")
