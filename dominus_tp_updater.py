@@ -1696,20 +1696,33 @@ def main():
             last_known_avg[sym]  = avg
             last_known_size[sym] = size
             new_trade_done[sym]  = True
-            sl_at_entry[sym]     = False
+            # sl_at_entry wird erst nach SL-Prüfung gesetzt (unten)
 
             # ── SL prüfen — einmalig beim Start ──────────────
             if avg == 0 or size == 0:
+                sl_at_entry[sym] = False
                 continue
+
             sl_existing = get_sl_price(sym, direction)
+
             if sl_existing > 0:
                 sl_dist = abs(avg - sl_existing) / avg * 100
-                log(f"  ✓ SL vorhanden @ {sl_existing} "
-                    f"({sl_dist:.1f}% Abstand)")
+                # Prüfen ob SL bereits auf Entry steht (Toleranz 0.15%)
+                # Das bedeutet TP1 wurde bereits ausgelöst
+                at_entry = sl_dist <= 0.15
+                sl_at_entry[sym] = at_entry
+                if at_entry:
+                    log(f"  ✓ SL auf Entry @ {sl_existing} "
+                        f"— TP1 bereits ausgelöst, SL wird nicht verändert")
+                else:
+                    log(f"  ✓ SL vorhanden @ {sl_existing} "
+                        f"({sl_dist:.1f}% Abstand) — wird nicht verändert")
             else:
                 # Kein SL → Auto-SL auf -25% setzen
-                factor  = 0.25 / lev
-                sl_auto = avg * (1 - factor) if direction == "long"                           else avg * (1 + factor)
+                # Nur wenn kein Hinweis auf bereits ausgelöste TPs
+                sl_at_entry[sym] = False
+                factor   = 0.25 / lev
+                sl_auto  = avg * (1 - factor) if direction == "long"                            else avg * (1 + factor)
                 decimals = get_price_decimals(sym)
                 sl_str   = round_price(sl_auto, decimals)
                 sl_auto  = float(sl_str)
