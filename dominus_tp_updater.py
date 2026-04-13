@@ -756,18 +756,96 @@ def setup_new_trade(pos: dict):
         f"{len(dca_results)}/2 DCA-Orders gesetzt")
 
 
+def get_existing_tps(symbol: str) -> list:
+    """
+    Holt bestehende TP-Orders via orders-plan-pending.
+    Gibt Liste mit {'price': float, 'qty': float, 'orderId': str} zurück.
+    """
+    result = api_get("/api/v2/mix/order/orders-plan-pending", {
+        "symbol":      symbol,
+        "productType": PRODUCT_TYPE,
+        "planType":    "profit_plan",
+    })
+    if result.get("code") != "00000":
+        return []
+    data = result.get("data") or []
+    if isinstance(data, dict):
+        orders = data.get("entrustedList") or []
+    else:
+        orders = data
+    tps = []
+    for o in orders:
+        if o.get("planType") == "profit_plan":
+            tps.append({
+                "price":   float(o.get("triggerPrice", 0)),
+                "qty":     float(o.get("size", 0)),
+                "orderId": o.get("orderId", ""),
+            })
+    # Nach Preis sortieren
+    tps.sort(key=lambda x: x["price"],
+             reverse=(True if "short" in str(o.get("holdSide","")) else False))
+    return tps
+
+
+def tps_are_correct(existing: list, avg: float, total: float,
+                    direction: str, leverage: int,
+                    decimals: int, mark: float) -> bool:
+    """
+    Prüft ob bestehende TPs mit dem erwarteten Schema übereinstimmen.
+    Toleranz: 0.05% Preisabweichung (Rundungsdifferenzen)
+    """
+    if len(existing) == 0:
+        return False  # Keine TPs → müssen gesetzt werden
+
+    # Erwartete TP-Preise berechnen
+    expected_prices = []
+    for roi in [TP1_ROI, TP2_ROI, TP3_ROI, TP4_ROI]:
+        tp = calc_tp_price(avg, roi, direction, leverage)
+        tp_str = round_price(tp, decimals)
+        tp_val = float(tp_str)
+        # Nur TPs die noch nicht überschritten sind
+        if direction == "long" and tp_val > mark:
+            expected_prices.append(tp_val)
+        elif direction == "short" and tp_val < mark:
+            expected_prices.append(tp_val)
+
+    if len(existing) != len(expected_prices):
+        log(f"  TP-Anzahl stimmt nicht: {len(existing)} vorhanden, "
+            f"{len(expected_prices)} erwartet")
+        return False
+
+    # Preise vergleichen (0.05% Toleranz)
+    existing_prices = sorted([t["price"] for t in existing])
+    expected_prices_sorted = sorted(expected_prices)
+    for ex, exp in zip(existing_prices, expected_prices_sorted):
+        if exp == 0:
+            continue
+        diff_pct = abs(ex - exp) / exp * 100
+        if diff_pct > 0.05:
+            log(f"  TP-Preis stimmt nicht: {ex} vs erwartet {exp:.5f} "
+                f"(Δ {diff_pct:.3f}%)")
+            return False
+
+    return True
+
+
+
 # ═══════════════════════════════════════════════════════════════
 # TP UPDATE (bei Nachkauf)
 # ═══════════════════════════════════════════════════════════════
 
 def update_tp_for_position(pos: dict, reason: str):
-    """TPs neu berechnen nach Nachkauf."""
+    """
+    Prüft bestehende TPs, löscht nur wenn nötig und setzt neu.
+    Ablauf: Bestehende TPs abrufen → prüfen → bei Abweichung: löschen + neu setzen.
+    """
     symbol    = pos.get("symbol", "?")
     direction = pos.get("holdSide", "long")
     avg       = float(pos.get("openPriceAvg", 0))
     total     = float(pos.get("total", 0))
     leverage  = int(float(pos.get("leverage", 10)))
     mark      = get_mark_price(symbol)
+    decimals  = get_price_decimals(symbol)
 
     log(f"  {symbol} | {direction.upper()} | Avg={avg} | "
         f"Qty={total} | Hebel={leverage}x | Mark={mark}")
@@ -775,6 +853,19 @@ def update_tp_for_position(pos: dict, reason: str):
     if avg == 0 or total == 0:
         log("  Ungültige Position.")
         return
+
+    # ── 1. Bestehende TPs prüfen ─────────────────────────────
+    existing = get_existing_tps(symbol)
+    log(f"  Bestehende TPs: {len(existing)}")
+
+    if tps_are_correct(existing, avg, total, direction,
+                       leverage, decimals, mark):
+        log(f"  ✓ TPs sind korrekt — kein Update nötig")
+        last_known_avg[symbol]  = avg
+        last_known_size[symbol] = total
+        return
+
+    log(f"  TPs stimmen nicht — werden neu gesetzt (Grund: {reason})")
 
     # Position zu klein für individuelle TP-Orders (< 4 Kontrakte)
     if total < 4:
