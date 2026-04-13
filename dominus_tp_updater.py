@@ -1105,38 +1105,13 @@ def update_tp_for_position(pos: dict, reason: str):
     # TPs bei Nachkauf immer neu setzen (alter Avg-Preis → neuer Avg-Preis)
     log(f"  Setze TPs neu (Grund: {reason})")
 
-    # Position zu klein für individuelle TP-Orders (< 4 Kontrakte)
-    if total < 4:
+    # Mindest-Grösse berechnen: mind. 4 Kontrakte für 4 TPs nötig
+    # (TP1=15%: floor(4*0.15)=0 → max(1,0)=1 → aber 4 × 1 = 4 < size nötig)
+    min_size_for_tps = 4
+    if total < min_size_for_tps:
         log(f"  ⚠ Position zu klein (Qty={total}) — "
-            f"setze nur 1 kombinierten TP für Gesamtposition")
-        # Einen einzigen TP für die gesamte Restposition
-        decimals = get_price_decimals(symbol)
-        tp_raw   = calc_tp_price(avg, TP2_ROI, direction, leverage)
-        tp_str   = round_price(tp_raw, decimals)
-        tp_val   = float(tp_str)
-        if mark_price > 0:
-            valid = (direction == "long" and tp_val > mark_price) or                     (direction == "short" and tp_val < mark_price)
-            if not valid:
-                log(f"  ⏭ Einzel-TP @ {tp_str} bereits überschritten")
-                last_known_avg[symbol]  = avg
-                last_known_size[symbol] = total
-                return
-        size_int = max(1, round(total))
-        res = api_post("/api/v2/mix/order/place-tpsl-order", {
-            "symbol":       symbol,
-            "productType":  PRODUCT_TYPE,
-            "marginCoin":   MARGIN_COIN,
-            "planType":     "profit_plan",
-            "triggerPrice": tp_str,
-            "triggerType":  "mark_price",
-            "executePrice": "0",
-            "holdSide":     direction,
-            "size":         str(size_int),
-        })
-        if res.get("code") == "00000":
-            log(f"  ✓ Einzel-TP @ {tp_str} USDT gesetzt (Qty: {size_int})")
-        else:
-            log(f"  ✗ Einzel-TP Fehler: {res.get('msg', res)}")
+            f"TPs werden nicht gesetzt (min. {min_size_for_tps} Kontrakte nötig)")
+        log(f"  Bitte Position manuell überwachen oder grösser eröffnen")
         last_known_avg[symbol]  = avg
         last_known_size[symbol] = total
         return
@@ -1743,22 +1718,19 @@ def main():
                 # Kein SL gefunden → prüfen ob TPs bereits teils ausgelöst
                 # Indikator: bestehende TPs starten nicht bei TP1-Preis
                 existing_tps = get_existing_tps(sym)
-                tp1_price    = calc_tp_price(avg, TP1_ROI, direction, lev)
                 decimals     = get_price_decimals(sym)
+                n_tps        = len(existing_tps)
 
-                # TP1 bereits ausgelöst wenn:
-                # a) TPs vorhanden aber erster TP deutlich über TP1-Preis liegt
-                # b) Oder keine TPs mehr vorhanden (alle ausgelöst, nur TP4 pending)
-                tp1_already_hit = False
-                if existing_tps:
-                    prices = sorted([t["price"] for t in existing_tps],
-                                    reverse=(direction == "short"))
-                    first_tp = prices[0] if direction == "long" else prices[-1]
-                    tp1_diff = abs(first_tp - tp1_price) / tp1_price * 100
-                    if tp1_diff > 1.0:  # Erster TP weicht mehr als 1% von TP1 ab
-                        tp1_already_hit = True
-                        log(f"  TP1 bereits ausgelöst erkannt "
-                            f"(erster TP @ {first_tp:.5f} vs TP1 @ {tp1_price:.5f})")
+                # Zuverlässigste Erkennung: Anzahl verbleibender TPs
+                # Original = 4 TPs → nach TP1 nur noch 3 → nach TP2 nur noch 2
+                # Wenn < 4 TPs vorhanden → mindestens TP1 wurde ausgelöst
+                # → SL muss auf Entry stehen
+                tp1_already_hit = n_tps < 4
+                if tp1_already_hit:
+                    log(f"  TP1 bereits ausgelöst: {n_tps}/4 TPs noch offen "
+                        f"→ SL auf Entry")
+                else:
+                    log(f"  Alle 4 TPs noch offen → normaler Trade")
 
                 if tp1_already_hit:
                     # SL auf Entry setzen — Position ist bereits abgesichert
