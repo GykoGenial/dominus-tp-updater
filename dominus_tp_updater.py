@@ -268,30 +268,42 @@ def get_recent_fills_all(since_ms: int) -> list:
 
 def get_sl_price(symbol: str, direction: str) -> float:
     """
-    Liest den bestehenden SL-Preis.
-    Bitget kennt zwei SL-Typen:
-      loss_plan  = manuell vom User gesetzt (Ausstiegslinie)
-      pos_loss   = von Script gesetzt via place-pos-tpsl (SL auf Entry nach TP1)
-    Beide werden erkannt.
+    Liest den SL-Preis direkt aus den Positionsdaten — zuverlässigste Methode.
+    Bitget speichert den SL im Feld autoMarginReduction/stopLossPrice
+    der Position selbst, unabhängig davon wie er gesetzt wurde
+    (manuell loss_plan, via place-pos-tpsl pos_loss, etc.)
+
+    Fallback: tpsl-pending-orders mit allen bekannten SL-Typen.
     """
-    result = api_get("/api/v2/mix/order/tpsl-pending-orders", {
+    # Primär: SL aus Positionsdaten lesen
+    result = api_get("/api/v2/mix/position/single-position", {
+        "symbol":      symbol,
+        "productType": PRODUCT_TYPE,
+        "marginCoin":  MARGIN_COIN,
+    })
+    if result.get("code") == "00000":
+        for pos in (result.get("data") or []):
+            if pos.get("holdSide") == direction:
+                # Bitget liefert SL in stopLossPrice oder stopSurplusPrice
+                sl = float(pos.get("stopLossPrice", 0) or 0)
+                if sl > 0:
+                    log(f"  SL aus Position: {sl} ({direction})")
+                    return sl
+
+    # Fallback: pending orders (alle SL-Typen)
+    result2 = api_get("/api/v2/mix/order/tpsl-pending-orders", {
         "symbol":      symbol,
         "productType": PRODUCT_TYPE,
     })
-    if result.get("code") != "00000":
-        return 0.0
-    orders = (result.get("data") or {}).get("entrustedList") or []
-
-    # Beide SL-Typen prüfen — loss_plan (manuell) und pos_loss (Script)
-    SL_TYPES = {"loss_plan", "pos_loss"}
-    for o in orders:
-        if (o.get("planType") in SL_TYPES
-                and o.get("holdSide") == direction):
-            price = float(o.get("triggerPrice", 0) or 0)
-            if price > 0:
-                log(f"  SL gefunden: planType={o.get('planType')} "
-                    f"@ {price} ({direction})")
-                return price
+    if result2.get("code") == "00000":
+        orders = (result2.get("data") or {}).get("entrustedList") or []
+        SL_TYPES = {"loss_plan", "pos_loss", "moving_plan"}
+        for o in orders:
+            if o.get("planType") in SL_TYPES and o.get("holdSide") == direction:
+                price = float(o.get("triggerPrice", 0) or 0)
+                if price > 0:
+                    log(f"  SL aus Orders: {o.get('planType')} @ {price}")
+                    return price
     return 0.0
 
 
@@ -1728,40 +1740,83 @@ def main():
                     log(f"  ✓ SL vorhanden @ {sl_existing} "
                         f"({sl_dist:.1f}% Abstand) — wird nicht verändert")
             else:
-                # Kein SL → Auto-SL auf -25% setzen
-                # Nur wenn kein Hinweis auf bereits ausgelöste TPs
-                sl_at_entry[sym] = False
-                factor   = 0.25 / lev
-                sl_auto  = avg * (1 - factor) if direction == "long"                            else avg * (1 + factor)
-                decimals = get_price_decimals(sym)
-                sl_str   = round_price(sl_auto, decimals)
-                sl_auto  = float(sl_str)
-                sl_dist  = abs(avg - sl_auto) / avg * 100
-                log(f"  ⚠ Kein SL — Auto-SL @ {sl_str} "
-                    f"({sl_dist:.1f}% Abstand)")
-                res = api_post("/api/v2/mix/order/place-pos-tpsl", {
-                    "symbol":               sym,
-                    "productType":          PRODUCT_TYPE,
-                    "marginCoin":           MARGIN_COIN,
-                    "holdSide":             direction,
-                    "stopLossTriggerPrice": sl_str,
-                    "stopLossTriggerType":  "mark_price",
-                })
-                if res.get("code") == "00000":
-                    log(f"  ✓ Auto-SL gesetzt @ {sl_str} USDT")
-                    links = tv_chart_links(sym)
-                    telegram(
-                        f"\U0001f6e1 <b>Auto-SL gesetzt \u2014 {sym}</b>\n"
-                        f"Script-Start: kein SL gefunden\n\n"
-                        f"SL: {sl_str} USDT ({sl_dist:.1f}% Abstand)\n"
-                        f"Entry: {avg} | Hebel: {lev}x\n\n"
-                        f"\u26a0\ufe0f Bitte pr\u00fcfen ob SL mit "
-                        f"Ausstiegslinie \u00fcbereinstimmt!\n"
-                        f"H4: {links['coin_h4']}"
-                    )
+                # Kein SL gefunden → prüfen ob TPs bereits teils ausgelöst
+                # Indikator: bestehende TPs starten nicht bei TP1-Preis
+                existing_tps = get_existing_tps(sym)
+                tp1_price    = calc_tp_price(avg, TP1_ROI, direction, lev)
+                decimals     = get_price_decimals(sym)
+
+                # TP1 bereits ausgelöst wenn:
+                # a) TPs vorhanden aber erster TP deutlich über TP1-Preis liegt
+                # b) Oder keine TPs mehr vorhanden (alle ausgelöst, nur TP4 pending)
+                tp1_already_hit = False
+                if existing_tps:
+                    prices = sorted([t["price"] for t in existing_tps],
+                                    reverse=(direction == "short"))
+                    first_tp = prices[0] if direction == "long" else prices[-1]
+                    tp1_diff = abs(first_tp - tp1_price) / tp1_price * 100
+                    if tp1_diff > 1.0:  # Erster TP weicht mehr als 1% von TP1 ab
+                        tp1_already_hit = True
+                        log(f"  TP1 bereits ausgelöst erkannt "
+                            f"(erster TP @ {first_tp:.5f} vs TP1 @ {tp1_price:.5f})")
+
+                if tp1_already_hit:
+                    # SL auf Entry setzen — Position ist bereits abgesichert
+                    sl_at_entry[sym] = True
+                    sl_str = round_price(avg, decimals)
+                    log(f"  SL auf Entry setzen @ {sl_str} "
+                        f"(TP1 bereits ausgelöst)")
+                    res = api_post("/api/v2/mix/order/place-pos-tpsl", {
+                        "symbol":               sym,
+                        "productType":          PRODUCT_TYPE,
+                        "marginCoin":           MARGIN_COIN,
+                        "holdSide":             direction,
+                        "stopLossTriggerPrice": sl_str,
+                        "stopLossTriggerType":  "mark_price",
+                    })
+                    if res.get("code") == "00000":
+                        log(f"  ✓ SL auf Entry gesetzt @ {sl_str} USDT")
+                        telegram(
+                            f"\U0001f512 <b>SL auf Entry gesetzt \u2014 {sym}</b>\n"
+                            f"Script-Start: TP1 bereits ausgelöst\n"
+                            f"SL: {sl_str} USDT (Entry-Preis)\n"
+                            f"Position abgesichert \u2713"
+                        )
+                    else:
+                        log(f"  ✗ SL auf Entry fehlgeschlagen: "
+                            f"{res.get('msg', res)}")
                 else:
-                    log(f"  ✗ Auto-SL fehlgeschlagen: "
-                        f"{res.get('msg', res)}")
+                    # Kein TP ausgelöst → Auto-SL -25%
+                    sl_at_entry[sym] = False
+                    factor   = 0.25 / lev
+                    sl_auto  = avg * (1 - factor) if direction == "long"                                else avg * (1 + factor)
+                    sl_str   = round_price(sl_auto, decimals)
+                    sl_auto  = float(sl_str)
+                    sl_dist  = abs(avg - sl_auto) / avg * 100
+                    log(f"  ⚠ Kein SL — Auto-SL @ {sl_str} ({sl_dist:.1f}%)")
+                    res = api_post("/api/v2/mix/order/place-pos-tpsl", {
+                        "symbol":               sym,
+                        "productType":          PRODUCT_TYPE,
+                        "marginCoin":           MARGIN_COIN,
+                        "holdSide":             direction,
+                        "stopLossTriggerPrice": sl_str,
+                        "stopLossTriggerType":  "mark_price",
+                    })
+                    if res.get("code") == "00000":
+                        log(f"  ✓ Auto-SL gesetzt @ {sl_str} USDT")
+                        links = tv_chart_links(sym)
+                        telegram(
+                            f"\U0001f6e1 <b>Auto-SL gesetzt \u2014 {sym}</b>\n"
+                            f"Script-Start: kein SL gefunden\n\n"
+                            f"SL: {sl_str} USDT ({sl_dist:.1f}% Abstand)\n"
+                            f"Entry: {avg} | Hebel: {lev}x\n\n"
+                            f"\u26a0\ufe0f Bitte pr\u00fcfen ob SL mit "
+                            f"Ausstiegslinie \u00fcbereinstimmt!\n"
+                            f"H4: {links['coin_h4']}"
+                        )
+                    else:
+                        log(f"  ✗ Auto-SL fehlgeschlagen: "
+                            f"{res.get('msg', res)}")
     else:
         log("Keine offenen Positionen. Warte auf ersten Trade...")
 
