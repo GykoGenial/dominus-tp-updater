@@ -1389,23 +1389,67 @@ def main():
     t = threading.Thread(target=start_webhook_server, daemon=True)
     t.start()
 
-    # Beim Start: bestehende Positionen als bekannt markieren
-    # Keine TP-Anpassung beim Start — TPs werden nur bei
-    # neuem Trade oder Nachkauf gesetzt/angepasst.
+    # Beim Start: bestehende Positionen als bekannt markieren.
+    # SL wird einmalig geprüft — falls nicht gesetzt: Auto-SL (-25%).
+    # TPs werden beim Start nie angepasst.
     positions = get_all_positions()
     if positions:
         log(f"{len(positions)} bestehende Position(en) beim Start:")
         for pos in positions:
-            sym  = pos.get("symbol", "?")
-            avg  = float(pos.get("openPriceAvg", 0))
-            size = float(pos.get("total", 0))
-            lev  = int(float(pos.get("leverage", 10)))
-            drct = pos.get("holdSide", "?").upper()
-            log(f"  {sym} | {drct} | Avg={avg} | Qty={size} | {lev}x")
+            sym       = pos.get("symbol", "?")
+            avg       = float(pos.get("openPriceAvg", 0))
+            size      = float(pos.get("total", 0))
+            lev       = int(float(pos.get("leverage", 10)))
+            direction = pos.get("holdSide", "long")
+            log(f"  {sym} | {direction.upper()} | "
+                f"Avg={avg} | Qty={size} | {lev}x")
+
             last_known_avg[sym]  = avg
             last_known_size[sym] = size
             new_trade_done[sym]  = True
             sl_at_entry[sym]     = False
+
+            # ── SL prüfen — einmalig beim Start ──────────────
+            if avg == 0 or size == 0:
+                continue
+            sl_existing = get_sl_price(sym, direction)
+            if sl_existing > 0:
+                sl_dist = abs(avg - sl_existing) / avg * 100
+                log(f"  ✓ SL vorhanden @ {sl_existing} "
+                    f"({sl_dist:.1f}% Abstand)")
+            else:
+                # Kein SL → Auto-SL auf -25% setzen
+                factor  = 0.25 / lev
+                sl_auto = avg * (1 - factor) if direction == "long"                           else avg * (1 + factor)
+                decimals = get_price_decimals(sym)
+                sl_str   = round_price(sl_auto, decimals)
+                sl_auto  = float(sl_str)
+                sl_dist  = abs(avg - sl_auto) / avg * 100
+                log(f"  ⚠ Kein SL — Auto-SL @ {sl_str} "
+                    f"({sl_dist:.1f}% Abstand)")
+                res = api_post("/api/v2/mix/order/place-pos-tpsl", {
+                    "symbol":               sym,
+                    "productType":          PRODUCT_TYPE,
+                    "marginCoin":           MARGIN_COIN,
+                    "holdSide":             direction,
+                    "stopLossTriggerPrice": sl_str,
+                    "stopLossTriggerType":  "mark_price",
+                })
+                if res.get("code") == "00000":
+                    log(f"  ✓ Auto-SL gesetzt @ {sl_str} USDT")
+                    links = tv_chart_links(sym)
+                    telegram(
+                        f"\U0001f6e1 <b>Auto-SL gesetzt \u2014 {sym}</b>\n"
+                        f"Script-Start: kein SL gefunden\n\n"
+                        f"SL: {sl_str} USDT ({sl_dist:.1f}% Abstand)\n"
+                        f"Entry: {avg} | Hebel: {lev}x\n\n"
+                        f"\u26a0\ufe0f Bitte pr\u00fcfen ob SL mit "
+                        f"Ausstiegslinie \u00fcbereinstimmt!\n"
+                        f"H4: {links['coin_h4']}"
+                    )
+                else:
+                    log(f"  ✗ Auto-SL fehlgeschlagen: "
+                        f"{res.get('msg', res)}")
     else:
         log("Keine offenen Positionen. Warte auf ersten Trade...")
 
