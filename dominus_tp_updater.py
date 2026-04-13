@@ -101,6 +101,11 @@ last_update_id:   int  = 0    # Telegram: letzter verarbeiteter Update-ID
 # {symbol: {entry, direction, leverage, sl, peak_size, open_ts}}
 trade_data: dict = {}
 
+# H4 Trigger-Puffer: sammelt Alerts, sendet gebündelt nach Zeitfenster
+h4_buffer:     list = []
+h4_buffer_lock = __import__("threading").Lock()
+H4_BUFFER_SEC  = int(os.environ.get("H4_BUFFER_SEC", "300"))  # 5 Min
+
 
 # ═══════════════════════════════════════════════════════════════
 # BASIS-FUNKTIONEN
@@ -1438,6 +1443,51 @@ def poll_telegram_commands():
 # WEBHOOK SERVER — empfängt TradingView Alerts
 # ═══════════════════════════════════════════════════════════════
 
+def flush_h4_buffer():
+    """Sendet gesammelte H4-Trigger als eine gebündelte Telegram-Nachricht."""
+    global h4_buffer
+    with h4_buffer_lock:
+        if not h4_buffer:
+            return
+        items     = list(h4_buffer)
+        h4_buffer = []
+
+    longs  = [i for i in items if i["direction"] == "long"]
+    shorts = [i for i in items if i["direction"] == "short"]
+    now_str = __import__("datetime").datetime.now().strftime("%H:%M")
+
+    lines = [
+        f"\U0001f4cb <b>H4 Trigger-Zusammenfassung \u2014 {now_str} Uhr</b>",
+        "\u2501" * 22,
+    ]
+    if longs:
+        lines.append("\U0001f7e2 <b>LONG:</b>")
+        for item in longs:
+            lnk = tv_chart_links(item["symbol"])
+            lines.append(f"  \u2022 {item['symbol']}  @ {item['entry']:.5f}")
+            lines.append(f"    {lnk['coin_h4']}")
+    if longs and shorts:
+        lines.append("")
+    if shorts:
+        lines.append("\U0001f534 <b>SHORT:</b>")
+        for item in shorts:
+            lnk = tv_chart_links(item["symbol"])
+            lines.append(f"  \u2022 {item['symbol']}  @ {item['entry']:.5f}")
+            lines.append(f"    {lnk['coin_h4']}")
+
+    btc_lnk = tv_chart_links("BTCUSDT")
+    lines += [
+        "",
+        "\u23f1 H2-Alarm f\u00fcr relevante Coins aktivieren",
+        "",
+        "\U0001f4c8 Markt:",
+        f"BTC H2: {btc_lnk['btc_h2']}",
+        f"Total2: {btc_lnk['total2']}",
+    ]
+    telegram("\n".join(lines))
+    log(f"H4-Zusammenfassung gesendet: {len(longs)} Long, {len(shorts)} Short")
+
+
 def start_webhook_server():
     """
     Startet einen Flask HTTP-Server in einem separaten Thread.
@@ -1503,47 +1553,60 @@ def start_webhook_server():
         log(f"📡 TradingView Alert: {symbol} {direction.upper()} "
             f"@ {entry} [{timeframe}]")
 
-        # ── Aktuellen Kurs nehmen falls kein Entry mitgeschickt ──
         if entry == 0:
             entry = get_mark_price(symbol)
 
-        # ── Kontostand & Hebel-Empfehlung berechnen ──────────
-        balance    = get_futures_balance()
-        kelly      = kelly_recommendation(balance, WINRATE)
-        links      = tv_chart_links(symbol)
-        per_order  = balance * 0.10 / 3
+        signal_type = data.get("signal", "").upper()
+        log(f"\U0001f4e1 Alert: {symbol} {direction.upper()} @ {entry} [{timeframe}]")
 
-        # ── Telegram-Nachricht senden ─────────────────────────
-        icon = "\U0001f7e2" if direction == "long" else "\U0001f534"
-        chk_dir = "gr\u00fcner" if direction == "long" else "roter"
+        # H4 Trigger → gepuffert, nach 5 Min gebündelt senden
+        if timeframe == "H4" or signal_type == "H4_TRIGGER":
+            with h4_buffer_lock:
+                exists = any(
+                    i["symbol"] == symbol and i["direction"] == direction
+                    for i in h4_buffer
+                )
+                if not exists:
+                    h4_buffer.append({
+                        "symbol": symbol, "direction": direction,
+                        "entry": entry, "ts": __import__("time").time(),
+                    })
+                    log(f"  H4 gepuffert ({len(h4_buffer)} im Puffer)")
+            return jsonify({"status": "buffered", "symbol": symbol}), 200
+
+        # H2 Signal → H4 Puffer flushen dann sofort senden
+        flush_h4_buffer()
+        balance   = get_futures_balance()
+        kelly     = kelly_recommendation(balance, WINRATE)
+        links     = tv_chart_links(symbol)
+        per_order = balance * 0.10 / 3
+        chk_dir   = "gr\u00fcner" if direction == "long" else "roter"
+        icon      = "\U0001f7e2" if direction == "long" else "\U0001f534"
         msg_parts = [
-            f"{icon} <b>DOMINUS Signal \u2014 {symbol} {direction.upper()}</b>",
+            f"{icon} <b>H2 Signal \u2014 {symbol} {direction.upper()}</b>",
             "\u2501" * 22,
-            f"Timeframe: {timeframe} | Kurs: {entry}",
+            f"Kurs: {entry}",
             "",
             "\U0001f4cb <b>DOMINUS Checkliste:</b>",
             "\u2610 DOMINUS Impuls Extremzone erreicht?",
-            "\u2610 H4 Buy/Sell Trigger best\u00e4tigt?",
+            "\u2610 H4 Trigger best\u00e4tigt?",
             "\u2610 HARSI nicht in Extremzone?",
             "\u2610 BTC + Total2 gleiche Richtung?",
-            f"\u2610 Premium Setup? (Impuls in dunkel{chk_dir} Zone)",
+            f"\u2610 Premium Setup? (Impuls dunkel{chk_dir})",
             "",
-            f"\U0001f4b0 Konto: {balance:.0f} USDT",
-            f"\U0001f4e6 Pro Order: {per_order:.0f} USDT",
-            f"\U0001f4ca Kelly {WINRATE*100:.0f}%: {kelly['kelly_pct']}%",
+            f"\U0001f4b0 {balance:.0f} USDT  |  Pro Order: {per_order:.0f} USDT",
+            f"\U0001f4ca Kelly: {kelly['kelly_pct']}%",
             "",
             "\u23f1 <b>30-Min-Fenster l\u00e4uft!</b>",
-            "Wenn alle Punkte \u2713:",
-            f"/trade {symbol} {direction.upper()} [HEBEL] {entry:.4f} [SL]",
+            f"/trade {symbol} {direction.upper()} [HEBEL] {entry:.5f} [SL]",
             "",
-            "\U0001f4c8 <b>Charts:</b>",
+            "\U0001f4c8 Charts:",
             f"H2 {symbol}: {links['coin_h2']}",
             f"H4 {symbol}: {links['coin_h4']}",
             f"BTC H2: {links['btc_h2']}",
             f"Total2: {links['total2']}",
         ]
         telegram("\n".join(msg_parts))
-
         return jsonify({"status": "ok", "symbol": symbol,
                         "direction": direction}), 200
 
@@ -1649,6 +1712,13 @@ def main():
         try:
             # ── 0. Telegram-Befehle prüfen ─────────────────
             poll_telegram_commands()
+
+            # ── 0b. H4 Puffer flushen wenn Zeitfenster abgelaufen ──
+            if h4_buffer:
+                with h4_buffer_lock:
+                    oldest = min((i["ts"] for i in h4_buffer), default=0)
+                if oldest and __import__("time").time() - oldest >= H4_BUFFER_SEC:
+                    flush_h4_buffer()
 
             # ── 1. Neue Fills (Nachkäufe / Einstiege) ──────
             fills      = get_recent_fills_all(last_check_ms)
