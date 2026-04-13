@@ -349,25 +349,23 @@ def cancel_all_tp_orders(symbol: str):
     → abrufen via orders-plan-pending, stornieren via cancel-plan-order.
     SL (loss_plan via tpsl-pending-orders) wird nie angefasst.
     """
-    # Nur profit_plan Orders abrufen (= unsere TPs)
+    # profit_plan Orders abrufen — planType als Filter wird server-seitig nicht unterstützt
     result = api_get("/api/v2/mix/order/orders-plan-pending", {
         "symbol":      symbol,
         "productType": PRODUCT_TYPE,
-        "planType":    "profit_plan",
     })
     if result.get("code") != "00000":
         log(f"  ⚠ orders-plan-pending Fehler: {result.get('msg', result)}")
         return
 
-    # Response kann Liste oder Dict mit entrustedList sein
     data = result.get("data") or []
     if isinstance(data, dict):
-        tp_orders = data.get("entrustedList") or []
+        all_orders = data.get("entrustedList") or []
     else:
-        tp_orders = data
+        all_orders = data
 
-    # Nochmals sicherstellen: nur profit_plan
-    tp_orders = [o for o in tp_orders
+    # Client-seitig nur profit_plan filtern
+    tp_orders = [o for o in all_orders
                  if o.get("planType", "") == "profit_plan"]
 
     if not tp_orders:
@@ -529,31 +527,54 @@ def cancel_open_dca_orders(symbol: str, direction: str):
 
 def get_closed_pnl(symbol: str, since_ms: int) -> dict:
     """
-    Holt realisierten P&L der zuletzt geschlossenen Position via Bitget.
-    Gibt {'realized_pnl': float, 'fee': float, 'net_pnl': float} zurück.
+    Berechnet realisierten P&L eines vollständigen Trades via Fill-History.
+    Summiert ALLE Schliessungen (TP1, TP2, ... + SL) seit Trade-Eröffnung.
+    So wird der echte Gesamt-P&L korrekt erfasst — auch bei Teiltrades.
     """
-    result = api_get("/api/v2/mix/position/history-position", {
+    result = api_get("/api/v2/mix/order/fill-history", {
         "symbol":      symbol,
         "productType": PRODUCT_TYPE,
-        "limit":       "1",
+        "startTime":   str(since_ms),
+        "limit":       "50",
     })
     if result.get("code") != "00000":
         return {}
-    positions = (result.get("data") or {}).get("list") or []
-    if not positions:
+
+    fills = (result.get("data") or {}).get("fillList") or []
+    # Nur Close-Fills (tradeSide=close)
+    close_fills = [f for f in fills if f.get("tradeSide") == "close"]
+    if not close_fills:
         return {}
-    pos = positions[0]
-    realized = float(pos.get("achievedProfits", 0) or 0)
-    fee      = float(pos.get("totalFee", 0) or 0)
-    net      = realized - abs(fee)
+
+    total_pnl   = sum(float(f.get("profit", 0) or 0) for f in close_fills)
+    total_fee   = sum(float(f.get("fee", 0) or 0) for f in close_fills)
+    total_size  = sum(float(f.get("size", 0) or 0) for f in close_fills)
+    net_pnl     = total_pnl - abs(total_fee)
+
+    # Durchschnittlichen Schlusskurs berechnen
+    prices = [float(f.get("price", 0) or 0) for f in close_fills if float(f.get("price",0))>0]
+    avg_close = sum(prices) / len(prices) if prices else 0
+
+    # Einzelne Schliessungen für Detail-Bericht
+    tp_closes = []
+    for f in close_fills:
+        pnl_f = float(f.get("profit", 0) or 0)
+        size_f = float(f.get("size", 0) or 0)
+        price_f = float(f.get("price", 0) or 0)
+        tp_closes.append({
+            "size": size_f,
+            "price": price_f,
+            "pnl": pnl_f,
+        })
+
     return {
-        "realized_pnl": realized,
-        "fee":          fee,
-        "net_pnl":      net,
-        "open_price":   float(pos.get("openPriceAvg", 0) or 0),
-        "close_price":  float(pos.get("closeAvgPrice", 0) or 0),
-        "total_size":   float(pos.get("openSize", 0) or 0),
-        "hold_time":    pos.get("holdTime", ""),
+        "realized_pnl": total_pnl,
+        "fee":          abs(total_fee),
+        "net_pnl":      net_pnl,
+        "close_price":  avg_close,
+        "total_size":   total_size,
+        "tp_closes":    tp_closes,
+        "num_closes":   len(close_fills),
     }
 
 
@@ -606,27 +627,45 @@ def handle_position_closed(symbol: str, reason: str = ""):
     log(f"  P&L: {net_pnl:+.2f} USDT | ROI: {roi_pct:+.1f}% | "
         f"Fee: {fee:.2f} USDT")
 
+    # Detail-Schliessungen aus P&L-Daten
+    tp_closes  = pnl_data.get("tp_closes", [])
+    num_closes = pnl_data.get("num_closes", 0)
+
     msg_lines = [
         f"{icon} <b>Trade abgeschlossen — {symbol}</b>",
         f"━━━━━━━━━━━━━━━━━━━━━━",
         f"Ergebnis: <b>{result_label}</b>",
         f"",
         f"📊 <b>Auswertung:</b>",
-        f"Netto P&L:  {net_pnl:+.2f} USDT",
-        f"ROI:        {roi_pct:+.1f}% auf Margin",
-        f"Realisiert: {realized:+.2f} USDT",
-        f"Gebühren:   {fee:.2f} USDT",
+        f"Netto P&L:   {net_pnl:+.2f} USDT",
+        f"ROI:         {roi_pct:+.1f}% auf Margin",
+        f"Realisiert:  {realized:+.2f} USDT",
+        f"Gebühren:    {fee:.2f} USDT",
+        f"Schliessungen: {num_closes}x",
+    ]
+
+    # Einzelne Schliessungen auflisten (TP1, TP2,... + SL)
+    if tp_closes:
+        msg_lines.append(f"")
+        msg_lines.append(f"📋 <b>Einzelne Schliessungen:</b>")
+        for i, c in enumerate(tp_closes):
+            label = f"TP{i+1}" if i < num_closes - 1 else "SL/Close"
+            sign  = "+" if c["pnl"] >= 0 else ""
+            msg_lines.append(
+                f"  {label}: {c['size']:.1f} Ktr @ {c['price']:.5f}"
+                f" → {sign}{c['pnl']:.2f} USDT"
+            )
+
+    msg_lines += [
         f"",
         f"📋 <b>Trade-Details:</b>",
-        f"Richtung:   {direction.upper()}  |  {leverage}x Hebel",
-        f"Entry:      {entry}",
+        f"Richtung: {direction.upper()}  |  {leverage}x Hebel",
+        f"Entry: {entry}",
     ]
     if close_px:
-        msg_lines.append(f"Schlusskurs: {close_px}")
+        msg_lines.append(f"Avg Close: {close_px:.5f}")
     if sl_price:
-        msg_lines.append(f"SL war:     {sl_price}")
-    if hold_str != "?":
-        msg_lines.append(f"Haltedauer: {hold_str}")
+        msg_lines.append(f"SL war: {sl_price}")
     msg_lines += [
         f"",
         f"Status bereinigt ✓",
@@ -881,14 +920,13 @@ def setup_new_trade(pos: dict):
     )
 
     # ── 4. TP1–TP4 setzen ───────────────────────────────────
-    log(f"  Setze TPs für Gesamtposition (3x {size} = {size*3:.2f})...")
-    # TPs werden auf Basis der GESAMTEN geplanten Position berechnet
-    # (Initial + DCA1 + DCA2 = 3x Initialgrösse)
-    total_planned = size * 3
+    # TPs auf Basis der tatsächlichen aktuellen Position setzen.
+    # DCA-Orders sind noch nicht gefüllt — wird automatisch angepasst wenn sie füllen.
+    log(f"  Setze TPs für aktuelle Position (Qty={size})...")
     cancel_all_tp_orders(symbol)
     time.sleep(1)
     count, tp_prices = place_tp_orders(
-        symbol, entry, total_planned, direction, leverage, mark
+        symbol, entry, size, direction, leverage, mark
     )
 
     # ── 5. Status speichern ─────────────────────────────────
@@ -953,7 +991,6 @@ def get_existing_tps(symbol: str) -> list:
     result = api_get("/api/v2/mix/order/orders-plan-pending", {
         "symbol":      symbol,
         "productType": PRODUCT_TYPE,
-        "planType":    "profit_plan",
     })
     if result.get("code") != "00000":
         return []
