@@ -347,14 +347,29 @@ def cancel_all_tp_orders(symbol: str):
         return
     log(f"  {len(tp_orders)} bestehende TP(s) stornieren...")
     for order in tp_orders:
-        res = api_post("/api/v2/mix/order/cancel-plan-order", {
+        # cancel-tpsl-order ist der korrekte Endpoint für TP/SL Orders
+        # (place-tpsl-order → cancel-tpsl-order, nicht cancel-plan-order)
+        res = api_post("/api/v2/mix/order/cancel-tpsl-order", {
             "symbol":      symbol,
             "productType": PRODUCT_TYPE,
             "marginCoin":  MARGIN_COIN,
             "orderId":     order.get("orderId"),
         })
-        status = "✓" if res.get("code") == "00000" else "✗"
-        log(f"    {status} {order.get('orderId')}")
+        if res.get("code") == "00000":
+            log(f"    ✓ Storniert: {order.get('orderId')}")
+        else:
+            # Fallback: cancel-plan-order versuchen
+            res2 = api_post("/api/v2/mix/order/cancel-plan-order", {
+                "symbol":      symbol,
+                "productType": PRODUCT_TYPE,
+                "marginCoin":  MARGIN_COIN,
+                "orderId":     order.get("orderId"),
+            })
+            if res2.get("code") == "00000":
+                log(f"    ✓ Storniert (fallback): {order.get('orderId')}")
+            else:
+                log(f"    ✗ Stornierung fehlgeschlagen: "
+                    f"{res.get('msg')} | {res2.get('msg')}")
 
 
 def calc_tp_price(avg: float, roi: float,
