@@ -335,58 +335,49 @@ def kelly_recommendation(balance: float, winrate: float) -> dict:
 
 def cancel_all_tp_orders(symbol: str):
     """
-    Storniert ausschliesslich TP-Orders (profit_plan / pos_profit).
-    SL-Orders (loss_plan / pos_loss) werden nie angefasst.
+    Storniert alle TP-Orders (profit_plan) für ein Symbol.
+    TPs werden via place-tpsl-order gesetzt → sind Plan-Orders
+    → abrufen via orders-plan-pending, stornieren via cancel-plan-order.
+    SL (loss_plan via tpsl-pending-orders) wird nie angefasst.
     """
-    result = api_get("/api/v2/mix/order/tpsl-pending-orders", {
+    # Nur profit_plan Orders abrufen (= unsere TPs)
+    result = api_get("/api/v2/mix/order/orders-plan-pending", {
         "symbol":      symbol,
         "productType": PRODUCT_TYPE,
+        "planType":    "profit_plan",
     })
     if result.get("code") != "00000":
-        log(f"  ⚠ tpsl-pending-orders Fehler: {result.get('msg', result)}")
+        log(f"  ⚠ orders-plan-pending Fehler: {result.get('msg', result)}")
         return
 
-    all_orders = (result.get("data") or {}).get("entrustedList") or []
+    # Response kann Liste oder Dict mit entrustedList sein
+    data = result.get("data") or []
+    if isinstance(data, dict):
+        tp_orders = data.get("entrustedList") or []
+    else:
+        tp_orders = data
 
-    # Debug: alle Orders mit planType loggen
-    if all_orders:
-        types = set(o.get("planType", "?") for o in all_orders)
-        log(f"  Pending Orders: {len(all_orders)} total | Typen: {types}")
-
-    # NUR TP-Orders: profit_plan (order-level) oder pos_profit (pos-level)
-    TP_TYPES = {"profit_plan", "pos_profit"}
-    tp_orders = [o for o in all_orders if o.get("planType") in TP_TYPES]
+    # Nochmals sicherstellen: nur profit_plan
+    tp_orders = [o for o in tp_orders
+                 if o.get("planType", "") == "profit_plan"]
 
     if not tp_orders:
-        log(f"  Keine TP-Orders zum Stornieren gefunden")
+        log(f"  Keine TP-Orders gefunden (profit_plan)")
         return
 
     log(f"  {len(tp_orders)} TP(s) stornieren...")
     for order in tp_orders:
-        oid  = order.get("orderId")
-        ptype = order.get("planType", "?")
-        # cancel-tpsl-order für TP/SL Orders
-        res = api_post("/api/v2/mix/order/cancel-tpsl-order", {
+        oid = order.get("orderId")
+        res = api_post("/api/v2/mix/order/cancel-plan-order", {
             "symbol":      symbol,
             "productType": PRODUCT_TYPE,
             "marginCoin":  MARGIN_COIN,
             "orderId":     oid,
         })
         if res.get("code") == "00000":
-            log(f"    ✓ TP storniert ({ptype}): {oid}")
+            log(f"    ✓ TP storniert: {oid}")
         else:
-            # Fallback: cancel-plan-order
-            res2 = api_post("/api/v2/mix/order/cancel-plan-order", {
-                "symbol":      symbol,
-                "productType": PRODUCT_TYPE,
-                "marginCoin":  MARGIN_COIN,
-                "orderId":     oid,
-            })
-            if res2.get("code") == "00000":
-                log(f"    ✓ TP storniert via fallback ({ptype}): {oid}")
-            else:
-                log(f"    ✗ TP Stornierung fehlgeschlagen ({ptype}): "
-                    f"{res.get('msg')} / {res2.get('msg')}")
+            log(f"    ✗ Fehler: {res.get('msg', res)}")
 
 
 def calc_tp_price(avg: float, roi: float,
