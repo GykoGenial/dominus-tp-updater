@@ -268,8 +268,11 @@ def get_recent_fills_all(since_ms: int) -> list:
 
 def get_sl_price(symbol: str, direction: str) -> float:
     """
-    Liest den bestehenden SL-Preis aus den pending TPSL-Orders.
-    Du setzt den SL (Ausstiegslinie) beim Trade-Einstieg auf Bitget.
+    Liest den bestehenden SL-Preis.
+    Bitget kennt zwei SL-Typen:
+      loss_plan  = manuell vom User gesetzt (Ausstiegslinie)
+      pos_loss   = von Script gesetzt via place-pos-tpsl (SL auf Entry nach TP1)
+    Beide werden erkannt.
     """
     result = api_get("/api/v2/mix/order/tpsl-pending-orders", {
         "symbol":      symbol,
@@ -277,11 +280,18 @@ def get_sl_price(symbol: str, direction: str) -> float:
     })
     if result.get("code") != "00000":
         return 0.0
-    orders = result.get("data", {}).get("entrustedList", [])
+    orders = (result.get("data") or {}).get("entrustedList") or []
+
+    # Beide SL-Typen prüfen — loss_plan (manuell) und pos_loss (Script)
+    SL_TYPES = {"loss_plan", "pos_loss"}
     for o in orders:
-        if (o.get("planType") == "loss_plan"
+        if (o.get("planType") in SL_TYPES
                 and o.get("holdSide") == direction):
-            return float(o.get("triggerPrice", 0))
+            price = float(o.get("triggerPrice", 0) or 0)
+            if price > 0:
+                log(f"  SL gefunden: planType={o.get('planType')} "
+                    f"@ {price} ({direction})")
+                return price
     return 0.0
 
 
