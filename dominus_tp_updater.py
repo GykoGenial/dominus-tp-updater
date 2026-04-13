@@ -469,6 +469,83 @@ def place_tp_orders(symbol: str, avg: float, size: float,
 # SL AUF ENTRY SETZEN (nach TP1)
 # ═══════════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════════
+# DCA ORDERS STORNIEREN (nach TP1)
+# ═══════════════════════════════════════════════════════════════
+
+def cancel_open_dca_orders(symbol: str, direction: str):
+    """
+    Storniert alle noch offenen DCA Limit-Orders nach TP1.
+    Nach SL auf Entry sind DCA-Nachkäufe nicht mehr gewünscht.
+    """
+    result = api_get("/api/v2/mix/order/orders-pending", {
+        "symbol":      symbol,
+        "productType": PRODUCT_TYPE,
+    })
+    if result.get("code") != "00000":
+        log(f"  ⚠ DCA-Abruf Fehler: {result.get('msg', result)}")
+        return
+
+    data   = result.get("data") or {}
+    orders = data.get("entrustedList") or [] if isinstance(data, dict) else data
+
+    # Nur Open-Orders in Richtung des Trades (DCA = gleiche Seite wie Entry)
+    side = "buy" if direction == "long" else "sell"
+    dca_orders = [
+        o for o in orders
+        if o.get("side") == side
+        and o.get("tradeSide") == "open"
+        and o.get("orderType") == "limit"
+    ]
+
+    if not dca_orders:
+        log(f"  Keine offenen DCA-Orders gefunden")
+        return
+
+    log(f"  {len(dca_orders)} DCA-Order(s) stornieren...")
+    for order in dca_orders:
+        oid = order.get("orderId")
+        price = order.get("price", "?")
+        res = api_post("/api/v2/mix/order/cancel-order", {
+            "symbol":      symbol,
+            "productType": PRODUCT_TYPE,
+            "orderId":     oid,
+        })
+        if res.get("code") == "00000":
+            log(f"    ✓ DCA storniert @ {price} USDT: {oid}")
+        else:
+            log(f"    ✗ DCA Stornierung fehlgeschlagen: "
+                f"{res.get('msg', res)}")
+
+
+# ═══════════════════════════════════════════════════════════════
+# POSITION GESCHLOSSEN ERKENNEN
+# ═══════════════════════════════════════════════════════════════
+
+def handle_position_closed(symbol: str, reason: str = ""):
+    """
+    Wird aufgerufen wenn eine Position vollständig geschlossen wurde.
+    Bereinigt den internen Status für das nächste Setup.
+    """
+    log(f"Position geschlossen: {symbol} ({reason})")
+
+    # Internen Status zurücksetzen
+    last_known_avg.pop(symbol, None)
+    last_known_size.pop(symbol, None)
+    new_trade_done.pop(symbol, None)
+    sl_at_entry.pop(symbol, None)
+
+    # Noch offene DCA/TP-Orders aufräumen (Sicherheit)
+    cancel_all_tp_orders(symbol)
+
+    telegram(
+        f"✅ <b>Position geschlossen — {symbol}</b>\n"
+        f"{reason}\n\n"
+        f"Status bereinigt. Bereit für neues Setup.\n"
+        f"/berechnen für neuen Trade"
+    )
+
+
 def set_sl_at_entry(symbol: str, direction: str, entry_price: float):
     """SL auf Einstiegspreis setzen — DOMINUS-Regel nach TP1."""
     decimals = get_price_decimals(symbol)
@@ -485,12 +562,15 @@ def set_sl_at_entry(symbol: str, direction: str, entry_price: float):
 
     if result.get("code") == "00000":
         log(f"  ✓ SL auf Entry gesetzt: {sl_str} USDT ({symbol})")
+        sl_at_entry[symbol] = True
+        # DCA Limit-Orders stornieren — nicht mehr nötig nach TP1
+        cancel_open_dca_orders(symbol, direction)
         telegram(
             f"🔒 <b>SL auf Entry — {symbol}</b>\n"
             f"TP1 ausgelöst → SL auf {sl_str} USDT\n"
-            f"Position abgesichert ✓"
+            f"✓ Position abgesichert\n"
+            f"✓ DCA-Orders storniert"
         )
-        sl_at_entry[symbol] = True
     else:
         log(f"  ✗ SL-Anpassung fehlgeschlagen: {result.get('msg', result)}")
 
@@ -1517,6 +1597,13 @@ def main():
                     # Grösse aktualisieren (Position teilweise geschlossen)
                     elif kno_size > 0 and cur_size != kno_size:
                         last_known_size[sym] = cur_size
+
+                # Geschlossene Positionen erkennen
+                # (Position war bekannt, ist jetzt nicht mehr in get_all_positions)
+                active_symbols = {p.get("symbol") for p in get_all_positions()}
+                for sym in list(last_known_avg.keys()):
+                    if sym not in active_symbols and last_known_avg.get(sym, 0) > 0:
+                        handle_position_closed(sym, "SL oder TP4 ausgelöst")
 
         except requests.exceptions.ConnectionError:
             log("Verbindungsfehler. Retry in 30s...")
