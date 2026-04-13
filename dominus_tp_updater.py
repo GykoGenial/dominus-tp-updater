@@ -523,6 +523,26 @@ def place_dca_orders(symbol: str, entry: float, sl: float,
 # NEUER TRADE — VOLLSTÄNDIGES SETUP
 # ═══════════════════════════════════════════════════════════════
 
+def tv_chart_links(symbol: str) -> dict:
+    """
+    Generiert TradingView Chart-Links für ein Symbol.
+    Format: BITGET:ETHUSDT.P
+    Timeframe 120 = H2, 240 = H4
+    """
+    # Symbol bereinigen: ETHUSDT → ETHUSDT.P
+    tv_sym = symbol.upper()
+    if not tv_sym.endswith(".P"):
+        tv_sym = tv_sym + ".P"
+
+    base = "https://www.tradingview.com/chart"
+    return {
+        "coin_h2":  f"{base}/?symbol=BITGET:{tv_sym}&interval=120",
+        "coin_h4":  f"{base}/?symbol=BITGET:{tv_sym}&interval=240",
+        "btc_h2":   f"{base}/?symbol=BITGET:BTCUSDT.P&interval=120",
+        "total2":   f"{base}/?symbol=CRYPTOCAP:TOTAL2&interval=120",
+    }
+
+
 def setup_new_trade(pos: dict):
     """
     Vollständiges Setup für einen neuen Trade:
@@ -568,25 +588,56 @@ def setup_new_trade(pos: dict):
     sl_price = get_sl_price(symbol, direction)
 
     if sl_price == 0:
-        log(f"  ⚠ Kein SL gefunden! Bitte SL (Ausstiegslinie) auf "
-            f"Bitget setzen. DCA-Orders werden NICHT gesetzt.")
-        telegram(
-            f"⚠️ <b>Neuer Trade: {symbol} {direction.upper()}</b>\n"
-            f"Entry: {entry} | Hebel: {leverage}x\n\n"
-            f"❌ Kein SL gesetzt!\n"
-            f"Bitte SL (Ausstiegslinie) auf Bitget setzen.\n"
-            f"DCA-Orders wurden nicht gesetzt."
-        )
-        # Nur TPs setzen
-        cancel_all_tp_orders(symbol)
-        time.sleep(1)
-        count, tp_prices = place_tp_orders(
-            symbol, entry, size, direction, leverage, mark
-        )
-        last_known_avg[symbol]  = entry
-        last_known_size[symbol] = size
-        new_trade_done[symbol]  = True
-        return
+        # ── Kein SL gesetzt → automatisch auf -25% berechnen ─────────
+        # Long:  SL = entry * (1 - 0.25 / leverage)
+        # Short: SL = entry * (1 + 0.25 / leverage)
+        factor   = 0.25 / leverage
+        sl_auto  = entry * (1 - factor) if direction == "long"                    else entry * (1 + factor)
+        decimals = get_price_decimals(symbol)
+        sl_str   = round_price(sl_auto, decimals)
+        sl_auto  = float(sl_str)
+        sl_dist  = abs(entry - sl_auto) / entry * 100
+
+        log(f"  ⚠ Kein SL gefunden — Auto-SL bei -25%: {sl_str} USDT")
+
+        res = api_post("/api/v2/mix/order/place-pos-tpsl", {
+            "symbol":               symbol,
+            "productType":          PRODUCT_TYPE,
+            "marginCoin":           MARGIN_COIN,
+            "holdSide":             direction,
+            "stopLossTriggerPrice": sl_str,
+            "stopLossTriggerType":  "mark_price",
+        })
+
+        links = tv_chart_links(symbol)
+        if res.get("code") == "00000":
+            log(f"  ✓ Auto-SL gesetzt @ {sl_str} (-25% Schutz)")
+            telegram(
+                f"\U0001f6e1 <b>Auto-SL gesetzt \u2014 {symbol}</b>\n"
+                f"Kein SL gefunden \u2192 -25% Schutz aktiviert\n\n"
+                f"SL: {sl_str} USDT ({sl_dist:.1f}% Abstand)\n"
+                f"Hebel: {leverage}x | Entry: {entry}\n\n"
+                f"\u26a0\ufe0f Bitte pr\u00fcfen ob SL mit deiner\n"
+                f"Ausstiegslinie \u00fcbereinstimmt!\n\n"
+                f"H4 {symbol}: {links['coin_h4']}\n"
+                f"H2 {symbol}: {links['coin_h2']}"
+            )
+            sl_price = sl_auto
+        else:
+            log(f"  ✗ Auto-SL fehlgeschlagen: {res.get('msg', res)}")
+            telegram(
+                f"\u274c <b>Kein SL \u2014 {symbol}</b>\n"
+                f"Auto-SL fehlgeschlagen. Bitte manuell setzen!\n"
+                f"Empfehlung: {sl_str} USDT ({sl_dist:.1f}%)\n\n"
+                f"H4: {links['coin_h4']}"
+            )
+            cancel_all_tp_orders(symbol)
+            time.sleep(1)
+            place_tp_orders(symbol, entry, size, direction, leverage, mark)
+            last_known_avg[symbol]  = entry
+            last_known_size[symbol] = size
+            new_trade_done[symbol]  = True
+            return
 
     # ── Hebel-Empfehlung & R:R-Check ─────────────────────
     sl_dist_pct   = abs(entry - sl_price) / entry * 100
@@ -662,7 +713,12 @@ def setup_new_trade(pos: dict):
         + "\n".join(tp_prices) + "\n\n"
         f"💰 Margin/Order ≈ {order_margin:.2f} USDT\n"
         f"📊 Total ≈ {order_margin*3:.2f} USDT "
-        f"({order_margin*3/balance*100:.1f}% Kapital)"
+        f"({order_margin*3/balance*100:.1f}% Kapital)\n\n"
+        f"📈 Charts:\n"
+        f"H2 {symbol}: {tv_chart_links(symbol)['coin_h2']}\n"
+        f"H4 {symbol}: {tv_chart_links(symbol)['coin_h4']}\n"
+        f"BTC H2: {tv_chart_links(symbol)['btc_h2']}\n"
+        f"Total2: {tv_chart_links(symbol)['total2']}"
         if balance > 0 else ""
     )
     telegram(msg)
@@ -836,6 +892,10 @@ def cmd_berechnen():
 
     lines += [
         "",
+        "📈 <b>Markt-Übersicht:</b>",
+        f"<a href=\"https://www.tradingview.com/chart/?symbol=BITGET:BTCUSDT.P&interval=120\">BTC H2</a>  |  "
+        f"<a href=\"https://www.tradingview.com/chart/?symbol=CRYPTOCAP:TOTAL2&interval=120\">Total2 H2</a>",
+        "",
         "📋 <b>Befehle:</b>",
         "/berechnen — dieser Status",
         "/trade SYMBOL LONG|SHORT HEBEL ENTRY SL",
@@ -961,12 +1021,26 @@ def cmd_trade(parts: list):
     if warnings:
         lines += ["", "⚠️ <b>Warnungen:</b>"] + warnings
 
+    links       = tv_chart_links(symbol)
+    coin_h2_url = links["coin_h2"]
+    coin_h4_url = links["coin_h4"]
+    btc_url     = links["btc_h2"]
+    total2_url  = links["total2"]
     lines += [
         "",
-        "✅ Platziere Market Order + SL auf Bitget.",
-        "Script setzt DCA + TPs automatisch."
+        "✔︎ HARSI nicht in Extremzone?",
+        "✔︎ DOMINUS Impuls im Premium-Bereich?",
+        "✔︎ BTC + Total2 gleiche Richtung?",
+        "",
+        "✅ Wenn ja: Market Order + SL auf Bitget setzen.",
+        "Script setzt DCA + TPs automatisch.",
+        "",
+        "📈 Charts:",
+        f'H2 {symbol} (HARSI): {coin_h2_url}',
+        f'H4 {symbol} (Premium): {coin_h4_url}',
+        f'BTC H2 (Momentum): {btc_url}',
+        f'Total2 H2 (Altcoins): {total2_url}',
     ]
-
     reply("\n".join(lines))
 
 
@@ -974,14 +1048,21 @@ def cmd_hilfe():
     reply(
         "🤖 <b>DOMINUS Bot — Befehle</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "/berechnen — Kontostand, offene Positionen, Money-Management\n"
+        "/berechnen — Kontostand + Positionen + BTC/Total2 Links\n"
         "/trade SYMBOL LONG|SHORT HEBEL ENTRY SL\n"
-        "   → Berechnet Trade-Setup (führt nichts aus)\n"
+        "   → Setup berechnen + alle Chart-Links\n"
         "   Beispiel: /trade ETHUSDT LONG 10 2850 2700\n"
         "/status — Kurzstatus aller Positionen\n"
         "/hilfe — diese Übersicht\n"
         "\n"
-        "Das Script setzt nach deinem Einstieg automatisch:\n"
+        "🎯 <b>Premium Setup (DOMINUS):</b>\n"
+        "Long: DOMINUS Impuls in dunkelgrüner Zone\n"
+        "   (zwischen überverkauft und Mittellinie)\n"
+        "Short: DOMINUS Impuls in dunkelroter Zone\n"
+        "   (zwischen überkauft und Mittellinie)\n"
+        "→ Kein Premium = Trade möglich, aber höheres Risiko\n"
+        "\n"
+        "⚙️ <b>Automatisch nach Einstieg:</b>\n"
         "• DCA1 + DCA2 Limit-Orders\n"
         "• TP1–TP4 (15/20/25/40%)\n"
         "• SL auf Entry nach TP1"
