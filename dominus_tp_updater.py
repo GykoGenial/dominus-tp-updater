@@ -97,6 +97,10 @@ new_trade_done:   dict = {}   # {symbol: bool} — DCA bereits gesetzt?
 price_decimals_cache: dict = {}
 last_update_id:   int  = 0    # Telegram: letzter verarbeiteter Update-ID
 
+# Trade-Daten für Auswertung bei Abschluss
+# {symbol: {entry, direction, leverage, sl, peak_size, open_ts}}
+trade_data: dict = {}
+
 
 # ═══════════════════════════════════════════════════════════════
 # BASIS-FUNKTIONEN
@@ -518,6 +522,36 @@ def cancel_open_dca_orders(symbol: str, direction: str):
                 f"{res.get('msg', res)}")
 
 
+def get_closed_pnl(symbol: str, since_ms: int) -> dict:
+    """
+    Holt realisierten P&L der zuletzt geschlossenen Position via Bitget.
+    Gibt {'realized_pnl': float, 'fee': float, 'net_pnl': float} zurück.
+    """
+    result = api_get("/api/v2/mix/position/history-position", {
+        "symbol":      symbol,
+        "productType": PRODUCT_TYPE,
+        "limit":       "1",
+    })
+    if result.get("code") != "00000":
+        return {}
+    positions = (result.get("data") or {}).get("list") or []
+    if not positions:
+        return {}
+    pos = positions[0]
+    realized = float(pos.get("achievedProfits", 0) or 0)
+    fee      = float(pos.get("totalFee", 0) or 0)
+    net      = realized - abs(fee)
+    return {
+        "realized_pnl": realized,
+        "fee":          fee,
+        "net_pnl":      net,
+        "open_price":   float(pos.get("openPriceAvg", 0) or 0),
+        "close_price":  float(pos.get("closeAvgPrice", 0) or 0),
+        "total_size":   float(pos.get("openSize", 0) or 0),
+        "hold_time":    pos.get("holdTime", ""),
+    }
+
+
 # ═══════════════════════════════════════════════════════════════
 # POSITION GESCHLOSSEN ERKENNEN
 # ═══════════════════════════════════════════════════════════════
@@ -525,25 +559,86 @@ def cancel_open_dca_orders(symbol: str, direction: str):
 def handle_position_closed(symbol: str, reason: str = ""):
     """
     Wird aufgerufen wenn eine Position vollständig geschlossen wurde.
-    Bereinigt den internen Status für das nächste Setup.
+    Berechnet P&L, sendet Auswertung per Telegram, bereinigt Status.
     """
     log(f"Position geschlossen: {symbol} ({reason})")
+
+    # Trade-Daten für Auswertung holen
+    td       = trade_data.get(symbol, {})
+    entry    = td.get("entry", last_known_avg.get(symbol, 0))
+    direction = td.get("direction", "?")
+    leverage  = td.get("leverage", 10)
+    sl_price  = td.get("sl", 0)
+    open_ts   = td.get("open_ts", int(time.time() * 1000))
+    peak_size = td.get("peak_size", last_known_size.get(symbol, 0))
+
+    # Realisierten P&L von Bitget holen
+    pnl_data = get_closed_pnl(symbol, open_ts)
+    net_pnl  = pnl_data.get("net_pnl", 0)
+    realized = pnl_data.get("realized_pnl", 0)
+    fee      = pnl_data.get("fee", 0)
+    close_px = pnl_data.get("close_price", 0)
+    hold_h   = pnl_data.get("hold_time", "")
+
+    # Gewinn/Verlust bestimmen
+    won = net_pnl > 0
+    icon = "🏆" if won else "🔴"
+    result_label = "GEWINN" if won else "VERLUST"
+
+    # ROI berechnen (auf eingesetztes Kapital)
+    margin = (entry * peak_size / leverage) if entry and leverage else 0
+    roi_pct = (net_pnl / margin * 100) if margin > 0 else 0
+
+    # Haltedauer formatieren
+    try:
+        hold_ms = int(hold_h) if hold_h else 0
+        hold_h_num = hold_ms // 3600000
+        hold_m_num = (hold_ms % 3600000) // 60000
+        hold_str = f"{hold_h_num}h {hold_m_num}m" if hold_ms else "?"
+    except Exception:
+        hold_str = str(hold_h) if hold_h else "?"
+
+    log(f"  P&L: {net_pnl:+.2f} USDT | ROI: {roi_pct:+.1f}% | "
+        f"Fee: {fee:.2f} USDT")
+
+    msg_lines = [
+        f"{icon} <b>Trade abgeschlossen — {symbol}</b>",
+        f"━━━━━━━━━━━━━━━━━━━━━━",
+        f"Ergebnis: <b>{result_label}</b>",
+        f"",
+        f"📊 <b>Auswertung:</b>",
+        f"Netto P&L:  {net_pnl:+.2f} USDT",
+        f"ROI:        {roi_pct:+.1f}% auf Margin",
+        f"Realisiert: {realized:+.2f} USDT",
+        f"Gebühren:   {fee:.2f} USDT",
+        f"",
+        f"📋 <b>Trade-Details:</b>",
+        f"Richtung:   {direction.upper()}  |  {leverage}x Hebel",
+        f"Entry:      {entry}",
+    ]
+    if close_px:
+        msg_lines.append(f"Schlusskurs: {close_px}")
+    if sl_price:
+        msg_lines.append(f"SL war:     {sl_price}")
+    if hold_str != "?":
+        msg_lines.append(f"Haltedauer: {hold_str}")
+    msg_lines += [
+        f"",
+        f"Status bereinigt ✓",
+        f"/berechnen für neuen Trade",
+    ]
+
+    telegram("\n".join(msg_lines))
 
     # Internen Status zurücksetzen
     last_known_avg.pop(symbol, None)
     last_known_size.pop(symbol, None)
     new_trade_done.pop(symbol, None)
     sl_at_entry.pop(symbol, None)
+    trade_data.pop(symbol, None)
 
-    # Noch offene DCA/TP-Orders aufräumen (Sicherheit)
+    # Noch offene TP-Orders aufräumen (Sicherheit)
     cancel_all_tp_orders(symbol)
-
-    telegram(
-        f"✅ <b>Position geschlossen — {symbol}</b>\n"
-        f"{reason}\n\n"
-        f"Status bereinigt. Bereit für neues Setup.\n"
-        f"/berechnen für neuen Trade"
-    )
 
 
 def set_sl_at_entry(symbol: str, direction: str, entry_price: float):
@@ -796,6 +891,15 @@ def setup_new_trade(pos: dict):
     last_known_size[symbol] = size
     new_trade_done[symbol]  = True
     sl_at_entry[symbol]     = False
+    # Trade-Daten für spätere Auswertung
+    trade_data[symbol] = {
+        "entry":     entry,
+        "direction": direction,
+        "leverage":  leverage,
+        "sl":        sl_price,
+        "peak_size": size,
+        "open_ts":   int(time.time() * 1000),
+    }
 
     # ── 6. Telegram-Zusammenfassung ─────────────────────────
     dca1_str = dca_results[0] if len(dca_results) > 0 else "Fehler"
@@ -994,6 +1098,11 @@ def update_tp_for_position(pos: dict, reason: str):
 
     last_known_avg[symbol]  = avg
     last_known_size[symbol] = total
+    # Peak-Grösse für Auswertung aktualisieren
+    if symbol in trade_data:
+        trade_data[symbol]["peak_size"] = max(
+            trade_data[symbol].get("peak_size", 0), total
+        )
 
 
 # ═══════════════════════════════════════════════════════════════
