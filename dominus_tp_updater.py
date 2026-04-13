@@ -40,9 +40,15 @@ import base64
 import time
 import json
 import os
+import threading
 import requests
 import math
 from datetime import datetime
+try:
+    from flask import Flask, request as flask_request, jsonify
+    FLASK_AVAILABLE = True
+except ImportError:
+    FLASK_AVAILABLE = False
 
 # ═══════════════════════════════════════════════════════════════
 # KONFIGURATION — aus Railway Variables
@@ -72,6 +78,7 @@ POLL_INTERVAL = 20    # Sekunden zwischen Checks
 
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+WEBHOOK_SECRET   = os.environ.get("WEBHOOK_SECRET", "dominus")  # Token für TradingView
 
 # Finanzmathematische Parameter
 WINRATE = float(os.environ.get("WINRATE", "0.55"))  # eigene Winrate (historisch)
@@ -525,16 +532,14 @@ def place_dca_orders(symbol: str, entry: float, sl: float,
 
 def tv_chart_links(symbol: str) -> dict:
     """
-    Generiert TradingView Chart-Links für ein Symbol.
-    Format: BITGET:ETHUSDT.P
-    Timeframe 120 = H2, 240 = H4
+    Generiert TradingView Chart-Links mit gespeichertem Layout lX5eDAis.
+    Symbol wird automatisch getauscht, Timeframe angepasst.
     """
-    # Symbol bereinigen: ETHUSDT → ETHUSDT.P
     tv_sym = symbol.upper()
     if not tv_sym.endswith(".P"):
         tv_sym = tv_sym + ".P"
 
-    base = "https://www.tradingview.com/chart"
+    base = "https://www.tradingview.com/chart/lX5eDAis"
     return {
         "coin_h2":  f"{base}/?symbol=BITGET:{tv_sym}&interval=120",
         "coin_h4":  f"{base}/?symbol=BITGET:{tv_sym}&interval=240",
@@ -1137,6 +1142,119 @@ def poll_telegram_commands():
 
 
 # ═══════════════════════════════════════════════════════════════
+# WEBHOOK SERVER — empfängt TradingView Alerts
+# ═══════════════════════════════════════════════════════════════
+
+def start_webhook_server():
+    """
+    Startet einen Flask HTTP-Server in einem separaten Thread.
+    TradingView sendet Alerts per POST an /webhook?token=SECRET
+
+    Erwartet JSON-Payload:
+    {
+      "symbol":    "ETHUSDT" oder "BITGET:ETHUSDT.P",
+      "direction": "long" oder "short",
+      "entry":     2850.50,        (optional — nimmt aktuellen Kurs wenn leer)
+      "timeframe": "H2"            (optional — für Log)
+    }
+    """
+    if not FLASK_AVAILABLE:
+        log("Flask nicht installiert — Webhook-Server deaktiviert")
+        log("requirements.txt: flask hinzufügen")
+        return
+
+    app = Flask(__name__)
+
+    @app.route("/webhook", methods=["POST"])
+    def webhook():
+        # ── Token-Prüfung ─────────────────────────────────────
+        token = flask_request.args.get("token", "")
+        if token != WEBHOOK_SECRET:
+            log("⚠ Webhook: Ungültiger Token")
+            return jsonify({"error": "unauthorized"}), 401
+
+        # ── Payload parsen ────────────────────────────────────
+        try:
+            data = flask_request.get_json(force=True) or {}
+        except Exception:
+            return jsonify({"error": "invalid json"}), 400
+
+        raw_symbol = data.get("symbol", "").upper()
+        direction  = data.get("direction", "").lower()
+        entry      = float(data.get("entry", 0) or 0)
+        timeframe  = data.get("timeframe", "H2").upper()
+
+        # Symbol bereinigen: BITGET:ETHUSDT.P → ETHUSDT
+        symbol = raw_symbol
+        for prefix in ["BITGET:", "BYBIT:", "BINANCE:"]:
+            symbol = symbol.replace(prefix, "")
+        symbol = symbol.replace(".P", "").replace("PERP", "")
+        if not symbol.endswith("USDT"):
+            symbol += "USDT"
+
+        if not symbol or direction not in ("long", "short"):
+            return jsonify({"error": "missing symbol or direction"}), 400
+
+        log(f"📡 TradingView Alert: {symbol} {direction.upper()} "
+            f"@ {entry} [{timeframe}]")
+
+        # ── Aktuellen Kurs nehmen falls kein Entry mitgeschickt ──
+        if entry == 0:
+            entry = get_mark_price(symbol)
+
+        # ── Kontostand & Hebel-Empfehlung berechnen ──────────
+        balance    = get_futures_balance()
+        kelly      = kelly_recommendation(balance, WINRATE)
+        links      = tv_chart_links(symbol)
+        per_order  = balance * 0.10 / 3
+
+        # ── Telegram-Nachricht senden ─────────────────────────
+        icon = "\U0001f7e2" if direction == "long" else "\U0001f534"
+        chk_dir = "gr\u00fcner" if direction == "long" else "roter"
+        msg_parts = [
+            f"{icon} <b>DOMINUS Signal \u2014 {symbol} {direction.upper()}</b>",
+            "\u2501" * 22,
+            f"Timeframe: {timeframe} | Kurs: {entry}",
+            "",
+            "\U0001f4cb <b>DOMINUS Checkliste:</b>",
+            "\u2610 DOMINUS Impuls Extremzone erreicht?",
+            "\u2610 H4 Buy/Sell Trigger best\u00e4tigt?",
+            "\u2610 HARSI nicht in Extremzone?",
+            "\u2610 BTC + Total2 gleiche Richtung?",
+            f"\u2610 Premium Setup? (Impuls in dunkel{chk_dir} Zone)",
+            "",
+            f"\U0001f4b0 Konto: {balance:.0f} USDT",
+            f"\U0001f4e6 Pro Order: {per_order:.0f} USDT",
+            f"\U0001f4ca Kelly {WINRATE*100:.0f}%: {kelly['kelly_pct']}%",
+            "",
+            "\u23f1 <b>30-Min-Fenster l\u00e4uft!</b>",
+            "Wenn alle Punkte \u2713:",
+            f"/trade {symbol} {direction.upper()} [HEBEL] {entry:.4f} [SL]",
+            "",
+            "\U0001f4c8 <b>Charts:</b>",
+            f"H2 {symbol}: {links['coin_h2']}",
+            f"H4 {symbol}: {links['coin_h4']}",
+            f"BTC H2: {links['btc_h2']}",
+            f"Total2: {links['total2']}",
+        ]
+        telegram("\n".join(msg_parts))
+
+        return jsonify({"status": "ok", "symbol": symbol,
+                        "direction": direction}), 200
+
+    @app.route("/health", methods=["GET"])
+    def health():
+        return jsonify({"status": "running",
+                        "version": "v4.1"}), 200
+
+    port = int(os.environ.get("PORT", 8080))
+    log(f"Webhook-Server gestartet auf Port {port}")
+    log(f"Endpoint: /webhook?token={WEBHOOK_SECRET}")
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+
+
+
+# ═══════════════════════════════════════════════════════════════
 # MAIN LOOP
 # ═══════════════════════════════════════════════════════════════
 
@@ -1150,6 +1268,10 @@ def main():
     log(f"Intervall: {POLL_INTERVAL}s")
     log("Warte auf neue Trades...")
     log("─" * 55)
+
+    # Webhook-Server in separatem Thread starten
+    t = threading.Thread(target=start_webhook_server, daemon=True)
+    t.start()
 
     # Beim Start: bestehende Positionen als bekannt markieren
     # (kein neues Setup — Trades laufen bereits)

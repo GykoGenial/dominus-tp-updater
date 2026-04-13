@@ -1,1 +1,1 @@
-worker: python dominus_tp_updater.py
+web: python dominus_tp_updater.py
