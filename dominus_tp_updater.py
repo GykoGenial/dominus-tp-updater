@@ -281,26 +281,54 @@ def get_recent_fills_all(since_ms: int) -> list:
 
 def _get_plan_orders(symbol: str) -> list:
     """
-    Liest alle offenen Plan-Orders für ein Symbol via orders-plan-pending.
-    Deckt ab: profit_plan (TP1-TP3), loss_plan (SL), pos_loss (SL),
-              normal (DCA Limit-Orders).
+    Liest alle offenen Plan-Orders (TPs, SL) für ein Symbol.
 
-    HINWEIS: tpsl-pending-orders gibt für diesen Account-Typ
-    "Request URL NOT FOUND" — orders-plan-pending ist der korrekte Endpoint.
+    Bitget v2 bietet zwei relevante Endpoints — beide werden versucht:
+      1. orders-plan-pending  (mit / ohne marginCoin, mit / ohne symbol)
+      2. tpsl-pending-orders  (als Fallback)
+
+    Deckt ab: profit_plan (TP1-TP3), loss_plan / pos_loss (SL).
     """
-    result = api_get("/api/v2/mix/order/orders-plan-pending", {
+    def _parse(raw) -> list:
+        if isinstance(raw, list):
+            return raw
+        if isinstance(raw, dict):
+            for key in ("entrustedList", "planList", "orderList", "data"):
+                lst = raw.get(key)
+                if isinstance(lst, list) and lst:
+                    return lst
+            # leeres dict aber code 00000 → leere Liste ist korrekt
+            return []
+        return []
+
+    # Versuch 1: orders-plan-pending mit symbol + marginCoin
+    r = api_get("/api/v2/mix/order/orders-plan-pending", {
         "productType": PRODUCT_TYPE,
         "symbol":      symbol,
+        "marginCoin":  MARGIN_COIN,
     })
-    if result.get("code") != "00000":
-        log(f"  [WARN] orders-plan-pending Fehler ({symbol}): "
-            f"{result.get('msg', result.get('code', '?'))}")
-        return []
-    raw = result.get("data")
-    if isinstance(raw, list):
-        return raw
-    if isinstance(raw, dict):
-        return raw.get("entrustedList") or raw.get("planList") or []
+    if r.get("code") == "00000":
+        return _parse(r.get("data"))
+
+    # Versuch 2: orders-plan-pending nur mit productType (dann symbol-Filter in Python)
+    r2 = api_get("/api/v2/mix/order/orders-plan-pending", {
+        "productType": PRODUCT_TYPE,
+    })
+    if r2.get("code") == "00000":
+        all_orders = _parse(r2.get("data"))
+        return [o for o in all_orders if o.get("symbol") == symbol]
+
+    # Versuch 3: tpsl-pending-orders mit marginCoin
+    r3 = api_get("/api/v2/mix/order/tpsl-pending-orders", {
+        "symbol":      symbol,
+        "productType": PRODUCT_TYPE,
+        "marginCoin":  MARGIN_COIN,
+    })
+    if r3.get("code") == "00000":
+        return _parse(r3.get("data"))
+
+    log(f"  [WARN] Alle Plan-Order Endpoints für {symbol} fehlgeschlagen: "
+        f"1={r.get('msg','?')} | 2={r2.get('msg','?')} | 3={r3.get('msg','?')}")
     return []
 
 
@@ -790,7 +818,7 @@ def handle_position_closed(symbol: str, reason: str = ""):
 
     msg_lines = [
         f"{icon} <b>Trade abgeschlossen — {symbol}</b>",
-        f"━━━━━━━━━━━━━━━━━━━━━━",
+        f"━━━━━━━━━━━━",
         f"Ergebnis: <b>{result_label}</b>",
         f"",
         f"📊 <b>Auswertung:</b>",
@@ -1147,7 +1175,7 @@ def setup_new_trade(pos: dict):
     lev_icon = "⚠️" if lev_diff > 2 else "✅"
     msg = (
         f"🚀 {dir_icon(direction)} <b>Neuer Trade — {symbol}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"━━━━━━━━━━━━\n"
         f"Richtung: {dir_icon(direction)} {direction.upper()} | Hebel: {leverage}x\n"
         f"Entry: {entry} USDT | SL: {sl_price} USDT\n\n"
         f"📐 <b>Analyse:</b>\n"
@@ -1359,7 +1387,7 @@ def cmd_berechnen():
 
     lines = [
         "💰 <b>Kontostand & Status</b>",
-        f"━━━━━━━━━━━━━━━━━━━━━━",
+        f"━━━━━━━━━━━━",
         f"Konto:        {balance:.2f} USDT",
         f"10%-Limit:    {max_10:.2f} USDT",
         f"Pro Order (÷3): {per_ord:.2f} USDT",
@@ -1503,7 +1531,7 @@ def cmd_trade(parts: list):
 
     lines = [
         f"🧮 <b>Trade-Berechnung — {symbol}</b>",
-        f"━━━━━━━━━━━━━━━━━━━━━━",
+        f"━━━━━━━━━━━━",
         f"Richtung: {dir_icon(direction)} {direction.upper()} | Hebel: {leverage}x",
         f"Entry: {entry} | SL: {sl} ({sl_dist_pct:.1f}%)",
         f"",
@@ -1556,7 +1584,7 @@ def cmd_trade(parts: list):
 def cmd_hilfe():
     reply(
         "🤖 <b>DOMINUS Bot — Befehle</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "━━━━━━━━━━━━\n"
         "/berechnen — Kontostand + Positionen + BTC/Total2 Links\n"
         "/trade SYMBOL LONG|SHORT HEBEL ENTRY SL\n"
         "   → Setup berechnen + alle Chart-Links\n"
@@ -1734,7 +1762,7 @@ def flush_h4_buffer():
 
     lines = [
         f"\U0001f4cb <b>H4 Trigger-Zusammenfassung \u2014 {now_str} Uhr</b>",
-        "\u2501" * 22,
+        "\u2501" * 12,
     ]
     if longs:
         lines.append("🟢↗️ <b>LONG:</b>")
@@ -1860,7 +1888,7 @@ def start_webhook_server():
         icon      = dir_icon(direction)
         msg_parts = [
             f"{icon} <b>H2 Signal \u2014 {symbol} {direction.upper()}</b>",
-            "\u2501" * 22,
+            "\u2501" * 12,
             f"Kurs: {entry}",
             "",
             "\U0001f4cb <b>DOMINUS Checkliste:</b>",
@@ -2587,20 +2615,18 @@ def report_position_startup(pos: dict):
         remaining = [t["label"] for t in state["tps_remaining"]]
         header = (
             f"🔍 <b>Startup-Check — {symbol}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"━━━━━━━━━━━━\n"
             f"{dir_icon(direction)} {direction.upper()} | Entry: {avg} | Qty: {size} | {leverage}x\n"
             f"Mark: {mark} | ROI: {pnl_sign}{pnl}%\n"
         )
         if tp1_done:
             header += f"TP1 Status: ausgelöst ({', '.join(tp1_src) if tp1_src else 'unbekannt'})\n"
-        header += "━━━━━━━━━━━━━━━━━━━━━━\n"
+        header += "━━━━━━━━━━━━\n"
 
         body = "\n".join(all_msgs)
-        footer = (
-            f"\n━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"➡️ Zum Reparieren: <code>/refresh {symbol}</code>"
-        )
-        telegram(header + body + footer)
+        telegram(header + body)
+        # Refresh-Befehl als separates Telegram → direkt kopierbar auf Mobile
+        telegram(f"<code>/refresh {symbol}</code>")
         log(f"  ⚠ {len(issues)} Problem(e), {len(warnings)} Warnung(en) → Telegram gesendet")
     else:
         log(f"  ✓ Alles korrekt — kein Eingriff nötig")
