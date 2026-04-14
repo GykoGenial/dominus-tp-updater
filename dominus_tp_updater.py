@@ -1554,6 +1554,8 @@ def cmd_hilfe():
         "   → Setup berechnen + alle Chart-Links\n"
         "   Beispiel: /trade ETHUSDT LONG 10 2850 2700\n"
         "/status — Kurzstatus aller Positionen\n"
+        "/refresh [SYMBOL] — SL/TP/DCA sofort prüfen & reparieren\n"
+        "   Beispiel: /refresh BTCUSDT  (oder /refresh für alle)\n"
         "/hilfe — diese Übersicht\n"
         "\n"
         "🎯 <b>Premium Setup (DOMINUS):</b>\n"
@@ -1593,6 +1595,72 @@ def cmd_status():
     reply("\n".join(lines))
 
 
+def cmd_refresh(parts: list):
+    """
+    /refresh [SYMBOL] — Prüft eine oder alle offenen Positionen sofort und
+    repariert fehlende/falsche SL, TP und DCA-Orders gemäss DOMINUS-Schema.
+
+    Beispiele:
+      /refresh BTCUSDT   → nur BTCUSDT prüfen
+      /refresh           → alle offenen Positionen prüfen
+    """
+    positions = get_all_positions()
+    if not positions:
+        reply("ℹ️ Keine offenen Positionen gefunden.")
+        return
+
+    # Symbol aus Argument extrahieren (z.B. /refresh BTCUSDT)
+    target = parts[1].upper() if len(parts) > 1 else None
+
+    # Ggf. filtern
+    if target:
+        matched = [p for p in positions if p.get("symbol", "").upper() == target]
+        if not matched:
+            # Freundlich: "BTCUSDT" kann auch als "BTC" eingegeben werden
+            matched = [p for p in positions
+                       if p.get("symbol", "").upper().startswith(target.rstrip("USDT"))]
+        if not matched:
+            reply(
+                f"⚠️ Keine offene Position für <b>{target}</b> gefunden.\n"
+                f"Offene Positionen: {', '.join(p.get('symbol','?') for p in positions)}"
+            )
+            return
+        positions_to_check = matched
+    else:
+        positions_to_check = positions
+
+    # Bestätigung vorab
+    symbols_str = ", ".join(p.get("symbol", "?") for p in positions_to_check)
+    reply(f"🔄 Refresh gestartet für: <b>{symbols_str}</b>\nPrüfe SL / TP / DCA…")
+
+    log(f"[/refresh] Manueller Check für: {symbols_str}")
+
+    for pos in positions_to_check:
+        sym = pos.get("symbol", "?")
+        log(f"[/refresh] ── {sym}")
+        check_and_repair_position(pos)
+
+    # Abschlussbericht
+    lines = [f"✅ <b>Refresh abgeschlossen</b> — {symbols_str}"]
+    for pos in positions_to_check:
+        sym  = pos.get("symbol", "?")
+        drct = pos.get("holdSide", "?").upper()
+        lev  = int(float(pos.get("leverage", 10)))
+        avg  = float(pos.get("openPriceAvg", 0))
+        mark = get_mark_price(sym)
+        sl   = get_sl_price(sym, pos.get("holdSide", "long"))
+        tps  = get_existing_tps(sym)
+        n_tp = len(tps)
+        secured = sl_at_entry.get(sym, False)
+        lock = "🔒 SL=Entry" if secured else (f"🛡 SL={sl:.4f}" if sl > 0 else "⚠️ Kein SL!")
+        lines.append(
+            f"\n📍 <b>{sym}</b> {drct} {lev}x\n"
+            f"   Entry={avg:.4f} | Mark={mark}\n"
+            f"   {lock} | TPs gesetzt: {n_tp}"
+        )
+    reply("\n".join(lines))
+
+
 def poll_telegram_commands():
     """
     Prüft auf neue Telegram-Nachrichten und führt Befehle aus.
@@ -1628,6 +1696,8 @@ def poll_telegram_commands():
             cmd_trade(parts)
         elif cmd == "/status":
             cmd_status()
+        elif cmd == "/refresh":
+            cmd_refresh(parts)
         elif cmd == "/hilfe" or cmd == "/start" or cmd == "/help":
             cmd_hilfe()
         else:
