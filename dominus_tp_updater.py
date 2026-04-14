@@ -351,7 +351,12 @@ def get_sl_price(symbol: str, direction: str) -> float:
     if result.get("code") == "00000":
         for pos in (result.get("data") or []):
             if pos.get("holdSide") == direction:
-                for field in ("stopLossPrice", "stopLoss", "stopLossTriggerPrice"):
+                # DEBUG: alle Felder ausgeben um richtigen SL-Feldnamen zu finden
+                sl_related = {k: v for k, v in pos.items()
+                              if any(x in k.lower() for x in ("sl", "stop", "loss", "tp", "profit"))}
+                log(f"  [DEBUG] Position SL/TP Felder: {sl_related}")
+                for field in ("stopLossPrice", "stopLoss", "stopLossTriggerPrice",
+                              "slPrice", "sl", "stopPrice"):
                     sl = float(pos.get(field, 0) or 0)
                     if sl > 0:
                         log(f"  SL aus Position.{field}: {sl}")
@@ -883,7 +888,10 @@ def _get_pos_tp_price(symbol: str, direction: str) -> float:
     if result.get("code") == "00000":
         for pos in (result.get("data") or []):
             if pos.get("holdSide") == direction:
-                # Alle bekannten TP-Feldnamen prüfen
+                # DEBUG: alle Felder ausgeben um richtigen TP-Feldnamen zu finden
+                tp_related = {k: v for k, v in pos.items()
+                              if any(x in k.lower() for x in ("tp", "profit", "take"))}
+                log(f"  [DEBUG] Position TP Felder: {tp_related}")
                 for field in ("takeProfitPrice", "takeProfit", "tpPrice",
                               "takeProfitTriggerPrice"):
                     tp = float(pos.get(field, 0) or 0)
