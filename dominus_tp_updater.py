@@ -279,16 +279,42 @@ def get_recent_fills_all(since_ms: int) -> list:
 # SL LESEN
 # ═══════════════════════════════════════════════════════════════
 
+def _get_plan_orders(symbol: str) -> list:
+    """
+    Liest alle offenen Plan-Orders für ein Symbol via orders-plan-pending.
+    Deckt ab: profit_plan (TP1-TP3), loss_plan (SL), pos_loss (SL),
+              normal (DCA Limit-Orders).
+
+    HINWEIS: tpsl-pending-orders gibt für diesen Account-Typ
+    "Request URL NOT FOUND" — orders-plan-pending ist der korrekte Endpoint.
+    """
+    result = api_get("/api/v2/mix/order/orders-plan-pending", {
+        "productType": PRODUCT_TYPE,
+        "symbol":      symbol,
+    })
+    if result.get("code") != "00000":
+        log(f"  [WARN] orders-plan-pending Fehler ({symbol}): "
+            f"{result.get('msg', result.get('code', '?'))}")
+        return []
+    raw = result.get("data")
+    if isinstance(raw, list):
+        return raw
+    if isinstance(raw, dict):
+        return raw.get("entrustedList") or raw.get("planList") or []
+    return []
+
+
 def get_sl_price(symbol: str, direction: str) -> float:
     """
-    Liest den SL-Preis direkt aus den Positionsdaten — zuverlässigste Methode.
-    Bitget speichert den SL im Feld autoMarginReduction/stopLossPrice
-    der Position selbst, unabhängig davon wie er gesetzt wurde
-    (manuell loss_plan, via place-pos-tpsl pos_loss, etc.)
+    Liest den SL-Preis für eine offene Position.
 
-    Fallback: tpsl-pending-orders mit allen bekannten SL-Typen.
+    Methode 1: stopLossPrice aus Positionsdaten (place-pos-tpsl Typ).
+    Methode 2: loss_plan / pos_loss aus orders-plan-pending (plan-basierter SL).
+
+    ACHTUNG: liquidationPrice wird NICHT als SL gewertet — das ist der
+    Zwangsliquidierungspreis der Exchange, kein User-gesetzter Stop-Loss.
     """
-    # Primär: SL aus Positionsdaten lesen (alle SL-Feldnamen prüfen)
+    # Methode 1: SL aus Positionsdaten (position-level TP/SL via place-pos-tpsl)
     result = api_get("/api/v2/mix/position/single-position", {
         "symbol":      symbol,
         "productType": PRODUCT_TYPE,
@@ -297,58 +323,22 @@ def get_sl_price(symbol: str, direction: str) -> float:
     if result.get("code") == "00000":
         for pos in (result.get("data") or []):
             if pos.get("holdSide") == direction:
-                # Alle bekannten SL-Feldnamen in Bitget v2
-                for field in ("stopLossPrice", "stopLoss", "stopPrice",
-                              "stopLossTriggerPrice", "liquidationPrice"):
+                for field in ("stopLossPrice", "stopLoss", "stopLossTriggerPrice"):
                     sl = float(pos.get(field, 0) or 0)
                     if sl > 0:
                         log(f"  SL aus Position.{field}: {sl}")
                         return sl
-                # DEBUG: alle Felder loggen wenn kein SL gefunden
-                pos_keys = {k: v for k, v in pos.items()
-                            if v and v != "0" and "price" in k.lower()
-                            or k in ("stopLoss","takeProfitPrice","stopLossPrice")}
-                if pos_keys:
-                    log(f"  [DEBUG] Preisfelder in Position: {pos_keys}")
-                else:
-                    log(f"  [DEBUG] Keine Preisfelder in Position gefunden "
-                        f"(holdSide={pos.get('holdSide')}, "
-                        f"all keys: {list(pos.keys())})")
 
-    # Fallback: pending orders (alle SL-Typen)
-    result2 = api_get("/api/v2/mix/order/tpsl-pending-orders", {
-        "symbol":      symbol,
-        "productType": PRODUCT_TYPE,
-        "marginCoin":  MARGIN_COIN,
-    })
-    if result2.get("code") == "00000":
-        raw_data = result2.get("data")
-        # DEBUG: Antwortstruktur prüfen
-        if isinstance(raw_data, list):
-            log(f"  [DEBUG] tpsl-pending data ist eine Liste ({len(raw_data)} Einträge)")
-            orders = raw_data
-        elif isinstance(raw_data, dict):
-            orders = raw_data.get("entrustedList") or []
-            if not orders:
-                log(f"  [DEBUG] tpsl-pending data keys: {list(raw_data.keys())}, "
-                    f"entrustedList leer")
-        else:
-            orders = []
-            log(f"  [DEBUG] tpsl-pending data Typ unbekannt: {type(raw_data)}")
+    # Methode 2: Plan-Orders lesen (plan-basierter SL via place-tpsl-order)
+    orders = _get_plan_orders(symbol)
+    SL_TYPES = {"loss_plan", "pos_loss", "moving_plan"}
+    for o in orders:
+        if o.get("planType") in SL_TYPES and o.get("holdSide") == direction:
+            price = float(o.get("triggerPrice", 0) or 0)
+            if price > 0:
+                log(f"  SL aus plan-orders: {o.get('planType')} @ {price}")
+                return price
 
-        SL_TYPES = {"loss_plan", "pos_loss", "moving_plan"}
-        for o in orders:
-            if o.get("planType") in SL_TYPES and o.get("holdSide") == direction:
-                price = float(o.get("triggerPrice", 0) or 0)
-                if price > 0:
-                    log(f"  SL aus Orders: {o.get('planType')} @ {price}")
-                    return price
-        if orders:
-            log(f"  [DEBUG] tpsl-pending: {len(orders)} Orders, aber kein SL-Typ für "
-                f"{direction}. Typen: "
-                f"{list(set(o.get('planType','?') for o in orders))}")
-    else:
-        log(f"  [DEBUG] tpsl-pending Fehler: {result2.get('msg', result2.get('code','?'))}")
     return 0.0
 
 
@@ -412,24 +402,10 @@ def kelly_recommendation(balance: float, winrate: float) -> dict:
 def cancel_all_tp_orders(symbol: str):
     """
     Storniert alle TP-Orders (profit_plan) für ein Symbol.
-
-    TPs werden via place-tpsl-order gesetzt → erscheinen in tpsl-pending-orders
-    (NICHT in orders-plan-pending — das ist ein anderer Endpoint für andere Order-Typen).
-    Stornierung via cancel-plan-order.
-    SL (loss_plan, pos_loss) wird nie angefasst.
+    Liest via orders-plan-pending, storniert via cancel-plan-order.
+    SL-Typen (loss_plan, pos_loss) werden nie angefasst.
     """
-    result = api_get("/api/v2/mix/order/tpsl-pending-orders", {
-        "symbol":      symbol,
-        "productType": PRODUCT_TYPE,
-        "marginCoin":  MARGIN_COIN,
-    })
-    if result.get("code") != "00000":
-        log(f"  ⚠ tpsl-pending Fehler: {result.get('msg', result)}")
-        return
-
-    orders = (result.get("data") or {}).get("entrustedList") or []
-
-    # Nur profit_plan — SL-Typen (loss_plan, pos_loss) nicht anfassen
+    orders = _get_plan_orders(symbol)
     tp_orders = [o for o in orders if o.get("planType") == "profit_plan"]
 
     if not tp_orders:
@@ -1204,34 +1180,10 @@ def setup_new_trade(pos: dict):
 
 def get_existing_tps(symbol: str) -> list:
     """
-    Holt bestehende TP-Orders via tpsl-pending-orders.
+    Holt bestehende profit_plan TP-Orders via orders-plan-pending.
     Gibt Liste mit {'price': float, 'qty': float, 'orderId': str} zurück.
     """
-    result = api_get("/api/v2/mix/order/tpsl-pending-orders", {
-        "symbol":      symbol,
-        "productType": PRODUCT_TYPE,
-        "marginCoin":  MARGIN_COIN,
-    })
-    if result.get("code") != "00000":
-        log(f"  [DEBUG] get_existing_tps Fehler: {result.get('msg', result.get('code'))}")
-        return []
-
-    raw_data = result.get("data")
-    # Bitget v2 kann data als Liste ODER als dict mit entrustedList zurückgeben
-    if isinstance(raw_data, list):
-        orders = raw_data
-    elif isinstance(raw_data, dict):
-        orders = raw_data.get("entrustedList") or []
-    else:
-        orders = []
-
-    # DEBUG: alle planTypes loggen wenn keine profit_plans gefunden
-    all_types = list(set(o.get("planType", "?") for o in orders))
-    if orders and "profit_plan" not in all_types:
-        log(f"  [DEBUG] {len(orders)} Orders in tpsl-pending, aber kein profit_plan. "
-            f"Vorhandene Typen: {all_types}")
-        log(f"  [DEBUG] Erster Eintrag: {orders[0] if orders else 'leer'}")
-
+    orders = _get_plan_orders(symbol)
     tps = []
     direction_last = "long"
     for o in orders:
@@ -1242,9 +1194,7 @@ def get_existing_tps(symbol: str) -> list:
                 "orderId": o.get("orderId", ""),
             })
             direction_last = o.get("holdSide", "long")
-    # Nach Preis sortieren
-    tps.sort(key=lambda x: x["price"],
-             reverse=(direction_last == "short"))
+    tps.sort(key=lambda x: x["price"], reverse=(direction_last == "short"))
     return tps
 
 
@@ -2486,7 +2436,7 @@ def report_position_startup(pos: dict):
     gefundenen Probleme automatisch reparieren zu lassen.
 
     Geprüft wird:
-      - SL vorhanden? (via Position + tpsl-pending)
+      - SL vorhanden? (via Position.stopLossPrice + orders-plan-pending)
       - SL korrekt? (Entry-SL nach TP1, oder sinnvoller Schutz-SL)
       - TPs korrekt? (Anzahl und Preise passend zum Trade-Stand)
       - TP1 bereits ausgelöst? (preislich + fill-basiert + SL-basiert)
