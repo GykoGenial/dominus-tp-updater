@@ -422,7 +422,7 @@ def calc_tp_price(avg: float, roi: float,
 
 def place_tp_orders(symbol: str, avg: float, size: float,
                     direction: str, leverage: int,
-                    mark_price: float) -> tuple:
+                    mark_price: float, known_sl: float = 0) -> tuple:
     """
     Setzt TP1–TP4 nach DOMINUS-Schema:
       TP1 (10% ROI): schliesst 15% der Position  → place-tpsl-order
@@ -508,8 +508,19 @@ def place_tp_orders(symbol: str, avg: float, size: float,
     if tp4_skip:
         log(f"    ⏭ TP4 (40%) @ {tp4_str} bereits überschritten — übersprungen")
     else:
-        # Aktuellen SL-Preis lesen um ihn mitzuschicken
+        # Aktuellen SL-Preis lesen um ihn mitzuschicken.
+        # Fallback-Kette: API → übergebener known_sl → trade_data
         current_sl = get_sl_price(symbol, direction)
+        if current_sl == 0 and known_sl > 0:
+            current_sl = known_sl
+            log(f"    SL aus Trade-Setup als Fallback: {current_sl}")
+        if current_sl == 0 and symbol in trade_data:
+            current_sl = trade_data[symbol].get("sl", 0)
+            if current_sl > 0:
+                log(f"    SL aus Trade-Daten als Fallback: {current_sl}")
+        if current_sl == 0:
+            log(f"    ⚠ Kein SL ermittelbar — TP4 wird ohne SL gesetzt "
+                f"(bestehender Bitget-SL bleibt erhalten wenn API das unterstützt)")
         sl_for_tp4 = round_price(current_sl, decimals) if current_sl > 0 else "0"
 
         body4 = {
@@ -1000,7 +1011,8 @@ def setup_new_trade(pos: dict):
             )
             cancel_all_tp_orders(symbol)
             time.sleep(1)
-            place_tp_orders(symbol, entry, size, direction, leverage, mark)
+            place_tp_orders(symbol, entry, size, direction, leverage, mark,
+                            known_sl=sl_price)
             last_known_avg[symbol]  = entry
             last_known_size[symbol] = size
             new_trade_done[symbol]  = True
@@ -1047,7 +1059,7 @@ def setup_new_trade(pos: dict):
     cancel_all_tp_orders(symbol)
     time.sleep(1)
     count, tp_prices = place_tp_orders(
-        symbol, entry, size, direction, leverage, mark
+        symbol, entry, size, direction, leverage, mark, known_sl=sl_price
     )
 
     # ── 5. Status speichern ─────────────────────────────────
@@ -1742,7 +1754,7 @@ def start_webhook_server():
     @app.route("/health", methods=["GET"])
     def health():
         return jsonify({"status": "running",
-                        "version": "v4.1"}), 200
+                        "version": "v4.31"}), 200
 
     port = int(os.environ.get("PORT", 8080))
     log(f"Webhook-Server gestartet auf Port {port}")
@@ -1761,7 +1773,7 @@ def main():
         log("In Railway → Variables eintragen.")
         return
 
-    log("DOMINUS Trade-Automatisierung v4.1 gestartet — mit finanzmathematischen Optimierungen")
+    log("DOMINUS Trade-Automatisierung v4.31 gestartet — mit finanzmathematischen Optimierungen")
     log(f"Intervall: {POLL_INTERVAL}s")
     log("Warte auf neue Trades...")
     log("─" * 55)
@@ -1806,6 +1818,9 @@ def main():
                 if at_entry:
                     log(f"  ✓ SL auf Entry @ {sl_existing} "
                         f"— TP1 bereits ausgelöst, SL wird nicht verändert")
+                    # SL ist nachweislich auf Entry → DCA stornieren (sicher)
+                    log(f"  Storniere offene DCA-Orders (TP1 bestätigt via SL)...")
+                    cancel_open_dca_orders(sym, direction)
                 else:
                     log(f"  ✓ SL vorhanden @ {sl_existing} "
                         f"({sl_dist:.1f}% Abstand) — wird nicht verändert")
@@ -1831,11 +1846,10 @@ def main():
                     # SL auf Entry setzen — Position ist bereits abgesichert
                     sl_at_entry[sym] = True
 
-                    # ── DCA-Orders stornieren ─────────────────────
-                    # (wurden beim ursprünglichen Trade-Einstieg gesetzt,
-                    #  sind nach TP1 nicht mehr nötig)
-                    log(f"  Storniere offene DCA-Orders...")
-                    cancel_open_dca_orders(sym, direction)
+                    # ── DCA-Orders werden NICHT automatisch storniert ────
+                    # Kein SL + <4 TPs ist mehrdeutig (z.B. Script-Neustart
+                    # während Kein-SL-Zustand). DCA-Stornierung nur wenn SL
+                    # nachweislich auf Entry steht (siehe Zweig sl_existing > 0).
 
                     # ── SL auf Entry setzen ───────────────────────
                     # Prüfen ob Mark-Preis bereits unter Entry (Long)
@@ -1865,6 +1879,9 @@ def main():
                         })
                         if res.get("code") == "00000":
                             log(f"  ✓ SL auf Entry gesetzt @ {sl_str} USDT")
+                            # SL nun nachweislich auf Entry → DCA stornieren
+                            log(f"  Storniere offene DCA-Orders (SL auf Entry gesetzt)...")
+                            cancel_open_dca_orders(sym, direction)
                             telegram(
                                 f"\U0001f512 <b>SL auf Entry gesetzt \u2014 {sym}</b>\n"
                                 f"Script-Start: TP1 bereits ausgelöst\n"
