@@ -123,6 +123,11 @@ def log(msg: str):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
+def dir_icon(direction: str) -> str:
+    """Richtungs-Icon: 🟢↗️ für Long, 🔴↘️ für Short."""
+    return "🟢↗️" if direction == "long" else "🔴↘️"
+
+
 def telegram(msg: str):
     """Sendet Telegram-Nachricht wenn konfiguriert."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -804,7 +809,7 @@ def handle_position_closed(symbol: str, reason: str = ""):
     msg_lines += [
         f"",
         f"📋 <b>Trade-Details:</b>",
-        f"Richtung: {direction.upper()}  |  {leverage}x Hebel",
+        f"Richtung: {dir_icon(direction)} {direction.upper()}  |  {leverage}x Hebel",
         f"Entry: {entry}",
     ]
     if close_px:
@@ -1131,9 +1136,9 @@ def setup_new_trade(pos: dict):
     rr_icon  = "⚠️" if rr_warn else "✅"
     lev_icon = "⚠️" if lev_diff > 2 else "✅"
     msg = (
-        f"🚀 <b>Neuer Trade — {symbol}</b>\n"
+        f"🚀 {dir_icon(direction)} <b>Neuer Trade — {symbol}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"Richtung: {direction.upper()} | Hebel: {leverage}x\n"
+        f"Richtung: {dir_icon(direction)} {direction.upper()} | Hebel: {leverage}x\n"
         f"Entry: {entry} USDT | SL: {sl_price} USDT\n\n"
         f"📐 <b>Analyse:</b>\n"
         f"{rr_icon} R:R Ratio: {rr} (Min: {MIN_RR})\n"
@@ -1289,8 +1294,8 @@ def update_tp_for_position(pos: dict, reason: str):
         log(f"  {status} TPs für {symbol} gesetzt.")
         sl_info = f"{known_sl} USDT" if known_sl > 0 else "nicht ermittelbar"
         telegram(
-            f"♻️ <b>TPs nach DCA aktualisiert — {symbol}</b>\n"
-            f"Richtung: {direction.upper()} | Hebel: {leverage}x\n"
+            f"♻️ {dir_icon(direction)} <b>TPs nach DCA — {symbol}</b>\n"
+            f"Richtung: {dir_icon(direction)} {direction.upper()} | Hebel: {leverage}x\n"
             f"Neuer Avg: {avg} USDT\n"
             f"SL (unverändert): {sl_info}\n"
             f"Grund: {reason}\n\n"
@@ -1496,7 +1501,7 @@ def cmd_trade(parts: list):
     lines = [
         f"🧮 <b>Trade-Berechnung — {symbol}</b>",
         f"━━━━━━━━━━━━━━━━━━━━━━",
-        f"Richtung: {direction.upper()} | Hebel: {leverage}x",
+        f"Richtung: {dir_icon(direction)} {direction.upper()} | Hebel: {leverage}x",
         f"Entry: {entry} | SL: {sl} ({sl_dist_pct:.1f}%)",
         f"",
         f"📐 <b>Analyse:</b>",
@@ -1729,7 +1734,7 @@ def flush_h4_buffer():
         "\u2501" * 22,
     ]
     if longs:
-        lines.append("\U0001f7e2 <b>LONG:</b>")
+        lines.append("🟢↗️ <b>LONG:</b>")
         for item in longs:
             lnk = tv_chart_links(item["symbol"])
             lines.append(f"  \u2022 {item['symbol']}  @ {item['entry']:.5f}")
@@ -1737,7 +1742,7 @@ def flush_h4_buffer():
     if longs and shorts:
         lines.append("")
     if shorts:
-        lines.append("\U0001f534 <b>SHORT:</b>")
+        lines.append("🔴↘️ <b>SHORT:</b>")
         for item in shorts:
             lnk = tv_chart_links(item["symbol"])
             lines.append(f"  \u2022 {item['symbol']}  @ {item['entry']:.5f}")
@@ -1849,7 +1854,7 @@ def start_webhook_server():
         links     = tv_chart_links(symbol)
         per_order = balance * 0.10 / 3
         chk_dir   = "gr\u00fcner" if direction == "long" else "roter"
-        icon      = "\U0001f7e2" if direction == "long" else "\U0001f534"
+        icon      = dir_icon(direction)
         msg_parts = [
             f"{icon} <b>H2 Signal \u2014 {symbol} {direction.upper()}</b>",
             "\u2501" * 22,
