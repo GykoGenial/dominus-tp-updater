@@ -424,36 +424,37 @@ def place_tp_orders(symbol: str, avg: float, size: float,
                     direction: str, leverage: int,
                     mark_price: float) -> tuple:
     """
-    Setzt TP1–TP4 nach DOMINUS-Schema.
-    TP4 schliesst immer die komplette Restposition.
-    Überholte TPs (Position bereits im Profit) werden übersprungen.
+    Setzt TP1–TP4 nach DOMINUS-Schema:
+      TP1 (10% ROI): schliesst 15% der Position  → place-tpsl-order
+      TP2 (20% ROI): schliesst 20% der Position  → place-tpsl-order
+      TP3 (30% ROI): schliesst 25% der Position  → place-tpsl-order
+      TP4 (40% ROI): Full Position Close         → place-pos-tpsl
+                     Schliesst automatisch ALLES was noch offen ist.
+                     (DOMINUS: "letzte TP schliesst Trade automatisch")
     """
-    decimals  = get_price_decimals(symbol)
-    rois      = [TP1_ROI, TP2_ROI, TP3_ROI, TP4_ROI]
-    labels    = ["TP1 (10%)", "TP2 (20%)", "TP3 (30%)", "TP4 (40%)"]
-    # Asymmetrische Grössen: 15/20/25% + kompletter Rest bei TP4
-    tp_sizes  = [max(1, math.floor(size * p)) for p in TP_CLOSE_PCTS[:3]]
-    tp4_size  = max(1, math.ceil(size - sum(tp_sizes)))
-    tp_sizes.append(tp4_size)
+    decimals = get_price_decimals(symbol)
+    count    = 0
+    prices   = []
 
-    tps = list(zip(rois, labels, tp_sizes))
-    count  = 0
-    prices = []
+    # ── TP1–TP3: Teilschliessungen ───────────────────────────────
+    partial_tps = [
+        (TP1_ROI, "TP1 (10%)", TP_CLOSE_PCTS[0]),
+        (TP2_ROI, "TP2 (20%)", TP_CLOSE_PCTS[1]),
+        (TP3_ROI, "TP3 (30%)", TP_CLOSE_PCTS[2]),
+    ]
 
-    for roi, label, qty in tps:
+    for roi, label, pct in partial_tps:
         tp_raw = calc_tp_price(avg, roi, direction, leverage)
         tp_str = round_price(tp_raw, decimals)
         tp_val = float(tp_str)
+        qty    = max(1, math.floor(size * pct))
 
-        # Validierung: TP auf richtiger Seite des Marktpreises
         if mark_price > 0:
-            if direction == "long" and tp_val <= mark_price:
-                log(f"    ⏭ {label} @ {tp_str} bereits überschritten "
-                    f"(Mark: {mark_price}) — übersprungen")
+            if direction == "long"  and tp_val <= mark_price:
+                log(f"    ⏭ {label} @ {tp_str} bereits überschritten — übersprungen")
                 continue
             if direction == "short" and tp_val >= mark_price:
-                log(f"    ⏭ {label} @ {tp_str} bereits überschritten "
-                    f"(Mark: {mark_price}) — übersprungen")
+                log(f"    ⏭ {label} @ {tp_str} bereits überschritten — übersprungen")
                 continue
 
         res = api_post("/api/v2/mix/order/place-tpsl-order", {
@@ -467,7 +468,6 @@ def place_tp_orders(symbol: str, avg: float, size: float,
             "holdSide":     direction,
             "size":         str(qty),
         })
-
         if res.get("code") == "00000":
             log(f"    ✓ {label} @ {tp_str} USDT (Qty: {qty})")
             count += 1
@@ -475,7 +475,6 @@ def place_tp_orders(symbol: str, avg: float, size: float,
         else:
             msg = res.get("msg", str(res))
             log(f"    ✗ {label} FEHLER: {msg}")
-            # Dezimalstellen-Fehler: Retry mit weniger Stellen
             if "checkBDScale" in msg or "checkScale" in msg:
                 new_dec = max(1, decimals - 1)
                 price_decimals_cache[symbol] = new_dec
@@ -495,6 +494,52 @@ def place_tp_orders(symbol: str, avg: float, size: float,
                     log(f"    ✓ {label} @ {tp_str2} USDT [retry OK]")
                     count += 1
                     prices.append(f"{label}: {tp_str2}")
+
+    # ── TP4: Full Position Close via place-pos-tpsl ──────────────
+    # Schliesst automatisch die gesamte verbleibende Position.
+    # Kein size-Parameter nötig — Bitget schliesst alles.
+    # DOMINUS: "letzte Teilauszahlung per Full Position TP"
+    tp4_raw = calc_tp_price(avg, TP4_ROI, direction, leverage)
+    tp4_str = round_price(tp4_raw, decimals)
+    tp4_val = float(tp4_str)
+
+    tp4_skip = (direction == "long"  and mark_price > 0 and tp4_val <= mark_price) or                (direction == "short" and mark_price > 0 and tp4_val >= mark_price)
+
+    if tp4_skip:
+        log(f"    ⏭ TP4 (40%) @ {tp4_str} bereits überschritten — übersprungen")
+    else:
+        res4 = api_post("/api/v2/mix/order/place-pos-tpsl", {
+            "symbol":                  symbol,
+            "productType":             PRODUCT_TYPE,
+            "marginCoin":              MARGIN_COIN,
+            "holdSide":                direction,
+            "takeProfitTriggerPrice":  tp4_str,
+            "takeProfitTriggerType":   "mark_price",
+        })
+        if res4.get("code") == "00000":
+            log(f"    ✓ TP4 Full Close @ {tp4_str} USDT "
+                f"(schliesst gesamte Restposition)")
+            count += 1
+            prices.append(f"TP4 Full Close: {tp4_str}")
+        else:
+            msg4 = res4.get("msg", str(res4))
+            log(f"    ✗ TP4 FEHLER: {msg4}")
+            if "checkBDScale" in msg4 or "checkScale" in msg4:
+                new_dec = max(1, decimals - 1)
+                price_decimals_cache[symbol] = new_dec
+                tp4_str2 = round_price(tp4_raw, new_dec)
+                res4b = api_post("/api/v2/mix/order/place-pos-tpsl", {
+                    "symbol":                 symbol,
+                    "productType":            PRODUCT_TYPE,
+                    "marginCoin":             MARGIN_COIN,
+                    "holdSide":               direction,
+                    "takeProfitTriggerPrice": tp4_str2,
+                    "takeProfitTriggerType":  "mark_price",
+                })
+                if res4b.get("code") == "00000":
+                    log(f"    ✓ TP4 Full Close @ {tp4_str2} USDT [retry OK]")
+                    count += 1
+                    prices.append(f"TP4 Full Close: {tp4_str2}")
 
     return count, prices
 
