@@ -496,9 +496,9 @@ def place_tp_orders(symbol: str, avg: float, size: float,
                     prices.append(f"{label}: {tp_str2}")
 
     # ── TP4: Full Position Close via place-pos-tpsl ──────────────
-    # Schliesst automatisch die gesamte verbleibende Position.
-    # Kein size-Parameter nötig — Bitget schliesst alles.
-    # DOMINUS: "letzte Teilauszahlung per Full Position TP"
+    # WICHTIG: place-pos-tpsl verwaltet NUR EINEN kombinierten
+    # Eintrag pro Position. TP4 und SL MÜSSEN zusammen gesetzt werden,
+    # sonst überschreibt TP4 den bestehenden SL (oder umgekehrt).
     tp4_raw = calc_tp_price(avg, TP4_ROI, direction, leverage)
     tp4_str = round_price(tp4_raw, decimals)
     tp4_val = float(tp4_str)
@@ -508,14 +508,25 @@ def place_tp_orders(symbol: str, avg: float, size: float,
     if tp4_skip:
         log(f"    ⏭ TP4 (40%) @ {tp4_str} bereits überschritten — übersprungen")
     else:
-        res4 = api_post("/api/v2/mix/order/place-pos-tpsl", {
-            "symbol":                  symbol,
-            "productType":             PRODUCT_TYPE,
-            "marginCoin":              MARGIN_COIN,
-            "holdSide":                direction,
-            "takeProfitTriggerPrice":  tp4_str,
-            "takeProfitTriggerType":   "mark_price",
-        })
+        # Aktuellen SL-Preis lesen um ihn mitzuschicken
+        current_sl = get_sl_price(symbol, direction)
+        sl_for_tp4 = round_price(current_sl, decimals) if current_sl > 0 else "0"
+
+        body4 = {
+            "symbol":                 symbol,
+            "productType":            PRODUCT_TYPE,
+            "marginCoin":             MARGIN_COIN,
+            "holdSide":               direction,
+            "takeProfitTriggerPrice": tp4_str,
+            "takeProfitTriggerType":  "mark_price",
+        }
+        # SL mitschicken wenn vorhanden — verhindert Überschreiben
+        if current_sl > 0:
+            body4["stopLossTriggerPrice"] = sl_for_tp4
+            body4["stopLossTriggerType"]  = "mark_price"
+            log(f"    TP4 kombiniert mit SL @ {sl_for_tp4}")
+
+        res4 = api_post("/api/v2/mix/order/place-pos-tpsl", body4)
         if res4.get("code") == "00000":
             log(f"    ✓ TP4 Full Close @ {tp4_str} USDT "
                 f"(schliesst gesamte Restposition)")
@@ -525,17 +536,21 @@ def place_tp_orders(symbol: str, avg: float, size: float,
             msg4 = res4.get("msg", str(res4))
             log(f"    ✗ TP4 FEHLER: {msg4}")
             if "checkBDScale" in msg4 or "checkScale" in msg4:
-                new_dec = max(1, decimals - 1)
+                new_dec   = max(1, decimals - 1)
                 price_decimals_cache[symbol] = new_dec
-                tp4_str2 = round_price(tp4_raw, new_dec)
-                res4b = api_post("/api/v2/mix/order/place-pos-tpsl", {
+                tp4_str2  = round_price(tp4_raw, new_dec)
+                body4b    = {
                     "symbol":                 symbol,
                     "productType":            PRODUCT_TYPE,
                     "marginCoin":             MARGIN_COIN,
                     "holdSide":               direction,
                     "takeProfitTriggerPrice": tp4_str2,
                     "takeProfitTriggerType":  "mark_price",
-                })
+                }
+                if current_sl > 0:
+                    body4b["stopLossTriggerPrice"] = sl_for_tp4
+                    body4b["stopLossTriggerType"]  = "mark_price"
+                res4b = api_post("/api/v2/mix/order/place-pos-tpsl", body4b)
                 if res4b.get("code") == "00000":
                     log(f"    ✓ TP4 Full Close @ {tp4_str2} USDT [retry OK]")
                     count += 1
@@ -757,19 +772,48 @@ def handle_position_closed(symbol: str, reason: str = ""):
     cancel_all_tp_orders(symbol)
 
 
+def _get_pos_tp_price(symbol: str, direction: str) -> float:
+    """
+    Liest den Positions-Level TP4-Preis (takeProfitPrice) direkt
+    aus den Positionsdaten — nicht aus den pending TPSL-Orders.
+    """
+    result = api_get("/api/v2/mix/position/single-position", {
+        "symbol":      symbol,
+        "productType": PRODUCT_TYPE,
+        "marginCoin":  MARGIN_COIN,
+    })
+    if result.get("code") == "00000":
+        for pos in (result.get("data") or []):
+            if pos.get("holdSide") == direction:
+                tp = float(pos.get("takeProfitPrice", 0) or 0)
+                if tp > 0:
+                    return tp
+    return 0.0
+
+
 def set_sl_at_entry(symbol: str, direction: str, entry_price: float):
     """SL auf Einstiegspreis setzen — DOMINUS-Regel nach TP1."""
     decimals = get_price_decimals(symbol)
     sl_str   = round_price(entry_price, decimals)
 
-    result = api_post("/api/v2/mix/order/place-pos-tpsl", {
+    # Vorhandenen TP4 lesen — muss beim SL-Update mitgeschickt werden
+    # (place-pos-tpsl überschreibt sonst den TP4)
+    existing_tp4 = _get_pos_tp_price(symbol, direction)
+    body_sl = {
         "symbol":               symbol,
         "productType":          PRODUCT_TYPE,
         "marginCoin":           MARGIN_COIN,
         "holdSide":             direction,
         "stopLossTriggerPrice": sl_str,
         "stopLossTriggerType":  "mark_price",
-    })
+    }
+    if existing_tp4 > 0:
+        decimals_sl = get_price_decimals(symbol)
+        body_sl["takeProfitTriggerPrice"] = round_price(existing_tp4, decimals_sl)
+        body_sl["takeProfitTriggerType"]  = "mark_price"
+        log(f"  TP4 @ {existing_tp4} wird mitgeführt")
+
+    result = api_post("/api/v2/mix/order/place-pos-tpsl", body_sl)
 
     if result.get("code") == "00000":
         log(f"  ✓ SL auf Entry gesetzt: {sl_str} USDT ({symbol})")
