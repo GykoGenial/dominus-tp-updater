@@ -2492,144 +2492,76 @@ def report_position_startup(pos: dict):
     sl_at_entry[symbol]     = False
 
     issues   = []   # Gesammelte Probleme → Telegram-Alert
-    warnings = []   # Warnungen (kein direkter Handlungsbedarf)
 
-    # ── 1. Alles von Bitget lesen ────────────────────────────────────────
-    sl_price    = get_sl_price(symbol, direction)
-    close_fills = get_symbol_close_fills(symbol, since_hours=48)
-    filled_tps  = detect_filled_tps(close_fills, avg, leverage, direction)
-    fill_tp1    = any(t["roi"] == TP1_ROI for t in filled_tps)
-
-    existing_tps = get_existing_tps(symbol)
-    tp4_pos      = _get_pos_tp_price(symbol, direction)
+    # ── 1. Zuverlässig lesbare Daten von Bitget holen ─────────────────────
+    # SL/TP-Plan-Orders sind via API nicht lesbar (alle Endpoints schlagen fehl).
+    # Verlässliche Quellen: Fill-Historie, offene DCA-Orders, Positionsdaten.
+    close_fills   = get_symbol_close_fills(symbol, since_hours=48)
+    filled_tps    = detect_filled_tps(close_fills, avg, leverage, direction)
+    fill_tp1      = any(t["roi"] == TP1_ROI for t in filled_tps)
+    fill_tp2      = any(t["roi"] == TP2_ROI for t in filled_tps)
     existing_dcas = get_existing_dca_orders(symbol, direction)
 
-    log(f"  Bitget gelesen: SL={sl_price or 'keiner'} | "
-        f"TPs={len(existing_tps)} profit_plan + TP4={'ja' if tp4_pos > 0 else 'nein'} | "
-        f"DCAs={len(existing_dcas)} | Fills (48h)={len(close_fills)}")
+    log(f"  DCAs={len(existing_dcas)} | Fills (48h)={len(close_fills)}")
     if filled_tps:
         log(f"  Fill-basierte TPs: {', '.join(t['label'] for t in filled_tps)}")
 
-    # ── 2. Trade-Stand analysieren ───────────────────────────────────────
+    # ── 2. Trade-Stand analysieren ────────────────────────────────────────
     state    = analyse_trade_state(avg, mark, leverage, direction)
     pnl      = state["pnl_roi_pct"]
     pnl_sign = "+" if pnl >= 0 else ""
     log(f"  ROI: {pnl_sign}{pnl}% | Mark: {mark}")
 
-    # SL-basiert: SL auf Entry = TP1 war schon ausgelöst
-    sl_is_entry = False
-    if sl_price > 0:
-        sl_dist_pct = abs(avg - sl_price) / avg * 100
-        sl_is_entry = sl_dist_pct <= 0.15
+    # TP1-Erkennung: preislich ODER fill-basiert
+    tp1_done = state["tp1_price_hit"] or fill_tp1
 
-    # Kombinierte TP1-Erkennung
-    tp1_done = state["tp1_price_hit"] or fill_tp1 or sl_is_entry
-    if tp1_done:
-        sl_at_entry[symbol] = sl_is_entry
-
-    # Trade-Daten für Polling-Loop und spätere SL-Fallbacks speichern
+    # Trade-Daten für Polling-Loop speichern
     trade_data[symbol] = {
         "entry":     avg,
         "direction": direction,
         "leverage":  leverage,
-        "sl":        sl_price,
+        "sl":        0,   # nicht lesbar via API
         "peak_size": size,
         "open_ts":   int(time.time() * 1000),
     }
+    if tp1_done:
+        sl_at_entry[symbol] = False   # unklar, da SL nicht lesbar
 
-    # ── 3. Probleme identifizieren (ohne etwas zu ändern) ────────────────
-
-    # SL-Check
-    if sl_price == 0:
-        if tp1_done:
-            issues.append("❌ SL fehlt — TP1 bereits ausgelöst, SL sollte auf Entry stehen")
-        elif pnl > 0:
-            issues.append(f"❌ SL fehlt — Position im Gewinn ({pnl_sign}{pnl}%), "
-                          f"SL-Floor auf Entry empfohlen ({avg})")
-        else:
-            issues.append(f"❌ SL fehlt — Auto-SL Empfehlung: "
-                          f"{round_price(avg * (1 - 0.25/leverage) if direction == 'long' else avg * (1 + 0.25/leverage), decimals)}")
-    else:
-        sl_dist_pct = abs(avg - sl_price) / avg * 100
-        if sl_is_entry:
-            log(f"  ✓ SL auf Entry @ {sl_price}")
-        elif tp1_done and not sl_is_entry:
-            issues.append(f"⚠️ SL @ {sl_price} — TP1 ausgelöst, SL sollte auf Entry "
-                          f"({avg}) stehen")
-        else:
-            log(f"  ✓ SL @ {sl_price} ({sl_dist_pct:.2f}% Abstand)")
-
-    # TP-Check
-    n_exp_pp  = state["n_expected_profit_plan"]
-    tp4_exp   = state["tp4_expected"]
-    n_act_pp  = len(existing_tps)
-    tp4_ok    = (tp4_pos > 0) if tp4_exp else True
-    pp_count_ok = (n_act_pp == n_exp_pp)
-    pp_price_ok = (tps_are_correct(existing_tps, avg, size, direction,
-                                   leverage, decimals, mark)
-                   if pp_count_ok else False)
-    tps_correct = pp_count_ok and pp_price_ok and tp4_ok
-
-    if not tps_correct:
-        if size < 4:
-            warnings.append(f"ℹ️ TPs nicht auto-setzbar (Qty={size} < min. 4 Kontrakte) "
-                            f"— manuell auf Bitget setzen")
-        else:
-            if not pp_count_ok:
-                issues.append(f"❌ TPs: {n_act_pp} profit_plan vorhanden, "
-                              f"{n_exp_pp} erwartet")
-            elif not pp_price_ok:
-                issues.append("❌ TP-Preise stimmen nicht mit aktuellem Setup überein")
-            if not tp4_ok:
-                issues.append("❌ TP4 Full-Close fehlt")
-    else:
-        log(f"  ✓ TPs korrekt ({n_act_pp} profit_plan + "
-            f"{'TP4' if tp4_pos > 0 else 'kein TP4 erwartet'})")
-
-    # DCA-Check (nur wenn TP1 noch nicht ausgelöst)
-    if not tp1_done:
-        if len(existing_dcas) < 2:
-            issues.append(f"⚠️ DCAs: nur {len(existing_dcas)}/2 vorhanden")
-        else:
-            dca_info = " | ".join(
-                f"{o.get('price','?')} × {o.get('size','?')}"
-                for o in existing_dcas[:2]
-            )
-            log(f"  ✓ DCAs: {dca_info}")
-    else:
-        if existing_dcas:
-            issues.append(f"⚠️ {len(existing_dcas)} DCA-Order(s) noch offen obwohl TP1 "
-                          f"bereits ausgelöst — sollten storniert werden")
-
-    # ── 4. Telegram-Report wenn Probleme gefunden ────────────────────────
-    all_msgs = issues + warnings
-    if all_msgs:
-        tp1_src = []
-        if state["tp1_price_hit"]:
-            tp1_src.append("preislich")
-        if fill_tp1:
-            tp1_src.append("fill-basiert")
-        if sl_is_entry:
-            tp1_src.append("SL auf Entry")
-
-        remaining = [t["label"] for t in state["tps_remaining"]]
-        header = (
-            f"🔍 <b>Startup-Check — {symbol}</b>\n"
-            f"━━━━━━━━━━━━\n"
-            f"{dir_icon(direction)} {direction.upper()} | Entry: {avg} | Qty: {size} | {leverage}x\n"
-            f"Mark: {mark} | ROI: {pnl_sign}{pnl}%\n"
+    # ── 3. Nur prüfen was wirklich erkennbar ist ──────────────────────────
+    # REGEL 1: TP1 ausgelöst + DCAs noch offen = klarer Fehler
+    if tp1_done and existing_dcas:
+        n = len(existing_dcas)
+        issues.append(
+            f"❌ TP1 ausgelöst, {n} DCA(s) noch offen → stornieren"
         )
-        if tp1_done:
-            header += f"TP1 Status: ausgelöst ({', '.join(tp1_src) if tp1_src else 'unbekannt'})\n"
-        header += "━━━━━━━━━━━━\n"
 
-        body = "\n".join(all_msgs)
+    # REGEL 2: TP1 ausgelöst → SL muss auf Entry (nicht prüfbar, aber hinweisen)
+    if tp1_done:
+        tp_src = []
+        if state["tp1_price_hit"]: tp_src.append("preislich")
+        if fill_tp1:               tp_src.append("fill-basiert")
+        filled_labels = ", ".join(t["label"] for t in filled_tps) if filled_tps else "TP1"
+        issues.append(
+            f"⚠️ {filled_labels} ausgelöst ({', '.join(tp_src)})"
+            f" — SL auf Entry ({avg}) prüfen!"
+        )
+
+    # ── 4. Telegram-Report wenn Probleme gefunden ─────────────────────────
+    if issues:
+        header = (
+            f"🔍 <b>Startup — {symbol}</b>\n"
+            f"━━━━━━━━━━━━\n"
+            f"{dir_icon(direction)} {direction.upper()} | "
+            f"Entry: {avg} | {leverage}x\n"
+            f"Mark: {mark} | ROI: {pnl_sign}{pnl}%\n"
+            f"━━━━━━━━━━━━\n"
+        )
+        body = "\n".join(issues)
         telegram(header + body)
-        # Refresh-Befehl als separates Telegram → direkt kopierbar auf Mobile
         telegram(f"<code>/refresh {symbol}</code>")
-        log(f"  ⚠ {len(issues)} Problem(e), {len(warnings)} Warnung(en) → Telegram gesendet")
+        log(f"  ⚠ {len(issues)} Problem(e) → Telegram gesendet")
     else:
-        log(f"  ✓ Alles korrekt — kein Eingriff nötig")
+        log(f"  ✓ Kein Handlungsbedarf erkannt")
 
 
 def main():
