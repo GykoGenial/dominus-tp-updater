@@ -74,6 +74,14 @@ TP_CLOSE_PCTS = [0.15, 0.20, 0.25, 0.40]  # TP1/TP2/TP3/TP4-Anteil
 DCA1_RATIO = 1/3      # DCA1 bei 1/3 des Weges zum SL
 DCA2_RATIO = 2/3      # DCA2 bei 2/3 des Weges zum SL
 
+# Progressives DCA Sizing 20/30/50 — immer aktiv
+# Verhältnis zum Initial-Trade:
+#   DCA1 = Initial × 1.5  (30/20)
+#   DCA2 = Initial × 2.5  (50/20)
+# Gesamtsetup: Market 20% + DCA1 30% + DCA2 50% = 100% des Einsatzes
+DCA1_MULTIPLIER = 1.5   # DCA1 = 1.5× Initial
+DCA2_MULTIPLIER = 2.5   # DCA2 = 2.5× Initial
+
 POLL_INTERVAL = 20    # Sekunden zwischen Checks
 
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
@@ -741,12 +749,14 @@ def set_sl_at_entry(symbol: str, direction: str, entry_price: float):
 # ═══════════════════════════════════════════════════════════════
 
 def place_dca_orders(symbol: str, entry: float, sl: float,
-                     direction: str, base_size: float) -> list:
+                     direction: str, base_size: float,
+                     balance: float = 0, leverage: int = 10) -> list:
     """
-    Setzt 2 DCA Limit-Orders zwischen Entry und SL.
-    DCA1: 1/3 des Abstands Entry → SL
-    DCA2: 2/3 des Abstands Entry → SL
-    Grösse: gleich wie Initial-Order (1/3 des Gesamtsetups)
+    Setzt 2 DCA Limit-Orders — immer progressives Sizing 20/30/50.
+    Basis: Initial-Trade (base_size = Market-Order Grösse)
+      DCA1 = base_size × 1.5  (entspricht 30% bei 20% Initial)
+      DCA2 = base_size × 2.5  (entspricht 50% bei 20% Initial)
+    Beispiel: Initial = 10 → DCA1 = 15 → DCA2 = 25 → Total = 50
     """
     decimals  = get_price_decimals(symbol)
     sl_dist   = abs(entry - sl)
@@ -760,21 +770,28 @@ def place_dca_orders(symbol: str, entry: float, sl: float,
         dca2 = entry + sl_dist * DCA2_RATIO
         side = "sell"
 
-    dca1_str = round_price(dca1, decimals)
-    dca2_str = round_price(dca2, decimals)
+    dca1_str  = round_price(dca1, decimals)
+    dca2_str  = round_price(dca2, decimals)
+    dca1_size = round(base_size * DCA1_MULTIPLIER, 4)
+    dca2_size = round(base_size * DCA2_MULTIPLIER, 4)
 
-    # Grösse: gleich wie Initial-Order (Dezimalstellen des Symbols beachten)
-    size_str = str(int(base_size)) if base_size == int(base_size) \
-               else str(round(base_size, 4))
+    log(f"  DCA Sizing 20/30/50: "
+        f"Market={base_size} | DCA1={dca1_size} | DCA2={dca2_size}")
+
+    def fmt(s):
+        return str(int(s)) if s == int(s) else str(round(s, 4))
 
     results = []
-    for label, price_str in [("DCA1", dca1_str), ("DCA2", dca2_str)]:
+    for label, price_str, qty in [
+        ("DCA1", dca1_str, dca1_size),
+        ("DCA2", dca2_str, dca2_size),
+    ]:
         res = api_post("/api/v2/mix/order/place-order", {
             "symbol":      symbol,
             "productType": PRODUCT_TYPE,
             "marginMode":  "isolated",
             "marginCoin":  MARGIN_COIN,
-            "size":        size_str,
+            "size":        fmt(qty),
             "price":       price_str,
             "side":        side,
             "tradeSide":   "open",
@@ -782,17 +799,12 @@ def place_dca_orders(symbol: str, entry: float, sl: float,
             "force":       "gtc",
         })
         if res.get("code") == "00000":
-            log(f"  ✓ {label} Limit @ {price_str} USDT (Qty: {size_str})")
-            results.append(f"{label}: {price_str} USDT")
+            log(f"  ✓ {label} Limit @ {price_str} USDT (Qty: {fmt(qty)})")
+            results.append(f"{label}: {price_str} USDT × {fmt(qty)}")
         else:
             log(f"  ✗ {label} FEHLER: {res.get('msg', res)}")
 
     return results
-
-
-# ═══════════════════════════════════════════════════════════════
-# NEUER TRADE — VOLLSTÄNDIGES SETUP
-# ═══════════════════════════════════════════════════════════════
 
 def tv_chart_links(symbol: str) -> dict:
     """
@@ -938,7 +950,8 @@ def setup_new_trade(pos: dict):
     # ── 3. DCA Limit-Orders setzen ──────────────────────────
     log(f"  Setze DCA-Orders...")
     dca_results = place_dca_orders(
-        symbol, entry, sl_price, direction, size
+        symbol, entry, sl_price, direction, size,
+        balance=balance, leverage=leverage
     )
 
     # ── 4. TP1–TP4 setzen ───────────────────────────────────
