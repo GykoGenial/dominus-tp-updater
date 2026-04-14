@@ -375,44 +375,41 @@ def kelly_recommendation(balance: float, winrate: float) -> dict:
 def cancel_all_tp_orders(symbol: str):
     """
     Storniert alle TP-Orders (profit_plan) für ein Symbol.
-    TPs werden via place-tpsl-order gesetzt → sind Plan-Orders
-    → abrufen via orders-plan-pending, stornieren via cancel-plan-order.
-    SL (loss_plan via tpsl-pending-orders) wird nie angefasst.
+
+    TPs werden via place-tpsl-order gesetzt → erscheinen in tpsl-pending-orders
+    (NICHT in orders-plan-pending — das ist ein anderer Endpoint für andere Order-Typen).
+    Stornierung via cancel-plan-order.
+    SL (loss_plan, pos_loss) wird nie angefasst.
     """
-    # profit_plan Orders abrufen — planType als Filter wird server-seitig nicht unterstützt
-    result = api_get("/api/v2/mix/order/orders-plan-pending", {
+    result = api_get("/api/v2/mix/order/tpsl-pending-orders", {
         "symbol":      symbol,
         "productType": PRODUCT_TYPE,
     })
     if result.get("code") != "00000":
-        log(f"  ⚠ orders-plan-pending Fehler: {result.get('msg', result)}")
+        log(f"  ⚠ tpsl-pending Fehler: {result.get('msg', result)}")
         return
 
-    data = result.get("data") or []
-    if isinstance(data, dict):
-        all_orders = data.get("entrustedList") or []
-    else:
-        all_orders = data
+    orders = (result.get("data") or {}).get("entrustedList") or []
 
-    # Client-seitig nur profit_plan filtern
-    tp_orders = [o for o in all_orders
-                 if o.get("planType", "") == "profit_plan"]
+    # Nur profit_plan — SL-Typen (loss_plan, pos_loss) nicht anfassen
+    tp_orders = [o for o in orders if o.get("planType") == "profit_plan"]
 
     if not tp_orders:
-        log(f"  Keine TP-Orders gefunden (profit_plan)")
+        log(f"  Keine TP-Orders gefunden")
         return
 
     log(f"  {len(tp_orders)} TP(s) stornieren...")
     for order in tp_orders:
-        oid = order.get("orderId")
-        res = api_post("/api/v2/mix/order/cancel-plan-order", {
+        oid   = order.get("orderId")
+        price = order.get("triggerPrice", "?")
+        res   = api_post("/api/v2/mix/order/cancel-plan-order", {
             "symbol":      symbol,
             "productType": PRODUCT_TYPE,
             "marginCoin":  MARGIN_COIN,
             "orderId":     oid,
         })
         if res.get("code") == "00000":
-            log(f"    ✓ TP storniert: {oid}")
+            log(f"    ✓ TP storniert @ {price}: {oid}")
         else:
             log(f"    ✗ Fehler: {res.get('msg', res)}")
 
@@ -1020,20 +1017,16 @@ def setup_new_trade(pos: dict):
 
 def get_existing_tps(symbol: str) -> list:
     """
-    Holt bestehende TP-Orders via orders-plan-pending.
+    Holt bestehende TP-Orders via tpsl-pending-orders.
     Gibt Liste mit {'price': float, 'qty': float, 'orderId': str} zurück.
     """
-    result = api_get("/api/v2/mix/order/orders-plan-pending", {
+    result = api_get("/api/v2/mix/order/tpsl-pending-orders", {
         "symbol":      symbol,
         "productType": PRODUCT_TYPE,
     })
     if result.get("code") != "00000":
         return []
-    data = result.get("data") or []
-    if isinstance(data, dict):
-        orders = data.get("entrustedList") or []
-    else:
-        orders = data
+    orders = (result.get("data") or {}).get("entrustedList") or []
     tps = []
     for o in orders:
         if o.get("planType") == "profit_plan":
