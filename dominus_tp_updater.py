@@ -1748,28 +1748,49 @@ def main():
                 if tp1_already_hit:
                     # SL auf Entry setzen — Position ist bereits abgesichert
                     sl_at_entry[sym] = True
-                    sl_str = round_price(avg, decimals)
-                    log(f"  SL auf Entry setzen @ {sl_str} "
-                        f"(TP1 bereits ausgelöst)")
-                    res = api_post("/api/v2/mix/order/place-pos-tpsl", {
-                        "symbol":               sym,
-                        "productType":          PRODUCT_TYPE,
-                        "marginCoin":           MARGIN_COIN,
-                        "holdSide":             direction,
-                        "stopLossTriggerPrice": sl_str,
-                        "stopLossTriggerType":  "mark_price",
-                    })
-                    if res.get("code") == "00000":
-                        log(f"  ✓ SL auf Entry gesetzt @ {sl_str} USDT")
+
+                    # ── DCA-Orders stornieren ─────────────────────
+                    # (wurden beim ursprünglichen Trade-Einstieg gesetzt,
+                    #  sind nach TP1 nicht mehr nötig)
+                    log(f"  Storniere offene DCA-Orders...")
+                    cancel_open_dca_orders(sym, direction)
+
+                    # ── SL auf Entry setzen ───────────────────────
+                    # Prüfen ob Mark-Preis bereits unter Entry (Long)
+                    # → Bitget lehnt SL über Marktpreis ab
+                    mark = get_mark_price(sym)
+                    sl_valid = (direction == "long"  and avg <= mark) or                                (direction == "short" and avg >= mark)
+
+                    if not sl_valid:
+                        log(f"  ⚠ Mark {mark} bereits hinter Entry {avg} "
+                            f"— SL auf Entry nicht setzbar, Position im Verlust")
                         telegram(
-                            f"\U0001f512 <b>SL auf Entry gesetzt \u2014 {sym}</b>\n"
-                            f"Script-Start: TP1 bereits ausgelöst\n"
-                            f"SL: {sl_str} USDT (Entry-Preis)\n"
-                            f"Position abgesichert \u2713"
+                            f"\u26a0\ufe0f <b>SL auf Entry nicht möglich \u2014 {sym}</b>\n"
+                            f"Mark-Preis {mark} bereits hinter Entry {avg}\n"
+                            f"Position manuell überwachen!"
                         )
                     else:
-                        log(f"  ✗ SL auf Entry fehlgeschlagen: "
-                            f"{res.get('msg', res)}")
+                        sl_str = round_price(avg, decimals)
+                        log(f"  SL auf Entry setzen @ {sl_str} "
+                            f"(TP1 bereits ausgelöst)")
+                        res = api_post("/api/v2/mix/order/place-pos-tpsl", {
+                            "symbol":               sym,
+                            "productType":          PRODUCT_TYPE,
+                            "marginCoin":           MARGIN_COIN,
+                            "holdSide":             direction,
+                            "stopLossTriggerPrice": sl_str,
+                            "stopLossTriggerType":  "mark_price",
+                        })
+                        if res.get("code") == "00000":
+                            log(f"  ✓ SL auf Entry gesetzt @ {sl_str} USDT")
+                            telegram(
+                                f"\U0001f512 <b>SL auf Entry gesetzt \u2014 {sym}</b>\n"
+                                f"Script-Start: TP1 bereits ausgelöst\n"
+                                f"SL: {sl_str} USDT | DCA-Orders storniert \u2713"
+                            )
+                        else:
+                            log(f"  ✗ SL auf Entry fehlgeschlagen: "
+                                f"{res.get('msg', res)}")
                 else:
                     # Kein TP ausgelöst → Auto-SL -25%
                     sl_at_entry[sym] = False
