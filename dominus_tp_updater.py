@@ -623,6 +623,28 @@ def cancel_open_dca_orders(symbol: str, direction: str):
                 f"{res.get('msg', res)}")
 
 
+def get_existing_dca_orders(symbol: str, direction: str) -> list:
+    """
+    Gibt alle offenen DCA Limit-Orders für ein Symbol/Richtung zurück.
+    Gleiche Filterlogik wie cancel_open_dca_orders, aber ohne Stornierung.
+    """
+    result = api_get("/api/v2/mix/order/orders-pending", {
+        "symbol":      symbol,
+        "productType": PRODUCT_TYPE,
+    })
+    if result.get("code") != "00000":
+        return []
+    data   = result.get("data") or {}
+    orders = data.get("entrustedList") or [] if isinstance(data, dict) else data
+    side   = "buy" if direction == "long" else "sell"
+    return [
+        o for o in orders
+        if o.get("side") == side
+        and o.get("tradeSide") == "open"
+        and o.get("orderType") == "limit"
+    ]
+
+
 def get_closed_pnl(symbol: str, since_ms: int) -> dict:
     """
     Berechnet realisierten P&L eines vollständigen Trades via Fill-History.
@@ -1191,8 +1213,10 @@ def tps_are_correct(existing: list, avg: float, total: float,
 
 def update_tp_for_position(pos: dict, reason: str):
     """
-    Prüft bestehende TPs, löscht nur wenn nötig und setzt neu.
-    Ablauf: Bestehende TPs abrufen → prüfen → bei Abweichung: löschen + neu setzen.
+    Wird bei DCA-Fill aufgerufen: löscht alle bestehenden TPs und setzt sie
+    auf Basis des neuen Durchschnittspreises neu (10/20/30/40% ROI, 15/20/25/40%).
+    WICHTIG: Der SL wird nicht verändert. Er wird beim TP4-Setzen explizit
+             mitgeführt, damit place-pos-tpsl ihn nicht überschreibt.
     """
     symbol    = pos.get("symbol", "?")
     direction = pos.get("holdSide", "long")
@@ -1209,16 +1233,21 @@ def update_tp_for_position(pos: dict, reason: str):
         log("  Ungültige Position.")
         return
 
-    # TPs bei Nachkauf immer neu setzen (alter Avg-Preis → neuer Avg-Preis)
-    log(f"  Setze TPs neu (Grund: {reason})")
+    # SL-Preis vor dem TP-Löschen lesen — wird beim TP4 zwingend mitgeführt
+    known_sl = get_sl_price(symbol, direction)
+    if known_sl == 0 and symbol in trade_data:
+        known_sl = trade_data[symbol].get("sl", 0)
+    if known_sl > 0:
+        log(f"  SL @ {known_sl} wird unverändert beibehalten")
+    else:
+        log(f"  ⚠ Kein SL ermittelbar — TP4-Aufruf ohne SL-Parameter")
 
-    # Mindest-Grösse berechnen: mind. 4 Kontrakte für 4 TPs nötig
-    # (TP1=15%: floor(4*0.15)=0 → max(1,0)=1 → aber 4 × 1 = 4 < size nötig)
+    log(f"  TPs löschen und neu setzen (Grund: {reason})")
+
     min_size_for_tps = 4
     if total < min_size_for_tps:
-        log(f"  ⚠ Position zu klein (Qty={total}) — "
-            f"TPs werden nicht gesetzt (min. {min_size_for_tps} Kontrakte nötig)")
-        log(f"  Bitte Position manuell überwachen oder grösser eröffnen")
+        log(f"  ⚠ Position zu klein (Qty={total}, min. {min_size_for_tps}) — "
+            f"TPs manuell überwachen")
         last_known_avg[symbol]  = avg
         last_known_size[symbol] = total
         return
@@ -1226,16 +1255,18 @@ def update_tp_for_position(pos: dict, reason: str):
     cancel_all_tp_orders(symbol)
     time.sleep(1)
     count, prices = place_tp_orders(
-        symbol, avg, total, direction, leverage, mark
+        symbol, avg, total, direction, leverage, mark, known_sl=known_sl
     )
 
     if count > 0:
         status = "✓ Alle 4" if count == 4 else f"⚠ {count}/4"
         log(f"  {status} TPs für {symbol} gesetzt.")
+        sl_info = f"{known_sl} USDT" if known_sl > 0 else "nicht ermittelbar"
         telegram(
-            f"♻️ <b>TPs aktualisiert — {symbol}</b>\n"
-            f"Richtung: {direction.upper()}\n"
-            f"Neuer Avg: {avg} USDT | Hebel: {leverage}x\n"
+            f"♻️ <b>TPs nach DCA aktualisiert — {symbol}</b>\n"
+            f"Richtung: {direction.upper()} | Hebel: {leverage}x\n"
+            f"Neuer Avg: {avg} USDT\n"
+            f"SL (unverändert): {sl_info}\n"
             f"Grund: {reason}\n\n"
             + "\n".join(prices)
         )
@@ -1767,6 +1798,330 @@ def start_webhook_server():
 # MAIN LOOP
 # ═══════════════════════════════════════════════════════════════
 
+def analyse_trade_state(avg: float, mark: float, leverage: int,
+                        direction: str) -> dict:
+    """
+    Errechnet den aktuellen Trade-Stand anhand von Entry-Preis und Mark-Preis.
+
+    Vergleicht den aktuellen Kurs (mark) mit den errechneten TP-Preisen:
+      Long:  TP ausgelöst wenn mark >= TP-Preis
+      Short: TP ausgelöst wenn mark <= TP-Preis
+
+    Gibt zurück:
+      tps_hit        — Liste der bereits preislich passierten TPs (Label, ROI, Preis)
+      tps_remaining  — Liste der noch offenstehenden TPs (Label, ROI, Pct, Preis)
+      tp1_price_hit  — bool: TP1-Preislevel wurde passiert
+      n_expected_profit_plan — Anzahl erwarteter profit_plan Orders (TP1–TP3 der verbleibenden)
+      tp4_expected   — bool: TP4 sollte noch als Full-Close vorhanden sein
+      pnl_roi_pct    — unrealisierter ROI auf Margin (Mark vs Entry, mit Hebel)
+    """
+    rois   = [TP1_ROI, TP2_ROI, TP3_ROI, TP4_ROI]
+    labels = ["TP1 (10%)", "TP2 (20%)", "TP3 (30%)", "TP4 (40%)"]
+    pcts   = TP_CLOSE_PCTS
+
+    tps_hit       = []
+    tps_remaining = []
+
+    for label, roi, pct in zip(labels, rois, pcts):
+        tp_price = calc_tp_price(avg, roi, direction, leverage)
+        if direction == "long":
+            hit = mark >= tp_price
+        else:
+            hit = mark <= tp_price
+        entry = {"label": label, "roi": roi, "pct": pct, "price": tp_price}
+        if hit:
+            tps_hit.append(entry)
+        else:
+            tps_remaining.append(entry)
+
+    tp1_price_hit = len(tps_hit) >= 1
+
+    # profit_plan Orders: TP1–TP3 der noch nicht passierten TPs
+    n_expected_profit_plan = sum(
+        1 for t in tps_remaining if t["roi"] < TP4_ROI
+    )
+    tp4_expected = any(t["roi"] == TP4_ROI for t in tps_remaining)
+
+    # Unrealisierter ROI auf Margin
+    price_change_pct = (mark - avg) / avg * 100
+    if direction == "short":
+        price_change_pct = -price_change_pct
+    pnl_roi_pct = price_change_pct * leverage
+
+    return {
+        "tps_hit":                tps_hit,
+        "tps_remaining":          tps_remaining,
+        "tp1_price_hit":          tp1_price_hit,
+        "n_expected_profit_plan": n_expected_profit_plan,
+        "tp4_expected":           tp4_expected,
+        "pnl_roi_pct":            round(pnl_roi_pct, 1),
+    }
+
+
+def check_and_repair_position(pos: dict):
+    """
+    Startup-Check: Prüft eine bestehende Position vollständig und repariert Fehlendes.
+
+    Ablauf:
+      0. Trade-Stand errechnen: Entry vs. Mark-Preis → welche TPs wurden preislich
+         bereits passiert? So wird der aktuelle Stand ohne gespeicherten Zustand ermittelt.
+      1. SL prüfen — vorhanden? Auf Entry oder auf -25%? Sonst Auto-SL setzen.
+         Wenn TP1-Preis passiert und SL noch nicht auf Entry → SL auf Entry setzen.
+      2. TPs prüfen — nur die noch nicht passierten TPs müssen als Orders vorhanden sein.
+         TP4 schliesst 100% der Restposition. Fehlende/falsche TPs werden neu gesetzt.
+      3. TP1 ausgelöst (SL auf Entry oder TP1-Preis passiert) → DCAs stornieren, fertig.
+      4. Noch kein TP passiert → 2 DCA Limit-Orders prüfen. Fehlende nachsetzen.
+    """
+    symbol    = pos.get("symbol", "?")
+    direction = pos.get("holdSide", "long")
+    avg       = float(pos.get("openPriceAvg", 0))
+    size      = float(pos.get("total", 0))
+    leverage  = int(float(pos.get("leverage", 10)))
+    decimals  = get_price_decimals(symbol)
+    mark      = get_mark_price(symbol)
+
+    log(f"  ── {symbol} | {direction.upper()} | "
+        f"Avg={avg} | Qty={size} | {leverage}x | Mark={mark}")
+
+    if avg == 0 or size == 0:
+        log("  Ungültige Positionsdaten — übersprungen.")
+        return
+
+    # State vormerken
+    last_known_avg[symbol]  = avg
+    last_known_size[symbol] = size
+    new_trade_done[symbol]  = True
+    sl_at_entry[symbol]     = False
+
+    # ── 0. Trade-Stand anhand Preisbewegung errechnen ─────────────────────
+    state = analyse_trade_state(avg, mark, leverage, direction)
+    pnl   = state["pnl_roi_pct"]
+    pnl_sign = "+" if pnl >= 0 else ""
+
+    log(f"  Unrealisierter ROI: {pnl_sign}{pnl}% auf Margin")
+    if state["tps_hit"]:
+        hit_labels = ", ".join(t["label"] for t in state["tps_hit"])
+        log(f"  Preislich passierte TPs: {hit_labels}"
+            f" → diese Orders sollten bereits ausgelöst/nicht mehr aktiv sein")
+    else:
+        log(f"  Kein TP-Level preislich überschritten → alle 4 TPs erwartet")
+
+    remaining_labels = [t["label"] for t in state["tps_remaining"]]
+    log(f"  Noch offene TPs erwartet: "
+        f"{', '.join(remaining_labels) if remaining_labels else 'keine (alle passiert)'}")
+
+    # ── 1. SL prüfen ──────────────────────────────────────────────────────
+    sl_price    = get_sl_price(symbol, direction)
+    sl_is_entry = False
+
+    if sl_price == 0:
+        if state["tp1_price_hit"]:
+            # TP1 bereits passiert → SL muss auf Entry
+            sl_str   = round_price(avg, decimals)
+            sl_valid = (direction == "long" and avg <= mark) or \
+                       (direction == "short" and avg >= mark)
+            if sl_valid:
+                log(f"  TP1 preislich passiert, kein SL → setze SL auf Entry @ {sl_str}")
+                res = api_post("/api/v2/mix/order/place-pos-tpsl", {
+                    "symbol":               symbol,
+                    "productType":          PRODUCT_TYPE,
+                    "marginCoin":           MARGIN_COIN,
+                    "holdSide":             direction,
+                    "stopLossTriggerPrice": sl_str,
+                    "stopLossTriggerType":  "mark_price",
+                })
+                if res.get("code") == "00000":
+                    sl_price    = avg
+                    sl_is_entry = True
+                    log(f"  ✓ SL auf Entry gesetzt @ {sl_str}")
+                    telegram(
+                        f"🔒 <b>SL auf Entry gesetzt — {symbol}</b>\n"
+                        f"Script-Start: TP1 bereits passiert, kein SL vorhanden\n"
+                        f"SL: {sl_str} USDT"
+                    )
+                else:
+                    log(f"  ✗ SL auf Entry fehlgeschlagen: {res.get('msg', res)}")
+            else:
+                log(f"  ⚠ Mark {mark} bereits hinter Entry {avg} — SL auf Entry nicht setzbar")
+                telegram(f"⚠️ <b>{symbol}</b>: Position im Verlust, SL manuell setzen!")
+        else:
+            # Kein TP passiert → Auto-SL auf -25% Margin
+            factor  = 0.25 / leverage
+            sl_auto = avg * (1 - factor) if direction == "long" else avg * (1 + factor)
+            sl_str  = round_price(sl_auto, decimals)
+            sl_auto = float(sl_str)
+            sl_dist = abs(avg - sl_auto) / avg * 100
+            log(f"  ⚠ Kein SL → Auto-SL @ {sl_str} (-{sl_dist:.1f}% / -25% Margin)")
+            res = api_post("/api/v2/mix/order/place-pos-tpsl", {
+                "symbol":               symbol,
+                "productType":          PRODUCT_TYPE,
+                "marginCoin":           MARGIN_COIN,
+                "holdSide":             direction,
+                "stopLossTriggerPrice": sl_str,
+                "stopLossTriggerType":  "mark_price",
+            })
+            if res.get("code") == "00000":
+                sl_price = sl_auto
+                log(f"  ✓ Auto-SL gesetzt @ {sl_str}")
+                telegram(
+                    f"🛡 <b>Auto-SL gesetzt — {symbol}</b>\n"
+                    f"Script-Start: kein SL gefunden\n"
+                    f"SL: {sl_str} USDT ({sl_dist:.1f}% Abstand)\n"
+                    f"⚠️ Bitte mit Ausstiegslinie abgleichen!"
+                )
+            else:
+                log(f"  ✗ Auto-SL fehlgeschlagen: {res.get('msg', res)}")
+                telegram(
+                    f"❌ <b>Kein SL — {symbol}</b>\n"
+                    f"Auto-SL fehlgeschlagen. Bitte manuell setzen!\n"
+                    f"Empfehlung: {sl_str} USDT ({sl_dist:.1f}%)"
+                )
+    else:
+        sl_dist_pct = abs(avg - sl_price) / avg * 100
+        sl_is_entry = sl_dist_pct <= 0.15
+        if sl_is_entry:
+            log(f"  ✓ SL auf Entry @ {sl_price} (bestätigt)")
+        elif state["tp1_price_hit"] and not sl_is_entry:
+            # TP1 preislich passiert aber SL noch nicht auf Entry → nachziehen
+            sl_str   = round_price(avg, decimals)
+            sl_valid = (direction == "long" and avg <= mark) or \
+                       (direction == "short" and avg >= mark)
+            if sl_valid:
+                log(f"  TP1 passiert aber SL @ {sl_price} nicht auf Entry "
+                    f"→ SL auf Entry setzen @ {sl_str}")
+                existing_tp4 = _get_pos_tp_price(symbol, direction)
+                body_sl = {
+                    "symbol":               symbol,
+                    "productType":          PRODUCT_TYPE,
+                    "marginCoin":           MARGIN_COIN,
+                    "holdSide":             direction,
+                    "stopLossTriggerPrice": sl_str,
+                    "stopLossTriggerType":  "mark_price",
+                }
+                if existing_tp4 > 0:
+                    body_sl["takeProfitTriggerPrice"] = round_price(existing_tp4, decimals)
+                    body_sl["takeProfitTriggerType"]  = "mark_price"
+                res = api_post("/api/v2/mix/order/place-pos-tpsl", body_sl)
+                if res.get("code") == "00000":
+                    sl_price    = avg
+                    sl_is_entry = True
+                    log(f"  ✓ SL auf Entry nachgezogen @ {sl_str}")
+                    telegram(
+                        f"🔒 <b>SL auf Entry nachgezogen — {symbol}</b>\n"
+                        f"Script-Start: TP1 preislich passiert\n"
+                        f"SL: {sl_str} USDT"
+                    )
+                else:
+                    log(f"  ✗ SL nachziehen fehlgeschlagen: {res.get('msg', res)}")
+            else:
+                log(f"  ⚠ Mark {mark} hinter Entry {avg} — SL auf Entry nicht setzbar")
+        else:
+            log(f"  ✓ SL @ {sl_price} ({sl_dist_pct:.2f}% Abstand)")
+
+    sl_at_entry[symbol] = sl_is_entry
+
+    # Trade-Daten für spätere Auswertung und als SL-Fallback in place_tp_orders
+    trade_data[symbol] = {
+        "entry":     avg,
+        "direction": direction,
+        "leverage":  leverage,
+        "sl":        sl_price,
+        "peak_size": size,
+        "open_ts":   int(time.time() * 1000),
+    }
+
+    # ── 2. TPs prüfen ─────────────────────────────────────────────────────
+    # Nur die TPs prüfen, die laut Preisvergleich noch offen sein sollten.
+    existing_tps = get_existing_tps(symbol)
+    tp4_pos      = _get_pos_tp_price(symbol, direction)
+
+    n_exp_pp   = state["n_expected_profit_plan"]   # erwartete profit_plan Orders
+    tp4_exp    = state["tp4_expected"]             # TP4 Full-Close erwartet?
+    n_act_pp   = len(existing_tps)
+    tp4_ok     = (tp4_pos > 0) if tp4_exp else True
+
+    # profit_plan korrekt wenn Anzahl stimmt UND Preise übereinstimmen
+    pp_count_ok  = (n_act_pp == n_exp_pp)
+    pp_price_ok  = tps_are_correct(existing_tps, avg, size, direction,
+                                   leverage, decimals, mark) if pp_count_ok else False
+    tps_correct  = pp_count_ok and pp_price_ok and tp4_ok
+
+    log(f"  TPs: erwartet {n_exp_pp} profit_plan"
+        f" + {'TP4 Full-Close' if tp4_exp else 'kein TP4 (passiert)'}"
+        f" | vorhanden {n_act_pp} profit_plan"
+        f" + {'TP4 @ ' + str(tp4_pos) if tp4_pos > 0 else 'kein TP4'}")
+
+    if not tps_correct:
+        reasons = []
+        if not pp_count_ok:
+            reasons.append(f"profit_plan: {n_act_pp} statt {n_exp_pp} erwartet")
+        elif not pp_price_ok:
+            reasons.append("profit_plan Preise stimmen nicht")
+        if not tp4_ok:
+            reasons.append("TP4 Full-Close fehlt")
+        log(f"  ⚠ TPs inkorrekt ({'; '.join(reasons)}) → neu setzen")
+
+        if size < 4:
+            log(f"  ⚠ Position zu klein (Qty={size}, min. 4) — TPs manuell setzen")
+        else:
+            cancel_all_tp_orders(symbol)
+            time.sleep(1)
+            count, tp_prices = place_tp_orders(
+                symbol, avg, size, direction, leverage, mark, known_sl=sl_price
+            )
+            status = "✓ Alle" if count == len(state["tps_remaining"]) else f"⚠ {count}"
+            log(f"  {status} TPs gesetzt")
+            if count > 0:
+                telegram(
+                    f"🔧 <b>TPs repariert — {symbol}</b>\n"
+                    f"Script-Start: TPs fehlend/falsch\n"
+                    f"Verbleibende TPs: "
+                    f"{', '.join(t['label'] for t in state['tps_remaining'])}\n"
+                    + "\n".join(tp_prices)
+                )
+    else:
+        log(f"  ✓ TPs korrekt")
+
+    # ── 3. TP1 ausgelöst (Preis passiert oder SL auf Entry) ───────────────
+    tp1_done = sl_is_entry or state["tp1_price_hit"]
+    if tp1_done:
+        log(f"  TP1 ausgelöst → storniere offene DCA-Orders")
+        cancel_open_dca_orders(symbol, direction)
+        return
+
+    # ── 4. DCAs prüfen (nur wenn kein TP passiert) ────────────────────────
+    existing_dcas = get_existing_dca_orders(symbol, direction)
+    n_dca         = len(existing_dcas)
+
+    if n_dca >= 2:
+        dca_info = " | ".join(
+            f"{o.get('price','?')} × {o.get('size','?')}" for o in existing_dcas[:2]
+        )
+        log(f"  ✓ {n_dca} DCA-Orders vorhanden: {dca_info}")
+    else:
+        log(f"  ⚠ Nur {n_dca}/2 DCA-Orders vorhanden → fehlende setzen")
+        if sl_price == 0:
+            log("  Kein SL-Preis bekannt — DCA-Platzierung übersprungen")
+            telegram(
+                f"⚠️ <b>DCA fehlt — {symbol}</b>\n"
+                f"Kein SL-Preis bekannt, DCAs konnten nicht gesetzt werden.\n"
+                f"Bitte DCA-Orders manuell platzieren."
+            )
+        else:
+            base_size  = size   # aktuelle Grösse = Initial-Order (kein DCA gefüllt)
+            dca_result = place_dca_orders(
+                symbol, avg, sl_price, direction, base_size,
+                balance=get_futures_balance(), leverage=leverage
+            )
+            log(f"  {len(dca_result)}/2 DCAs gesetzt")
+            if dca_result:
+                telegram(
+                    f"🔧 <b>DCAs repariert — {symbol}</b>\n"
+                    f"Script-Start: {n_dca}/2 DCA-Orders gefehlt\n"
+                    + "\n".join(dca_result)
+                )
+
+
 def main():
     if not API_KEY or not SECRET_KEY or not PASSPHRASE:
         log("FEHLER: API_KEY, SECRET_KEY oder PASSPHRASE fehlen!")
@@ -1782,146 +2137,21 @@ def main():
     t = threading.Thread(target=start_webhook_server, daemon=True)
     t.start()
 
-    # Beim Start: bestehende Positionen als bekannt markieren.
-    # SL wird einmalig geprüft — falls nicht gesetzt: Auto-SL (-25%).
-    # TPs werden beim Start nie angepasst.
+    # ── Startup: bestehende Positionen vollständig prüfen und reparieren ──
+    # check_and_repair_position() prüft für jede Position:
+    #   1. SL vorhanden (Entry oder -25%)? → sonst Auto-SL
+    #   2. 4 TPs korrekt? → sonst neu setzen
+    #   3. TP1 ausgelöst (SL auf Entry)? → DCAs stornieren
+    #   4. Noch kein TP? → 2 DCAs vorhanden? → sonst setzen
     positions = get_all_positions()
     if positions:
-        log(f"{len(positions)} bestehende Position(en) beim Start:")
+        log(f"{'─'*55}")
+        log(f"Startup-Check: {len(positions)} offene Position(en)")
+        log(f"{'─'*55}")
         for pos in positions:
-            sym       = pos.get("symbol", "?")
-            avg       = float(pos.get("openPriceAvg", 0))
-            size      = float(pos.get("total", 0))
-            lev       = int(float(pos.get("leverage", 10)))
-            direction = pos.get("holdSide", "long")
-            log(f"  {sym} | {direction.upper()} | "
-                f"Avg={avg} | Qty={size} | {lev}x")
-
-            last_known_avg[sym]  = avg
-            last_known_size[sym] = size
-            new_trade_done[sym]  = True
-            # sl_at_entry wird erst nach SL-Prüfung gesetzt (unten)
-
-            # ── SL prüfen — einmalig beim Start ──────────────
-            if avg == 0 or size == 0:
-                sl_at_entry[sym] = False
-                continue
-
-            sl_existing = get_sl_price(sym, direction)
-
-            if sl_existing > 0:
-                sl_dist = abs(avg - sl_existing) / avg * 100
-                # Prüfen ob SL bereits auf Entry steht (Toleranz 0.15%)
-                # Das bedeutet TP1 wurde bereits ausgelöst
-                at_entry = sl_dist <= 0.15
-                sl_at_entry[sym] = at_entry
-                if at_entry:
-                    log(f"  ✓ SL auf Entry @ {sl_existing} "
-                        f"— TP1 bereits ausgelöst, SL wird nicht verändert")
-                    # SL ist nachweislich auf Entry → DCA stornieren (sicher)
-                    log(f"  Storniere offene DCA-Orders (TP1 bestätigt via SL)...")
-                    cancel_open_dca_orders(sym, direction)
-                else:
-                    log(f"  ✓ SL vorhanden @ {sl_existing} "
-                        f"({sl_dist:.1f}% Abstand) — wird nicht verändert")
-            else:
-                # Kein SL gefunden → prüfen ob TPs bereits teils ausgelöst
-                # Indikator: bestehende TPs starten nicht bei TP1-Preis
-                existing_tps = get_existing_tps(sym)
-                decimals     = get_price_decimals(sym)
-                n_tps        = len(existing_tps)
-
-                # Zuverlässigste Erkennung: Anzahl verbleibender TPs
-                # Original = 4 TPs → nach TP1 nur noch 3 → nach TP2 nur noch 2
-                # Wenn < 4 TPs vorhanden → mindestens TP1 wurde ausgelöst
-                # → SL muss auf Entry stehen
-                tp1_already_hit = n_tps < 4
-                if tp1_already_hit:
-                    log(f"  TP1 bereits ausgelöst: {n_tps}/4 TPs noch offen "
-                        f"→ SL auf Entry")
-                else:
-                    log(f"  Alle 4 TPs noch offen → normaler Trade")
-
-                if tp1_already_hit:
-                    # SL auf Entry setzen — Position ist bereits abgesichert
-                    sl_at_entry[sym] = True
-
-                    # ── DCA-Orders werden NICHT automatisch storniert ────
-                    # Kein SL + <4 TPs ist mehrdeutig (z.B. Script-Neustart
-                    # während Kein-SL-Zustand). DCA-Stornierung nur wenn SL
-                    # nachweislich auf Entry steht (siehe Zweig sl_existing > 0).
-
-                    # ── SL auf Entry setzen ───────────────────────
-                    # Prüfen ob Mark-Preis bereits unter Entry (Long)
-                    # → Bitget lehnt SL über Marktpreis ab
-                    mark = get_mark_price(sym)
-                    sl_valid = (direction == "long"  and avg <= mark) or                                (direction == "short" and avg >= mark)
-
-                    if not sl_valid:
-                        log(f"  ⚠ Mark {mark} bereits hinter Entry {avg} "
-                            f"— SL auf Entry nicht setzbar, Position im Verlust")
-                        telegram(
-                            f"\u26a0\ufe0f <b>SL auf Entry nicht möglich \u2014 {sym}</b>\n"
-                            f"Mark-Preis {mark} bereits hinter Entry {avg}\n"
-                            f"Position manuell überwachen!"
-                        )
-                    else:
-                        sl_str = round_price(avg, decimals)
-                        log(f"  SL auf Entry setzen @ {sl_str} "
-                            f"(TP1 bereits ausgelöst)")
-                        res = api_post("/api/v2/mix/order/place-pos-tpsl", {
-                            "symbol":               sym,
-                            "productType":          PRODUCT_TYPE,
-                            "marginCoin":           MARGIN_COIN,
-                            "holdSide":             direction,
-                            "stopLossTriggerPrice": sl_str,
-                            "stopLossTriggerType":  "mark_price",
-                        })
-                        if res.get("code") == "00000":
-                            log(f"  ✓ SL auf Entry gesetzt @ {sl_str} USDT")
-                            # SL nun nachweislich auf Entry → DCA stornieren
-                            log(f"  Storniere offene DCA-Orders (SL auf Entry gesetzt)...")
-                            cancel_open_dca_orders(sym, direction)
-                            telegram(
-                                f"\U0001f512 <b>SL auf Entry gesetzt \u2014 {sym}</b>\n"
-                                f"Script-Start: TP1 bereits ausgelöst\n"
-                                f"SL: {sl_str} USDT | DCA-Orders storniert \u2713"
-                            )
-                        else:
-                            log(f"  ✗ SL auf Entry fehlgeschlagen: "
-                                f"{res.get('msg', res)}")
-                else:
-                    # Kein TP ausgelöst → Auto-SL -25%
-                    sl_at_entry[sym] = False
-                    factor   = 0.25 / lev
-                    sl_auto  = avg * (1 - factor) if direction == "long"                                else avg * (1 + factor)
-                    sl_str   = round_price(sl_auto, decimals)
-                    sl_auto  = float(sl_str)
-                    sl_dist  = abs(avg - sl_auto) / avg * 100
-                    log(f"  ⚠ Kein SL — Auto-SL @ {sl_str} ({sl_dist:.1f}%)")
-                    res = api_post("/api/v2/mix/order/place-pos-tpsl", {
-                        "symbol":               sym,
-                        "productType":          PRODUCT_TYPE,
-                        "marginCoin":           MARGIN_COIN,
-                        "holdSide":             direction,
-                        "stopLossTriggerPrice": sl_str,
-                        "stopLossTriggerType":  "mark_price",
-                    })
-                    if res.get("code") == "00000":
-                        log(f"  ✓ Auto-SL gesetzt @ {sl_str} USDT")
-                        links = tv_chart_links(sym)
-                        telegram(
-                            f"\U0001f6e1 <b>Auto-SL gesetzt \u2014 {sym}</b>\n"
-                            f"Script-Start: kein SL gefunden\n\n"
-                            f"SL: {sl_str} USDT ({sl_dist:.1f}% Abstand)\n"
-                            f"Entry: {avg} | Hebel: {lev}x\n\n"
-                            f"\u26a0\ufe0f Bitte pr\u00fcfen ob SL mit "
-                            f"Ausstiegslinie \u00fcbereinstimmt!\n"
-                            f"H4: {links['coin_h4']}"
-                        )
-                    else:
-                        log(f"  ✗ Auto-SL fehlgeschlagen: "
-                            f"{res.get('msg', res)}")
+            check_and_repair_position(pos)
+        log(f"{'─'*55}")
+        log("Startup-Check abgeschlossen. Polling startet...")
     else:
         log("Keine offenen Positionen. Warte auf ersten Trade...")
 
