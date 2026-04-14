@@ -302,6 +302,7 @@ def get_sl_price(symbol: str, direction: str) -> float:
     result2 = api_get("/api/v2/mix/order/tpsl-pending-orders", {
         "symbol":      symbol,
         "productType": PRODUCT_TYPE,
+        "marginCoin":  MARGIN_COIN,
     })
     if result2.get("code") == "00000":
         orders = (result2.get("data") or {}).get("entrustedList") or []
@@ -384,6 +385,7 @@ def cancel_all_tp_orders(symbol: str):
     result = api_get("/api/v2/mix/order/tpsl-pending-orders", {
         "symbol":      symbol,
         "productType": PRODUCT_TYPE,
+        "marginCoin":  MARGIN_COIN,
     })
     if result.get("code") != "00000":
         log(f"  ⚠ tpsl-pending Fehler: {result.get('msg', result)}")
@@ -443,11 +445,24 @@ def place_tp_orders(symbol: str, avg: float, size: float,
         (TP3_ROI, "TP3 (30%)", TP_CLOSE_PCTS[2]),
     ]
 
+    partial_tps_skipped = 0  # zählt übersprungene Teilschliessungen (Position zu klein)
+
     for roi, label, pct in partial_tps:
         tp_raw = calc_tp_price(avg, roi, direction, leverage)
         tp_str = round_price(tp_raw, decimals)
         tp_val = float(tp_str)
-        qty    = max(1, math.floor(size * pct))
+
+        # Qty-Berechnung: ganzzahlige Kontrakte (>= 1.0) vs. Dezimal-Kontrakte (< 1.0)
+        # max(1, floor()) war falsch für BTC: floor(0.0013 × 0.15)=0 → "1 BTC schliessen"
+        if size >= 1.0:
+            qty = math.floor(size * pct)
+        else:
+            qty = round(size * pct, 4)
+
+        if qty <= 0:
+            log(f"    ⏭ {label}: Position zu klein für Teilschliessung (size={size}, pct={pct}) — übersprungen")
+            partial_tps_skipped += 1
+            continue
 
         if mark_price > 0:
             if direction == "long"  and tp_val <= mark_price:
@@ -494,6 +509,16 @@ def place_tp_orders(symbol: str, avg: float, size: float,
                     log(f"    ✓ {label} @ {tp_str2} USDT [retry OK]")
                     count += 1
                     prices.append(f"{label}: {tp_str2}")
+
+    # Warnung wenn Teilschliessungen wegen zu kleiner Position nicht setzbar waren
+    if partial_tps_skipped > 0:
+        warn_msg = (
+            f"⚠️ {symbol}: {partial_tps_skipped}/3 Teilschliessung(en) konnten nicht gesetzt werden "
+            f"(Position {size} Kontrakte zu klein für Teilschliessung).\n"
+            f"TP1–SL-Mechanismus greift nicht automatisch — SL manuell überwachen!"
+        )
+        log(warn_msg)
+        send_telegram(warn_msg)
 
     # ── TP4: Full Position Close via place-pos-tpsl ──────────────
     # WICHTIG: place-pos-tpsl verwaltet NUR EINEN kombinierten
@@ -1146,6 +1171,7 @@ def get_existing_tps(symbol: str) -> list:
     result = api_get("/api/v2/mix/order/tpsl-pending-orders", {
         "symbol":      symbol,
         "productType": PRODUCT_TYPE,
+        "marginCoin":  MARGIN_COIN,
     })
     if result.get("code") != "00000":
         return []
