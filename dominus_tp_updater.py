@@ -123,6 +123,12 @@ h4_buffer:     list = []
 h4_buffer_lock = __import__("threading").Lock()
 H4_BUFFER_SEC  = int(os.environ.get("H4_BUFFER_SEC", "300"))  # 5 Min
 
+# H2 Trigger-Puffer: sammelt Alerts, sendet gebündelt nach kurzem Zeitfenster
+h2_buffer:      list = []
+h2_buffer_lock  = __import__("threading").Lock()
+h2_flush_timer  = None   # threading.Timer — löst Flush nach H2_BUFFER_SEC aus
+H2_BUFFER_SEC   = int(os.environ.get("H2_BUFFER_SEC", "30"))   # 30 Sekunden
+
 
 # ═══════════════════════════════════════════════════════════════
 # BASIS-FUNKTIONEN
@@ -145,6 +151,30 @@ def telegram(msg: str):
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
             json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"},
+            timeout=5
+        )
+    except Exception:
+        pass
+
+
+def telegram_with_buttons(msg: str, keyboard: list):
+    """
+    Sendet Telegram-Nachricht mit InlineKeyboard-Buttons.
+
+    keyboard ist eine Liste von Zeilen, jede Zeile eine Liste von Button-Dicts:
+      [[{"text": "Label", "callback_data": "data"}], [...]]
+    """
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={
+                "chat_id":      TELEGRAM_CHAT_ID,
+                "text":         msg,
+                "parse_mode":   "HTML",
+                "reply_markup": {"inline_keyboard": keyboard},
+            },
             timeout=5
         )
     except Exception:
@@ -290,21 +320,13 @@ def get_recent_fills_all(since_ms: int) -> list:
 
 def _get_plan_orders(symbol: str) -> list:
     """
-    Liest alle offenen TPSL-Orders (profit_plan / loss_plan) für ein Symbol.
+    Liest alle offenen Plan-Orders (TPs, SL) für ein Symbol.
 
-    Bitget v2: orders-plan-pending benötigt planType=profit_loss für TPSL-Orders.
-    Ohne planType liefert die API "Parameter verification failed".
+    Bitget v2 bietet zwei relevante Endpoints — beide werden versucht:
+      1. orders-plan-pending  (mit / ohne marginCoin, mit / ohne symbol)
+      2. tpsl-pending-orders  (als Fallback)
 
-    Gültige planType-Werte für orders-plan-pending:
-      normal_plan  → reguläre Trigger-Orders (Entry)
-      profit_loss  → TPSL-Orders (TP + SL zusammen) ← das brauchen wir
-      track_plan   → Trailing-Stop-Orders
-
-    Zurückgegebene planType-Felder in den Orders:
-      profit_plan  → TP-Order (TP1–TP3 via place-tpsl-order)
-      loss_plan    → SL-Order (plan-basiert)
-      pos_loss     → SL via place-pos-tpsl (position-level)
-      pos_profit   → TP via place-pos-tpsl (TP4)
+    Deckt ab: profit_plan (TP1-TP3), loss_plan / pos_loss (SL).
     """
     def _parse(raw) -> list:
         if isinstance(raw, list):
@@ -312,44 +334,37 @@ def _get_plan_orders(symbol: str) -> list:
         if isinstance(raw, dict):
             for key in ("entrustedList", "planList", "orderList", "data"):
                 lst = raw.get(key)
-                if isinstance(lst, list):
+                if isinstance(lst, list) and lst:
                     return lst
             # leeres dict aber code 00000 → leere Liste ist korrekt
             return []
         return []
 
-    # Versuch 1: profit_loss planType mit Symbol
+    # Versuch 1: orders-plan-pending mit symbol + marginCoin
     r = api_get("/api/v2/mix/order/orders-plan-pending", {
-        "productType": PRODUCT_TYPE,
-        "symbol":      symbol,
-        "planType":    "profit_loss",
-    })
-    if r.get("code") == "00000":
-        orders = _parse(r.get("data"))
-        log(f"  [plan-orders] {len(orders)} TPSL-Orders für {symbol} (Versuch 1)")
-        return orders
-
-    # Versuch 2: profit_loss planType ohne Symbol (Python-Filter)
-    r2 = api_get("/api/v2/mix/order/orders-plan-pending", {
-        "productType": PRODUCT_TYPE,
-        "planType":    "profit_loss",
-    })
-    if r2.get("code") == "00000":
-        all_orders = _parse(r2.get("data"))
-        orders = [o for o in all_orders if o.get("symbol") == symbol]
-        log(f"  [plan-orders] {len(orders)}/{len(all_orders)} TPSL-Orders für {symbol} (Versuch 2)")
-        return orders
-
-    # Versuch 3: ohne planType + Symbol (ältere API-Versionen)
-    r3 = api_get("/api/v2/mix/order/orders-plan-pending", {
         "productType": PRODUCT_TYPE,
         "symbol":      symbol,
         "marginCoin":  MARGIN_COIN,
     })
+    if r.get("code") == "00000":
+        return _parse(r.get("data"))
+
+    # Versuch 2: orders-plan-pending nur mit productType (dann symbol-Filter in Python)
+    r2 = api_get("/api/v2/mix/order/orders-plan-pending", {
+        "productType": PRODUCT_TYPE,
+    })
+    if r2.get("code") == "00000":
+        all_orders = _parse(r2.get("data"))
+        return [o for o in all_orders if o.get("symbol") == symbol]
+
+    # Versuch 3: tpsl-pending-orders mit marginCoin
+    r3 = api_get("/api/v2/mix/order/tpsl-pending-orders", {
+        "symbol":      symbol,
+        "productType": PRODUCT_TYPE,
+        "marginCoin":  MARGIN_COIN,
+    })
     if r3.get("code") == "00000":
-        orders = _parse(r3.get("data"))
-        log(f"  [plan-orders] {len(orders)} Orders für {symbol} (Versuch 3)")
-        return orders
+        return _parse(r3.get("data"))
 
     log(f"  [WARN] Alle Plan-Order Endpoints für {symbol} fehlgeschlagen: "
         f"1={r.get('msg','?')} | 2={r2.get('msg','?')} | 3={r3.get('msg','?')}")
@@ -454,37 +469,31 @@ def kelly_recommendation(balance: float, winrate: float) -> dict:
 
 def cancel_all_tp_orders(symbol: str):
     """
-    Storniert alle TP-Orders (profit_plan / pos_profit) für ein Symbol.
-    Liest via orders-plan-pending (planType=profit_loss), storniert via cancel-plan-order.
+    Storniert alle TP-Orders (profit_plan) für ein Symbol.
+    Liest via orders-plan-pending, storniert via cancel-plan-order.
     SL-Typen (loss_plan, pos_loss) werden nie angefasst.
-
-    Bitget v2 cancel-plan-order erwartet orderIdList (Array), nicht einzelne orderId.
     """
-    TP_TYPES = {"profit_plan", "pos_profit"}
     orders = _get_plan_orders(symbol)
-    tp_orders = [o for o in orders if o.get("planType") in TP_TYPES]
+    tp_orders = [o for o in orders if o.get("planType") == "profit_plan"]
 
     if not tp_orders:
-        log(f"  Keine TP-Orders gefunden (von {len(orders)} plan-orders)")
+        log(f"  Keine TP-Orders gefunden")
         return
 
-    log(f"  {len(tp_orders)} TP(s) stornieren (von {len(orders)} plan-orders)...")
+    log(f"  {len(tp_orders)} TP(s) stornieren...")
     for order in tp_orders:
-        oid      = order.get("orderId")
-        price    = order.get("triggerPrice", "?")
-        ptype    = order.get("planType", "?")
-        # Bitget v2 cancel-plan-order: orderIdList ist ein Array von {orderId: ...}
-        res = api_post("/api/v2/mix/order/cancel-plan-order", {
+        oid   = order.get("orderId")
+        price = order.get("triggerPrice", "?")
+        res   = api_post("/api/v2/mix/order/cancel-plan-order", {
             "symbol":      symbol,
             "productType": PRODUCT_TYPE,
             "marginCoin":  MARGIN_COIN,
-            "planType":    ptype,
-            "orderIdList": [{"orderId": oid}],
+            "orderId":     oid,
         })
         if res.get("code") == "00000":
-            log(f"    ✓ TP storniert [{ptype}] @ {price}: {oid}")
+            log(f"    ✓ TP storniert @ {price}: {oid}")
         else:
-            log(f"    ✗ Fehler [{ptype}] @ {price}: {res.get('msg', res)}")
+            log(f"    ✗ Fehler: {res.get('msg', res)}")
 
 
 def calc_tp_price(avg: float, roi: float,
@@ -529,16 +538,15 @@ def place_tp_orders(symbol: str, avg: float, size: float,
         tp_str = round_price(tp_raw, decimals)
         tp_val = float(tp_str)
 
-        # Qty-Berechnung: 2 Dezimalstellen für Futures-Kontrakte >= 1.0
-        # (z.B. COMP 1.76 × 0.15 = 0.264 → floor=0 [falsch!], round=0.26 [korrekt])
-        # Für Kleinkontrakts-Symbole (BTC 0.001 etc.) mehr Präzision
+        # Qty-Berechnung: ganzzahlige Kontrakte (>= 1.0) vs. Dezimal-Kontrakte (< 1.0)
+        # max(1, floor()) war falsch für BTC: floor(0.0013 × 0.15)=0 → "1 BTC schliessen"
         if size >= 1.0:
-            qty = round(size * pct, 2)  # 2 Dezimalstellen — deckt Bitget-Mindestschritt ab
+            qty = math.floor(size * pct)
         else:
             qty = round(size * pct, 4)
 
         if qty <= 0:
-            log(f"    ⏭ {label}: qty=0 (size={size}, pct={pct}) — übersprungen")
+            log(f"    ⏭ {label}: Position zu klein für Teilschliessung (size={size}, pct={pct}) — übersprungen")
             partial_tps_skipped += 1
             continue
 
@@ -1786,10 +1794,63 @@ def cmd_refresh(parts: list):
     reply("\n".join(lines))
 
 
+def _answer_callback(callback_id: str):
+    """Quittiert einen Telegram Callback-Query (entfernt Lade-Animation)."""
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery",
+            json={"callback_query_id": callback_id},
+            timeout=3
+        )
+    except Exception:
+        pass
+
+
+def _send_h2_trade_detail(symbol: str, direction: str, entry: float):
+    """
+    Sendet die vollständige Einzel-Trade-Info für ein H2-Signal.
+    Wird ausgelöst wenn der User den Trade-Button in der H2-Zusammenfassung drückt.
+    """
+    links     = tv_chart_links(symbol)
+    balance   = get_futures_balance()
+    kelly     = kelly_recommendation(balance, WINRATE)
+    per_order = balance * 0.10 / 3
+    chk_dir   = "grüner" if direction == "long" else "roter"
+    icon      = dir_icon(direction)
+    leverage  = calc_optimal_leverage(entry, 0)  # ohne SL: Standard-Empfehlung
+    msg = "\n".join([
+        f"{icon} <b>H2 Signal — {symbol} {direction.upper()}</b>",
+        "━" * 12,
+        f"Kurs: {entry}",
+        "",
+        "📋 <b>DOMINUS Checkliste:</b>",
+        "☐ DOMINUS Impuls Extremzone erreicht?",
+        "☐ H4 Trigger bestätigt?",
+        "☐ HARSI nicht in Extremzone?",
+        "☐ BTC + Total2 gleiche Richtung?",
+        f"☐ Premium Setup? (Impuls dunkel{chk_dir})",
+        "",
+        f"💰 {balance:.0f} USDT  |  Pro Order: {per_order:.0f} USDT",
+        f"📊 Kelly: {kelly['kelly_pct']}%  |  Half-Kelly: {kelly['half_kelly_pct']}%",
+        "",
+        "⏱ <b>30-Min-Fenster läuft!</b>",
+        f"/trade {symbol} {direction.upper()} [HEBEL] {entry:.5f} [SL]",
+        "",
+        "📈 Charts:",
+        f"H2 {symbol}: {links['coin_h2']}",
+        f"H4 {symbol}: {links['coin_h4']}",
+        f"BTC H2: {links['btc_h2']}",
+        f"Total2: {links['total2']}",
+    ])
+    telegram(msg)
+
+
 def poll_telegram_commands():
     """
     Prüft auf neue Telegram-Nachrichten und führt Befehle aus.
-    Wird jeden Loop-Durchlauf aufgerufen.
+    Behandelt:
+      - Textnachrichten mit /-Befehlen
+      - callback_query (Inline-Button-Klicks aus H2-Zusammenfassung)
     Nur Nachrichten von TELEGRAM_CHAT_ID werden akzeptiert (Sicherheit).
     """
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -1797,6 +1858,33 @@ def poll_telegram_commands():
 
     updates = get_telegram_updates()
     for update in updates:
+
+        # ── Inline-Button-Klick (callback_query) ─────────────────────────────
+        cb = update.get("callback_query")
+        if cb:
+            cb_chat = str(cb.get("message", {}).get("chat", {}).get("id", ""))
+            if cb_chat != str(TELEGRAM_CHAT_ID):
+                continue
+            cb_id   = cb.get("id", "")
+            cb_data = cb.get("data", "")
+            _answer_callback(cb_id)
+            log(f"Telegram Button gedrückt: {cb_data}")
+
+            if cb_data.startswith("h2trade:"):
+                # Format: h2trade:SYMBOL:direction:entry
+                parts = cb_data.split(":", 3)
+                if len(parts) == 4:
+                    _, sym, drct, entry_str = parts
+                    _send_h2_trade_detail(sym, drct, float(entry_str or 0))
+            elif cb_data == "cmd:berechnen":
+                cmd_berechnen()
+            elif cb_data == "cmd:status":
+                cmd_status()
+            elif cb_data == "cmd:hilfe":
+                cmd_hilfe()
+            continue
+
+        # ── Textnachricht mit Befehl ──────────────────────────────────────────
         msg = update.get("message") or update.get("edited_message")
         if not msg:
             continue
@@ -1881,6 +1969,81 @@ def flush_h4_buffer():
     log(f"H4-Zusammenfassung gesendet: {len(longs)} Long, {len(shorts)} Short")
 
 
+def flush_h2_buffer():
+    """
+    Sendet gesammelte H2-Signale als eine gebündelte Telegram-Nachricht
+    mit InlineKeyboard-Buttons (ein Button pro Signal → tippt /trade vor).
+
+    Wird automatisch 30 Sekunden nach dem ersten H2-Signal ausgelöst.
+    Duplizierte Signale (z.B. H2 + 120min vom selben Symbol) werden dedupliziert.
+    """
+    global h2_buffer, h2_flush_timer
+    with h2_buffer_lock:
+        if not h2_buffer:
+            return
+        items         = list(h2_buffer)
+        h2_buffer     = []
+        h2_flush_timer = None
+
+    longs   = [i for i in items if i["direction"] == "long"]
+    shorts  = [i for i in items if i["direction"] == "short"]
+    now_str = datetime.now().strftime("%H:%M")
+
+    balance   = get_futures_balance()
+    kelly     = kelly_recommendation(balance, WINRATE)
+    per_order = balance * 0.10 / 3
+    btc_lnk   = tv_chart_links("BTCUSDT")
+
+    lines = [
+        f"📡 <b>H2 Signale — {now_str} Uhr</b>",
+        "━" * 12,
+    ]
+    if longs:
+        lines.append("🟢↗️ <b>LONG:</b>")
+        for item in longs:
+            lnk = tv_chart_links(item["symbol"])
+            lines.append(f"  • <b>{item['symbol']}</b>  @ {item['entry']:.5f}")
+            lines.append(f"    H2: {lnk['coin_h2']}  |  H4: {lnk['coin_h4']}")
+    if longs and shorts:
+        lines.append("")
+    if shorts:
+        lines.append("🔴↘️ <b>SHORT:</b>")
+        for item in shorts:
+            lnk = tv_chart_links(item["symbol"])
+            lines.append(f"  • <b>{item['symbol']}</b>  @ {item['entry']:.5f}")
+            lines.append(f"    H2: {lnk['coin_h2']}  |  H4: {lnk['coin_h4']}")
+    lines += [
+        "",
+        f"💰 {balance:.0f} USDT  |  Pro Order: {per_order:.0f} USDT",
+        f"📊 Kelly: {kelly['kelly_pct']}%  |  Half-Kelly: {kelly['half_kelly_pct']}%",
+        "",
+        "📋 <b>DOMINUS Checkliste:</b>",
+        "☐ DOMINUS Impuls Extremzone erreicht?",
+        "☐ H4 Trigger bestätigt?",
+        "☐ HARSI nicht in Extremzone?",
+        "☐ BTC + Total2 gleiche Richtung?",
+        "",
+        f"📈 Markt:  BTC H2: {btc_lnk['btc_h2']}  |  Total2: {btc_lnk['total2']}",
+    ]
+
+    # ── InlineKeyboard: ein Button pro Signal ────────────────────────────────
+    # Button-Klick → script empfängt callback_query → führt Trade-Info aus
+    keyboard = []
+    for item in items:
+        icon_str  = "🟢" if item["direction"] == "long" else "🔴"
+        btn_label = f"{icon_str} Trade {item['symbol']} {item['direction'].upper()}"
+        cb_data   = f"h2trade:{item['symbol']}:{item['direction']}:{item['entry']}"
+        keyboard.append([{"text": btn_label, "callback_data": cb_data}])
+    keyboard.append([
+        {"text": "📊 /berechnen", "callback_data": "cmd:berechnen"},
+        {"text": "📋 /status",    "callback_data": "cmd:status"},
+    ])
+
+    telegram_with_buttons("\n".join(lines), keyboard)
+    log(f"H2-Zusammenfassung gesendet: {len(longs)} Long, {len(shorts)} Short, "
+        f"{len(keyboard)-1} Trade-Buttons")
+
+
 def start_webhook_server():
     """
     Startet einen Flask HTTP-Server in einem separaten Thread.
@@ -1943,16 +2106,19 @@ def start_webhook_server():
                 f"dir={data.get('direction','')})")
             return jsonify({"status": "ignored", "reason": "no signal"}), 200
 
-        log(f"📡 TradingView Alert: {symbol} {direction.upper()} "
-            f"@ {entry} [{timeframe}]")
+        # Timeframe normalisieren: "120" / "240" → "H2" / "H4"
+        _tf_map = {"120": "H2", "120MIN": "H2", "240": "H4", "240MIN": "H4",
+                   "H1": "H1", "60": "H1"}
+        timeframe = _tf_map.get(timeframe, timeframe)
+
+        log(f"📡 TradingView Alert: {symbol} {direction.upper()} @ {entry} [{timeframe}]")
 
         if entry == 0:
             entry = get_mark_price(symbol)
 
         signal_type = data.get("signal", "").upper()
-        log(f"\U0001f4e1 Alert: {symbol} {direction.upper()} @ {entry} [{timeframe}]")
 
-        # H4 Trigger → gepuffert, nach 5 Min gebündelt senden
+        # ── H4 Trigger → gepuffert, nach 5 Min gebündelt senden ──────────────
         if timeframe == "H4" or signal_type == "H4_TRIGGER":
             with h4_buffer_lock:
                 exists = any(
@@ -1962,38 +2128,67 @@ def start_webhook_server():
                 if not exists:
                     h4_buffer.append({
                         "symbol": symbol, "direction": direction,
-                        "entry": entry, "ts": __import__("time").time(),
+                        "entry": entry, "ts": time.time(),
                     })
                     log(f"  H4 gepuffert ({len(h4_buffer)} im Puffer)")
-            return jsonify({"status": "buffered", "symbol": symbol}), 200
+            return jsonify({"status": "buffered_h4", "symbol": symbol}), 200
 
-        # H2 Signal → H4 Puffer flushen dann sofort senden
+        # ── H2 Signal → H4-Puffer flushen, dann H2-Puffer befüllen ──────────
+        # Mehrere H2-Signale (verschiedene Coins) kommen meist innerhalb
+        # weniger Sekunden → 30s sammeln und als EINE Nachricht + Buttons senden.
+        if timeframe in ("H2", "H1") or signal_type == "H2_TRIGGER":
+            flush_h4_buffer()  # H4 vorab senden wenn vorhanden
+            global h2_flush_timer
+            with h2_buffer_lock:
+                exists = any(
+                    i["symbol"] == symbol and i["direction"] == direction
+                    for i in h2_buffer
+                )
+                if not exists:
+                    h2_buffer.append({
+                        "symbol":    symbol,
+                        "direction": direction,
+                        "entry":     entry,
+                        "ts":        time.time(),
+                    })
+                    log(f"  H2 gepuffert ({len(h2_buffer)} im Puffer)")
+                # Timer starten wenn noch keiner läuft
+                if h2_flush_timer is None or not h2_flush_timer.is_alive():
+                    t = threading.Timer(H2_BUFFER_SEC, flush_h2_buffer)
+                    t.daemon = True
+                    t.start()
+                    h2_flush_timer = t
+                    log(f"  H2-Flush-Timer gestartet ({H2_BUFFER_SEC}s)")
+            return jsonify({"status": "buffered_h2", "symbol": symbol}), 200
+
+        # ── Sonstiger Timeframe → sofort senden ──────────────────────────────
         flush_h4_buffer()
+        flush_h2_buffer()
+        links     = tv_chart_links(symbol)
         balance   = get_futures_balance()
         kelly     = kelly_recommendation(balance, WINRATE)
-        links     = tv_chart_links(symbol)
         per_order = balance * 0.10 / 3
-        chk_dir   = "gr\u00fcner" if direction == "long" else "roter"
+        chk_dir   = "grüner" if direction == "long" else "roter"
         icon      = dir_icon(direction)
         msg_parts = [
-            f"{icon} <b>H2 Signal \u2014 {symbol} {direction.upper()}</b>",
-            "\u2501" * 12,
+            f"{icon} <b>{timeframe} Signal — {symbol} {direction.upper()}</b>",
+            "━" * 12,
             f"Kurs: {entry}",
             "",
-            "\U0001f4cb <b>DOMINUS Checkliste:</b>",
-            "\u2610 DOMINUS Impuls Extremzone erreicht?",
-            "\u2610 H4 Trigger best\u00e4tigt?",
-            "\u2610 HARSI nicht in Extremzone?",
-            "\u2610 BTC + Total2 gleiche Richtung?",
-            f"\u2610 Premium Setup? (Impuls dunkel{chk_dir})",
+            "📋 <b>DOMINUS Checkliste:</b>",
+            "☐ DOMINUS Impuls Extremzone erreicht?",
+            "☐ H4 Trigger bestätigt?",
+            "☐ HARSI nicht in Extremzone?",
+            "☐ BTC + Total2 gleiche Richtung?",
+            f"☐ Premium Setup? (Impuls dunkel{chk_dir})",
             "",
-            f"\U0001f4b0 {balance:.0f} USDT  |  Pro Order: {per_order:.0f} USDT",
-            f"\U0001f4ca Kelly: {kelly['kelly_pct']}%",
+            f"💰 {balance:.0f} USDT  |  Pro Order: {per_order:.0f} USDT",
+            f"📊 Kelly: {kelly['kelly_pct']}%",
             "",
-            "\u23f1 <b>30-Min-Fenster l\u00e4uft!</b>",
+            "⏱ <b>30-Min-Fenster läuft!</b>",
             f"/trade {symbol} {direction.upper()} [HEBEL] {entry:.5f} [SL]",
             "",
-            "\U0001f4c8 Charts:",
+            "📈 Charts:",
             f"H2 {symbol}: {links['coin_h2']}",
             f"H4 {symbol}: {links['coin_h4']}",
             f"BTC H2: {links['btc_h2']}",
@@ -2464,18 +2659,12 @@ def check_and_repair_position(pos: dict):
     }
 
     # ── 2. TPs prüfen ─────────────────────────────────────────────────────
-    # Avg-Änderung erkennen: DCA-Fill verändert den durchschnittlichen Entry.
-    # Wenn der Avg signifikant geändert hat, muss tp_set_ts gelöscht werden
-    # damit die TPs mit dem neuen Avg neuberechnet werden.
-    _prev_avg = last_known_avg.get(symbol, 0)
-    if _prev_avg > 0 and abs(avg - _prev_avg) / _prev_avg > 0.001:  # >0.1%
-        log(f"  Avg verändert ({_prev_avg:.6g} → {avg:.6g}) — DCA erkannt → TP-Neuberechnung")
-        tp_set_ts.pop(symbol, None)   # Grace-Period löschen → TPs werden geprüft
-
-    # SCHUTZFENSTER: TPs kürzlich korrekt gesetzt → API-Abfrage sparen.
-    # Wird automatisch gelöscht wenn avg sich ändert (DCA-Fill erkannt, s.o.).
+    # Nur die TPs prüfen, die laut Preisvergleich noch offen sein sollten.
+    # SCHUTZFENSTER: Da die plan-order API konsistent fehlschlägt, können
+    # wir vorhandene TPs nicht aus Bitget lesen. Wenn wir TPs kürzlich gesetzt
+    # haben (tp_set_ts), überspringen wir den TP-Re-Check komplett.
     if tp_set_ts.get(symbol, 0) > time.time() - SL_TP_GRACE:
-        log(f"  TPs: kürzlich gesetzt — skip TP-Prüfung")
+        log(f"  TPs: kürzlich gesetzt — skip TP-Prüfung (plan-order API unzuverlässig)")
         sl_at_entry[symbol] = sl_is_entry
         trade_data[symbol].update({"sl": sl_price if sl_price > 0 else trade_data.get(symbol, {}).get("sl", 0)})
         existing_tps = []
@@ -2627,9 +2816,9 @@ def report_position_startup(pos: dict):
 
     issues   = []   # Gesammelte Probleme → Telegram-Alert
 
-    # ── 1. Daten von Bitget lesen ─────────────────────────────────────────
-    # Startup-Check ist bewusst leichtgewichtig: prüft nur kritische Probleme.
-    # Vollständige TP/SL-Prüfung erfolgt im ersten regulären Polling-Zyklus.
+    # ── 1. Zuverlässig lesbare Daten von Bitget holen ─────────────────────
+    # SL/TP-Plan-Orders sind via API nicht lesbar (alle Endpoints schlagen fehl).
+    # Verlässliche Quellen: Fill-Historie, offene DCA-Orders, Positionsdaten.
     close_fills   = get_symbol_close_fills(symbol, since_hours=48)
     filled_tps    = detect_filled_tps(close_fills, avg, leverage, direction)
     fill_tp1      = any(t["roi"] == TP1_ROI for t in filled_tps)
@@ -2723,16 +2912,7 @@ def save_state():
         log(f"  [WARN] State konnte nicht gespeichert werden: {e}")
 
 def load_state():
-    """
-    Lädt persistierten State. Ältere Timestamps (>12h) werden verworfen.
-
-    tp_set_ts wird NICHT geladen — nach jedem Neustart werden TPs einmalig
-    geprüft und ggf. korrigiert. Das verhindert, dass falsche TPs (z.B. nach
-    einem DCA-Fill in der vorigen Session) unbemerkt bestehen bleiben.
-
-    sl_set_ts wird geladen — verhindert unerwünschtes SL-Überschreiben wenn
-    Bitget SL=0 zurückliefert (kurz nach dem Setzen).
-    """
+    """Lädt persistierten State. Ältere Timestamps (>12h) werden verworfen."""
     if not os.path.exists(STATE_FILE):
         return
     try:
@@ -2743,14 +2923,14 @@ def load_state():
             log(f"  State-Datei veraltet ({age/3600:.1f}h) — wird ignoriert")
             return
         sl_set_ts.update(s.get("sl_set_ts", {}))
-        # tp_set_ts wird NICHT geladen → erzwingt TP-Prüfung nach jedem Neustart
+        tp_set_ts.update(s.get("tp_set_ts", {}))
         sl_at_entry.update(s.get("sl_at_entry", {}))
         new_trade_done.update(s.get("new_trade_done", {}))
         last_known_avg.update(s.get("last_known_avg", {}))
         last_known_size.update(s.get("last_known_size", {}))
         trade_data.update(s.get("trade_data", {}))
         log(f"  ✓ State geladen: {len(trade_data)} Trade(s) | "
-            f"SL-ts: {len(sl_set_ts)} | TP-Prüfung erzwungen nach Neustart | "
+            f"SL-ts: {len(sl_set_ts)} | TP-ts: {len(tp_set_ts)} | "
             f"Alter: {age/60:.0f} Min")
     except Exception as e:
         log(f"  [WARN] State konnte nicht geladen werden: {e}")
