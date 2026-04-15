@@ -529,15 +529,16 @@ def place_tp_orders(symbol: str, avg: float, size: float,
         tp_str = round_price(tp_raw, decimals)
         tp_val = float(tp_str)
 
-        # Qty-Berechnung: ganzzahlige Kontrakte (>= 1.0) vs. Dezimal-Kontrakte (< 1.0)
-        # max(1, floor()) war falsch für BTC: floor(0.0013 × 0.15)=0 → "1 BTC schliessen"
+        # Qty-Berechnung: 2 Dezimalstellen für Futures-Kontrakte >= 1.0
+        # (z.B. COMP 1.76 × 0.15 = 0.264 → floor=0 [falsch!], round=0.26 [korrekt])
+        # Für Kleinkontrakts-Symbole (BTC 0.001 etc.) mehr Präzision
         if size >= 1.0:
-            qty = math.floor(size * pct)
+            qty = round(size * pct, 2)  # 2 Dezimalstellen — deckt Bitget-Mindestschritt ab
         else:
             qty = round(size * pct, 4)
 
         if qty <= 0:
-            log(f"    ⏭ {label}: Position zu klein für Teilschliessung (size={size}, pct={pct}) — übersprungen")
+            log(f"    ⏭ {label}: qty=0 (size={size}, pct={pct}) — übersprungen")
             partial_tps_skipped += 1
             continue
 
@@ -2463,12 +2464,18 @@ def check_and_repair_position(pos: dict):
     }
 
     # ── 2. TPs prüfen ─────────────────────────────────────────────────────
-    # Nur die TPs prüfen, die laut Preisvergleich noch offen sein sollten.
-    # SCHUTZFENSTER: Da die plan-order API konsistent fehlschlägt, können
-    # wir vorhandene TPs nicht aus Bitget lesen. Wenn wir TPs kürzlich gesetzt
-    # haben (tp_set_ts), überspringen wir den TP-Re-Check komplett.
+    # Avg-Änderung erkennen: DCA-Fill verändert den durchschnittlichen Entry.
+    # Wenn der Avg signifikant geändert hat, muss tp_set_ts gelöscht werden
+    # damit die TPs mit dem neuen Avg neuberechnet werden.
+    _prev_avg = last_known_avg.get(symbol, 0)
+    if _prev_avg > 0 and abs(avg - _prev_avg) / _prev_avg > 0.001:  # >0.1%
+        log(f"  Avg verändert ({_prev_avg:.6g} → {avg:.6g}) — DCA erkannt → TP-Neuberechnung")
+        tp_set_ts.pop(symbol, None)   # Grace-Period löschen → TPs werden geprüft
+
+    # SCHUTZFENSTER: TPs kürzlich korrekt gesetzt → API-Abfrage sparen.
+    # Wird automatisch gelöscht wenn avg sich ändert (DCA-Fill erkannt, s.o.).
     if tp_set_ts.get(symbol, 0) > time.time() - SL_TP_GRACE:
-        log(f"  TPs: kürzlich gesetzt — skip TP-Prüfung (plan-order API unzuverlässig)")
+        log(f"  TPs: kürzlich gesetzt — skip TP-Prüfung")
         sl_at_entry[symbol] = sl_is_entry
         trade_data[symbol].update({"sl": sl_price if sl_price > 0 else trade_data.get(symbol, {}).get("sl", 0)})
         existing_tps = []
@@ -2620,9 +2627,9 @@ def report_position_startup(pos: dict):
 
     issues   = []   # Gesammelte Probleme → Telegram-Alert
 
-    # ── 1. Zuverlässig lesbare Daten von Bitget holen ─────────────────────
-    # SL/TP-Plan-Orders sind via API nicht lesbar (alle Endpoints schlagen fehl).
-    # Verlässliche Quellen: Fill-Historie, offene DCA-Orders, Positionsdaten.
+    # ── 1. Daten von Bitget lesen ─────────────────────────────────────────
+    # Startup-Check ist bewusst leichtgewichtig: prüft nur kritische Probleme.
+    # Vollständige TP/SL-Prüfung erfolgt im ersten regulären Polling-Zyklus.
     close_fills   = get_symbol_close_fills(symbol, since_hours=48)
     filled_tps    = detect_filled_tps(close_fills, avg, leverage, direction)
     fill_tp1      = any(t["roi"] == TP1_ROI for t in filled_tps)
@@ -2716,7 +2723,16 @@ def save_state():
         log(f"  [WARN] State konnte nicht gespeichert werden: {e}")
 
 def load_state():
-    """Lädt persistierten State. Ältere Timestamps (>12h) werden verworfen."""
+    """
+    Lädt persistierten State. Ältere Timestamps (>12h) werden verworfen.
+
+    tp_set_ts wird NICHT geladen — nach jedem Neustart werden TPs einmalig
+    geprüft und ggf. korrigiert. Das verhindert, dass falsche TPs (z.B. nach
+    einem DCA-Fill in der vorigen Session) unbemerkt bestehen bleiben.
+
+    sl_set_ts wird geladen — verhindert unerwünschtes SL-Überschreiben wenn
+    Bitget SL=0 zurückliefert (kurz nach dem Setzen).
+    """
     if not os.path.exists(STATE_FILE):
         return
     try:
@@ -2727,14 +2743,14 @@ def load_state():
             log(f"  State-Datei veraltet ({age/3600:.1f}h) — wird ignoriert")
             return
         sl_set_ts.update(s.get("sl_set_ts", {}))
-        tp_set_ts.update(s.get("tp_set_ts", {}))
+        # tp_set_ts wird NICHT geladen → erzwingt TP-Prüfung nach jedem Neustart
         sl_at_entry.update(s.get("sl_at_entry", {}))
         new_trade_done.update(s.get("new_trade_done", {}))
         last_known_avg.update(s.get("last_known_avg", {}))
         last_known_size.update(s.get("last_known_size", {}))
         trade_data.update(s.get("trade_data", {}))
         log(f"  ✓ State geladen: {len(trade_data)} Trade(s) | "
-            f"SL-ts: {len(sl_set_ts)} | TP-ts: {len(tp_set_ts)} | "
+            f"SL-ts: {len(sl_set_ts)} | TP-Prüfung erzwungen nach Neustart | "
             f"Alter: {age/60:.0f} Min")
     except Exception as e:
         log(f"  [WARN] State konnte nicht geladen werden: {e}")
