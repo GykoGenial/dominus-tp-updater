@@ -105,9 +105,11 @@ new_trade_done:   dict = {}   # {symbol: bool} — DCA bereits gesetzt?
 price_decimals_cache: dict = {}
 last_update_id:   int  = 0    # Telegram: letzter verarbeiteter Update-ID
 
+# Vorberechneter SL aus /trade-Befehl — wird in setup_new_trade verwendet
+# {symbol: {sl, direction, entry, leverage, ts}}
+pending_trade: dict = {}
+
 # Timestamps — verhindern wiederholtes Neu-Setzen wenn Bitget SL/TPs nicht zurückliefert
-# Bitget gibt stopLossPrice=0 und plan-orders API schlägt fehl → Bot würde sonst
-# SL und TPs bei jedem 20s-Zyklus neu setzen obwohl sie korrekt gesetzt sind.
 sl_set_ts:  dict = {}  # {symbol: unix_ts}  — wann SL zuletzt erfolgreich gesetzt
 tp_set_ts:  dict = {}  # {symbol: unix_ts}  — wann TPs zuletzt erfolgreich gesetzt
 SL_TP_GRACE = int(os.environ.get("SL_TP_GRACE", "1800"))  # 30 Min Schutzfenster
@@ -116,19 +118,10 @@ SL_TP_GRACE = int(os.environ.get("SL_TP_GRACE", "1800"))  # 30 Min Schutzfenster
 # {symbol: {entry, direction, leverage, sl, peak_size, open_ts}}
 trade_data: dict = {}
 
-# Vorberechneter SL aus /trade-Befehl — wird in setup_new_trade verwendet
-# {symbol: {sl, direction, entry, leverage, ts}}
-pending_trade: dict = {}
-
 # H4 Trigger-Puffer: sammelt Alerts, sendet gebündelt nach Zeitfenster
 h4_buffer:     list = []
 h4_buffer_lock = __import__("threading").Lock()
 H4_BUFFER_SEC  = int(os.environ.get("H4_BUFFER_SEC", "300"))  # 5 Min
-
-# H2 Signal-Puffer: bündelt gleichzeitige H2-Signale zur einer Nachricht
-h2_buffer:     list = []
-h2_buffer_lock = __import__("threading").Lock()
-H2_BUFFER_SEC  = int(os.environ.get("H2_BUFFER_SEC", "90"))   # 90 Sekunden
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -156,72 +149,6 @@ def telegram(msg: str):
         )
     except Exception:
         pass
-
-
-def telegram_kb(msg: str, buttons: list):
-    """
-    Sendet Telegram-Nachricht mit Inline-Keyboard-Buttons.
-
-    buttons: Liste von Zeilen, jede Zeile ist eine Liste von Button-Dicts.
-    Button-Typen:
-      Callback: {"text": "Label", "callback_data": "/refresh BTCUSDT"}
-      URL:      {"text": "Label", "url": "https://..."}
-
-    Beispiel:
-      [[{"text": "🔄 Refresh", "callback_data": "/refresh BTCUSDT"}],
-       [{"text": "📊 H2", "url": "https://..."}, {"text": "📊 H4", "url": "..."}]]
-    """
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={
-                "chat_id":      TELEGRAM_CHAT_ID,
-                "text":         msg,
-                "parse_mode":   "HTML",
-                "reply_markup": {"inline_keyboard": buttons},
-            },
-            timeout=5
-        )
-    except Exception:
-        pass
-
-
-def answer_callback(callback_query_id: str, text: str = ""):
-    """Bestätigt Button-Klick (entfernt Spinner-Animation im Telegram)."""
-    if not TELEGRAM_TOKEN:
-        return
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery",
-            json={"callback_query_id": callback_query_id, "text": text},
-            timeout=5
-        )
-    except Exception:
-        pass
-
-
-def chart_kb(symbol: str, include_btc: bool = True) -> list:
-    """
-    Erstellt Inline-Button-Zeilen für TradingView Chart-Links.
-    Gibt eine Liste von Button-Zeilen zurück (direkt für telegram_kb nutzbar).
-
-    include_btc=True  → zweite Zeile mit BTC H2 + Total2
-    include_btc=False → nur Coin-Zeile (H2 + H4)
-    """
-    lnk = tv_chart_links(symbol)
-    clean = symbol.replace("USDT", "")
-    rows = [[
-        {"text": f"📊 {clean} H2", "url": lnk["coin_h2"]},
-        {"text": f"📊 {clean} H4", "url": lnk["coin_h4"]},
-    ]]
-    if include_btc:
-        rows.append([
-            {"text": "📊 BTC H2",  "url": lnk["btc_h2"]},
-            {"text": "📊 Total2",  "url": lnk["total2"]},
-        ])
-    return rows
 
 
 def sign(timestamp: str, method: str, path: str, body: str = "") -> str:
@@ -547,7 +474,8 @@ def calc_tp_price(avg: float, roi: float,
 
 def place_tp_orders(symbol: str, avg: float, size: float,
                     direction: str, leverage: int,
-                    mark_price: float, known_sl: float = 0) -> tuple:
+                    mark_price: float, known_sl: float = 0, decimals: int = None,
+                    skip_rois: set = None) -> tuple:
     """
     Setzt TP1–TP4 nach DOMINUS-Schema:
       TP1 (10% ROI): schliesst 15% der Position  → place-tpsl-order
@@ -570,7 +498,12 @@ def place_tp_orders(symbol: str, avg: float, size: float,
 
     partial_tps_skipped = 0  # zählt übersprungene Teilschliessungen (Position zu klein)
 
+    _skip_rois = set(skip_rois) if skip_rois else set()
+
     for roi, label, pct in partial_tps:
+        if roi in _skip_rois:
+            log(f"    ⏭ {label}: bereits ausgelöst — übersprungen")
+            continue
         tp_raw = calc_tp_price(avg, roi, direction, leverage)
         tp_str = round_price(tp_raw, decimals)
         tp_val = float(tp_str)
@@ -647,6 +580,10 @@ def place_tp_orders(symbol: str, avg: float, size: float,
     # WICHTIG: place-pos-tpsl verwaltet NUR EINEN kombinierten
     # Eintrag pro Position. TP4 und SL MÜSSEN zusammen gesetzt werden,
     # sonst überschreibt TP4 den bestehenden SL (oder umgekehrt).
+    if TP4_ROI in _skip_rois:
+        log(f"    ⏭ TP4: bereits ausgelöst — übersprungen")
+        return count, prices
+
     tp4_raw = calc_tp_price(avg, TP4_ROI, direction, leverage)
     tp4_str = round_price(tp4_raw, decimals)
     tp4_val = float(tp4_str)
@@ -676,8 +613,8 @@ def place_tp_orders(symbol: str, avg: float, size: float,
             "productType":            PRODUCT_TYPE,
             "marginCoin":             MARGIN_COIN,
             "holdSide":               direction,
-            "stopSurplusTriggerPrice": tp4_str,
-            "stopSurplusTriggerType":  "mark_price",
+            "takeProfitTriggerPrice": tp4_str,
+            "takeProfitTriggerType":  "mark_price",
         }
         # SL mitschicken wenn vorhanden — verhindert Überschreiben
         if current_sl > 0:
@@ -699,12 +636,12 @@ def place_tp_orders(symbol: str, avg: float, size: float,
                 price_decimals_cache[symbol] = new_dec
                 tp4_str2  = round_price(tp4_raw, new_dec)
                 body4b    = {
-                    "symbol":                  symbol,
-                    "productType":             PRODUCT_TYPE,
-                    "marginCoin":              MARGIN_COIN,
-                    "holdSide":                direction,
-                    "stopSurplusTriggerPrice": tp4_str2,
-                    "stopSurplusTriggerType":  "mark_price",
+                    "symbol":                 symbol,
+                    "productType":            PRODUCT_TYPE,
+                    "marginCoin":             MARGIN_COIN,
+                    "holdSide":               direction,
+                    "takeProfitTriggerPrice": tp4_str2,
+                    "takeProfitTriggerType":  "mark_price",
                 }
                 if current_sl > 0:
                     body4b["stopLossTriggerPrice"] = sl_for_tp4
@@ -970,8 +907,8 @@ def _get_pos_tp_price(symbol: str, direction: str) -> float:
     if result.get("code") == "00000":
         for pos in (result.get("data") or []):
             if pos.get("holdSide") == direction:
-                for field in ("stopSurplusTriggerPrice", "takeProfitPrice",
-                              "takeProfit", "tpPrice", "takeProfitTriggerPrice"):
+                for field in ("takeProfitPrice", "takeProfit", "tpPrice",
+                              "takeProfitTriggerPrice"):
                     tp = float(pos.get(field, 0) or 0)
                     if tp > 0:
                         return tp
@@ -996,8 +933,8 @@ def set_sl_at_entry(symbol: str, direction: str, entry_price: float):
     }
     if existing_tp4 > 0:
         decimals_sl = get_price_decimals(symbol)
-        body_sl["stopSurplusTriggerPrice"] = round_price(existing_tp4, decimals_sl)
-        body_sl["stopSurplusTriggerType"]  = "mark_price"
+        body_sl["takeProfitTriggerPrice"] = round_price(existing_tp4, decimals_sl)
+        body_sl["takeProfitTriggerType"]  = "mark_price"
         log(f"  TP4 @ {existing_tp4} wird mitgeführt")
 
     result = api_post("/api/v2/mix/order/place-pos-tpsl", body_sl)
@@ -1006,9 +943,9 @@ def set_sl_at_entry(symbol: str, direction: str, entry_price: float):
         log(f"  ✓ SL auf Entry gesetzt: {sl_str} USDT ({symbol})")
         sl_at_entry[symbol] = True
         sl_set_ts[symbol]   = time.time()
+        save_state()
         # DCA Limit-Orders stornieren — nicht mehr nötig nach TP1
         cancel_open_dca_orders(symbol, direction)
-        save_state()
         telegram(
             f"🔒 <b>SL auf Entry — {symbol}</b>\n"
             f"TP1 ausgelöst → SL auf {sl_str} USDT\n"
@@ -1178,8 +1115,8 @@ def setup_new_trade(pos: dict):
             else:
                 log(f"  ✗ SL aus /trade fehlgeschlagen: {res.get('msg', res)} — fallback Auto-SL")
 
-        # ── 2. Fallback: Auto-SL bei -25% Margin-Verlust ──────────────
         if sl_price == 0:
+            # ── 2. Fallback: Auto-SL bei -25% Margin-Verlust ──────────────
             # Long:  SL = entry * (1 - 0.25 / leverage)
             # Short: SL = entry * (1 + 0.25 / leverage)
             factor   = 0.25 / leverage
@@ -1200,26 +1137,29 @@ def setup_new_trade(pos: dict):
                 "stopLossTriggerPrice": sl_str,
                 "stopLossTriggerType":  "mark_price",
             })
+
+            links = tv_chart_links(symbol)
             if res.get("code") == "00000":
                 log(f"  ✓ Auto-SL gesetzt @ {sl_str} (-25% Schutz)")
-                telegram_kb(
+                telegram(
                     f"\U0001f6e1 <b>Auto-SL gesetzt \u2014 {symbol}</b>\n"
                     f"Kein SL gefunden \u2192 -25% Schutz aktiviert\n\n"
                     f"SL: {sl_str} USDT ({sl_dist:.1f}% Abstand)\n"
                     f"Hebel: {leverage}x | Entry: {entry}\n\n"
                     f"\u26a0\ufe0f Bitte pr\u00fcfen ob SL mit deiner\n"
-                    f"Ausstiegslinie \u00fcbereinstimmt!",
-                    chart_kb(symbol, include_btc=False)
+                    f"Ausstiegslinie \u00fcbereinstimmt!\n\n"
+                    f"H4 {symbol}: {links['coin_h4']}\n"
+                    f"H2 {symbol}: {links['coin_h2']}"
                 )
-                sl_price          = sl_auto
                 sl_set_ts[symbol] = time.time()
+                sl_price = sl_auto
             else:
                 log(f"  ✗ Auto-SL fehlgeschlagen: {res.get('msg', res)}")
-                telegram_kb(
+                telegram(
                     f"\u274c <b>Kein SL \u2014 {symbol}</b>\n"
                     f"Auto-SL fehlgeschlagen. Bitte manuell setzen!\n"
-                    f"Empfehlung: {sl_str} USDT ({sl_dist:.1f}%)",
-                    chart_kb(symbol, include_btc=False)
+                    f"Empfehlung: {sl_str} USDT ({sl_dist:.1f}%)\n\n"
+                    f"H4: {links['coin_h4']}"
                 )
                 cancel_all_tp_orders(symbol)
                 time.sleep(1)
@@ -1290,16 +1230,11 @@ def setup_new_trade(pos: dict):
     }
 
     # ── 6. Telegram-Zusammenfassung ─────────────────────────
-    dca1_line = dca_results[0] if len(dca_results) > 0 else "DCA1: Fehler"
-    dca2_line = dca_results[1] if len(dca_results) > 1 else "DCA2: Fehler"
+    dca1_str = dca_results[0] if len(dca_results) > 0 else "Fehler"
+    dca2_str = dca_results[1] if len(dca_results) > 1 else "Fehler"
 
-    coin     = symbol.replace("USDT", "")
     rr_icon  = "⚠️" if rr_warn else "✅"
     lev_icon = "⚠️" if lev_diff > 2 else "✅"
-
-    def fmt_qty(q: float) -> str:
-        return str(int(q)) if q == int(q) else str(round(q, 4))
-
     msg = (
         f"🚀 {dir_icon(direction)} <b>Neuer Trade — {symbol}</b>\n"
         f"━━━━━━━━━━━━\n"
@@ -1311,17 +1246,22 @@ def setup_new_trade(pos: dict):
         f"📊 Kelly {WINRATE*100:.0f}%: {kelly['kelly_pct']}% | "
         f"Half-Kelly: {kelly['half_kelly_pct']}%\n\n"
         f"📦 <b>Orders gesetzt:</b>\n"
-        f"✅ Market:  <b>{fmt_qty(size)} {coin}</b> @ {entry} USDT\n"
-        f"✅ {dca1_line} {coin}  ← auto\n"
-        f"✅ {dca2_line} {coin}  ← auto\n\n"
-        f"🎯 <b>Take-Profits:</b>\n"
+        f"Market:  {entry} USDT × {size}\n"
+        f"{dca1_str} × {size}\n"
+        f"{dca2_str} × {size}\n\n"
+        f"🎯 <b>Take-Profits (15/20/25/40%):</b>\n"
         + "\n".join(tp_prices) + "\n\n"
         f"💰 Margin/Order ≈ {order_margin:.2f} USDT\n"
         f"📊 Total ≈ {order_margin*3:.2f} USDT "
-        f"({order_margin*3/balance*100:.1f}% Kapital)"
+        f"({order_margin*3/balance*100:.1f}% Kapital)\n\n"
+        f"📈 Charts:\n"
+        f"H2 {symbol}: {tv_chart_links(symbol)['coin_h2']}\n"
+        f"H4 {symbol}: {tv_chart_links(symbol)['coin_h4']}\n"
+        f"BTC H2: {tv_chart_links(symbol)['btc_h2']}\n"
+        f"Total2: {tv_chart_links(symbol)['total2']}"
         if balance > 0 else ""
     )
-    telegram_kb(msg, chart_kb(symbol))
+    telegram(msg)
 
     status = "✓ Alle 4" if count == 4 else f"⚠ {count}/4"
     log(f"  {status} TPs gesetzt | "
@@ -1427,6 +1367,7 @@ def update_tp_for_position(pos: dict, reason: str):
         log(f"  ⚠ Kein SL ermittelbar — TP4-Aufruf ohne SL-Parameter")
 
     log(f"  TPs löschen und neu setzen (Grund: {reason})")
+
     # Kein Mindestgrößen-Block mehr: place_tp_orders überspringt TP1-3 intern
     # wenn qty=0, setzt aber immer TP4 (Full-Close) via place-pos-tpsl.
 
@@ -1655,17 +1596,6 @@ def cmd_trade(parts: list):
     rr_icon = "✅" if rr >= MIN_RR else "⚠️"
     lev_icon = "✅" if abs(leverage - opt_leverage) <= 2 else "⚠️"
 
-    coin = symbol.replace("USDT", "")
-    dca1_qty = round(contracts * DCA1_MULTIPLIER, 4)
-    dca2_qty = round(contracts * DCA2_MULTIPLIER, 4)
-
-    def fmt_qty(q: float) -> str:
-        return str(int(q)) if q == int(q) else str(round(q, 4))
-
-    mkt_qty_str  = fmt_qty(contracts)
-    dca1_qty_str = fmt_qty(dca1_qty)
-    dca2_qty_str = fmt_qty(dca2_qty)
-
     lines = [
         f"🧮 <b>Trade-Berechnung — {symbol}</b>",
         f"━━━━━━━━━━━━",
@@ -1676,13 +1606,13 @@ def cmd_trade(parts: list):
         f"{rr_icon} R:R: {rr} (Min: {MIN_RR})",
         f"{lev_icon} Empf. Hebel: {opt_leverage}x",
         f"",
-        f"🎯 <b>Bitget Einstieg (Menge-{coin}):</b>",
-        f"  Market:  <b>{mkt_qty_str} {coin}</b>  @ {entry}",
-        f"  DCA1:    {dca1_qty_str} {coin}  @ {dca1:.4f}  ← Script",
-        f"  DCA2:    {dca2_qty_str} {coin}  @ {dca2:.4f}  ← Script",
+        f"📦 <b>Orders (je {contracts:.2f} Kontrakte):</b>",
+        f"  Market:  {entry}",
+        f"  DCA1:    {dca1:.4f}",
+        f"  DCA2:    {dca2:.4f}",
         f"  SL:      {sl}",
         f"",
-        f"🎯 <b>Take-Profits:</b>",
+        f"🎯 <b>Take-Profits (15/20/25/40%):</b>",
     ] + tps + [
         f"",
         f"💰 <b>Money Management:</b>",
@@ -1695,16 +1625,27 @@ def cmd_trade(parts: list):
     if warnings:
         lines += ["", "⚠️ <b>Warnungen:</b>"] + warnings
 
+    links       = tv_chart_links(symbol)
+    coin_h2_url = links["coin_h2"]
+    coin_h4_url = links["coin_h4"]
+    btc_url     = links["btc_h2"]
+    total2_url  = links["total2"]
     lines += [
         "",
         "✔︎ HARSI nicht in Extremzone?",
         "✔︎ DOMINUS Impuls im Premium-Bereich?",
         "✔︎ BTC + Total2 gleiche Richtung?",
         "",
-        f"✅ Wenn ja: <b>{mkt_qty_str} {coin}</b> als Market Order auf Bitget.",
+        "✅ Wenn ja: Market Order + SL auf Bitget setzen.",
         "Script setzt DCA + TPs automatisch.",
+        "",
+        "📈 Charts:",
+        f'H2 {symbol} (HARSI): {coin_h2_url}',
+        f'H4 {symbol} (Premium): {coin_h4_url}',
+        f'BTC H2 (Momentum): {btc_url}',
+        f'Total2 H2 (Altcoins): {total2_url}',
     ]
-    telegram_kb("\n".join(lines), chart_kb(symbol))
+    reply("\n".join(lines))
 
 
 def cmd_hilfe():
@@ -1735,7 +1676,7 @@ def cmd_hilfe():
 
 
 def cmd_status():
-    """Kurzer Positionsstatus mit Refresh-Buttons pro Position."""
+    """Kurzer Positionsstatus."""
     positions = get_all_positions()
     if not positions:
         reply("✅ Keine offenen Positionen.")
@@ -1754,20 +1695,7 @@ def cmd_status():
             f"{icon} {sym} {drct} {lev}x | "
             f"Qty={qty:.2f} | Mark={mark} | PnL={pnl:+.2f} USDT"
         )
-
-    # Refresh-Buttons: eine Zeile pro Position (max. 4 Buttons nebeneinander)
-    # Buttons in Zweier-Gruppen anordnen damit Schrift lesbar bleibt
-    syms = [p.get("symbol", "?") for p in positions]
-    btn_rows = []
-    for i in range(0, len(syms), 2):
-        row = []
-        for sym in syms[i:i+2]:
-            clean = sym.replace("USDT", "")
-            row.append({"text": f"🔄 {clean}", "callback_data": f"/refresh {sym}"})
-        btn_rows.append(row)
-    btn_rows.append([{"text": "🔄 Alle aktualisieren", "callback_data": "/refresh"}])
-
-    telegram_kb("\n".join(lines), btn_rows)
+    reply("\n".join(lines))
 
 
 def cmd_refresh(parts: list):
@@ -1847,31 +1775,6 @@ def poll_telegram_commands():
 
     updates = get_telegram_updates()
     for update in updates:
-
-        # ── Callback-Query (Button-Klick) ──────────────────────────────
-        cq = update.get("callback_query")
-        if cq:
-            cq_id   = cq.get("id", "")
-            cq_chat = str(cq.get("message", {}).get("chat", {}).get("id", ""))
-            cq_data = cq.get("data", "").strip()
-            if cq_chat == str(TELEGRAM_CHAT_ID) and cq_data.startswith("/"):
-                answer_callback(cq_id, "⏳ Wird ausgeführt…")
-                log(f"Telegram Button-Klick: {cq_data}")
-                cq_parts = cq_data.split()
-                cq_cmd   = cq_parts[0].lower()
-                if cq_cmd == "/refresh":
-                    cmd_refresh(cq_parts)
-                elif cq_cmd == "/status":
-                    cmd_status()
-                elif cq_cmd == "/berechnen":
-                    cmd_berechnen()
-                elif cq_cmd == "/trade":
-                    cmd_trade(cq_parts)
-            else:
-                answer_callback(cq_id)
-            continue
-
-        # ── Normale Text-Nachricht ─────────────────────────────────────
         msg = update.get("message") or update.get("edited_message")
         if not msg:
             continue
@@ -1931,114 +1834,29 @@ def flush_h4_buffer():
     if longs:
         lines.append("🟢↗️ <b>LONG:</b>")
         for item in longs:
+            lnk = tv_chart_links(item["symbol"])
             lines.append(f"  \u2022 {item['symbol']}  @ {item['entry']:.5f}")
+            lines.append(f"    {lnk['coin_h4']}")
     if longs and shorts:
         lines.append("")
     if shorts:
         lines.append("🔴↘️ <b>SHORT:</b>")
         for item in shorts:
+            lnk = tv_chart_links(item["symbol"])
             lines.append(f"  \u2022 {item['symbol']}  @ {item['entry']:.5f}")
+            lines.append(f"    {lnk['coin_h4']}")
 
-    lines += ["", "\u23f1 H2-Alarm f\u00fcr relevante Coins aktivieren"]
-
-    # Chart-Buttons: je ein H4-Button pro Coin + BTC/Total2-Zeile
-    btc_lnk  = tv_chart_links("BTCUSDT")
-    all_items = longs + shorts
-    btn_rows = []
-    for i in range(0, len(all_items), 2):
-        row = []
-        for item in all_items[i:i+2]:
-            lnk   = tv_chart_links(item["symbol"])
-            clean = item["symbol"].replace("USDT", "")
-            icon  = "🟢" if item["direction"] == "long" else "🔴"
-            row.append({"text": f"{icon} {clean} H4", "url": lnk["coin_h4"]})
-        btn_rows.append(row)
-    btn_rows.append([
-        {"text": "📊 BTC H2",  "url": btc_lnk["btc_h2"]},
-        {"text": "📊 Total2",  "url": btc_lnk["total2"]},
-    ])
-    telegram_kb("\n".join(lines), btn_rows)
-    log(f"H4-Zusammenfassung gesendet: {len(longs)} Long, {len(shorts)} Short")
-
-
-def flush_h2_buffer():
-    """
-    Bündelt alle gepufferten H2-Signale zu einer einzigen Telegram-Nachricht.
-    Signale werden nach Richtung gruppiert, Checkliste + Konto-Info nur einmal.
-    Chart-Buttons: je H2 + H4 pro Coin, BTC/Total2 am Schluss.
-    """
-    global h2_buffer
-    with h2_buffer_lock:
-        if not h2_buffer:
-            return
-        items     = list(h2_buffer)
-        h2_buffer = []
-
-    longs  = [i for i in items if i["direction"] == "long"]
-    shorts = [i for i in items if i["direction"] == "short"]
-    now_str = __import__("datetime").datetime.now().strftime("%H:%M")
-
-    # Kontoinfo (vom ersten Item, alle teilen denselben Kontostand)
-    balance   = items[0].get("balance", 0)
-    kelly_pct = items[0].get("kelly_pct", "–")
-    per_order = balance * 0.10 / 3 if balance > 0 else 0
-
-    def _coin_label(item: dict) -> str:
-        """Coin-Name mit Premium-Stern falls Premium-Setup."""
-        name = item["symbol"].replace("USDT", "")
-        return f"⭐{name}" if item.get("premium") else name
-
-    lines = [
-        f"📡 <b>H2 Signale \u2014 {now_str} Uhr</b>",
-        "\u2501" * 12,
-    ]
-
-    # Shorts kompakt — Premium-Coins mit ⭐
-    if shorts:
-        sym_list = "  |  ".join(
-            f"{_coin_label(i)} @ {i['entry']}" for i in shorts
-        )
-        lines.append(f"🔴↘️  {sym_list}")
-
-    # Longs kompakt — Premium-Coins mit ⭐
-    if longs:
-        sym_list = "  |  ".join(
-            f"{_coin_label(i)} @ {i['entry']}" for i in longs
-        )
-        lines.append(f"🟢↗️  {sym_list}")
-
+    btc_lnk = tv_chart_links("BTCUSDT")
     lines += [
         "",
-        f"💰 {balance:.0f} USDT  |  Pro Order: {per_order:.0f} USDT  |  Kelly: {kelly_pct}%",
+        "\u23f1 H2-Alarm f\u00fcr relevante Coins aktivieren",
         "",
-        "\U0001f4cb <b>Checkliste:</b>",
-        "\u2610 Impuls Extremzone?  \u2610 H4 bestätigt?",
-        "\u2610 HARSI OK?  \u2610 BTC+Total2 gleich?  \u2610 Premium?",
-        "",
-        "\u23f1 <b>30-Min-Fenster läuft!</b>",
+        "\U0001f4c8 Markt:",
+        f"BTC H2: {btc_lnk['btc_h2']}",
+        f"Total2: {btc_lnk['total2']}",
     ]
-
-    # Chart-Buttons: je H2 + H4 pro Coin (zwei Coins pro Zeile)
-    btc_lnk  = tv_chart_links("BTCUSDT")
-    all_items = shorts + longs   # Shorts zuerst (häufigste Richtung im Bärmarkt)
-    btn_rows  = []
-    for item in all_items:
-        lnk   = tv_chart_links(item["symbol"])
-        clean = item["symbol"].replace("USDT", "")
-        icon  = "🟢" if item["direction"] == "long" else "🔴"
-        star  = "⭐" if item.get("premium") else ""
-        btn_rows.append([
-            {"text": f"{icon} {star}{clean} H2", "url": lnk["coin_h2"]},
-            {"text": f"{icon} {star}{clean} H4", "url": lnk["coin_h4"]},
-        ])
-    btn_rows.append([
-        {"text": "📊 BTC H2", "url": btc_lnk["btc_h2"]},
-        {"text": "📊 Total2", "url": btc_lnk["total2"]},
-    ])
-
-    telegram_kb("\n".join(lines), btn_rows)
-    log(f"H2-Zusammenfassung gesendet: "
-        f"{len(shorts)} Short, {len(longs)} Long ({len(items)} total)")
+    telegram("\n".join(lines))
+    log(f"H4-Zusammenfassung gesendet: {len(longs)} Long, {len(shorts)} Short")
 
 
 def start_webhook_server():
@@ -2110,9 +1928,7 @@ def start_webhook_server():
             entry = get_mark_price(symbol)
 
         signal_type = data.get("signal", "").upper()
-        premium     = int(float(data.get("premium", 0) or 0))  # 1 = Premium-Setup
-        log(f"\U0001f4e1 Alert: {symbol} {direction.upper()} @ {entry} "
-            f"[{timeframe}]{' ⭐Premium' if premium else ''}")
+        log(f"\U0001f4e1 Alert: {symbol} {direction.upper()} @ {entry} [{timeframe}]")
 
         # H4 Trigger → gepuffert, nach 5 Min gebündelt senden
         if timeframe == "H4" or signal_type == "H4_TRIGGER":
@@ -2129,30 +1945,40 @@ def start_webhook_server():
                     log(f"  H4 gepuffert ({len(h4_buffer)} im Puffer)")
             return jsonify({"status": "buffered", "symbol": symbol}), 200
 
-        # H2 Signal → H4-Puffer flushen, dann H2 puffern
+        # H2 Signal → H4 Puffer flushen dann sofort senden
         flush_h4_buffer()
-        balance = get_futures_balance()
-        kelly   = kelly_recommendation(balance, WINRATE)
-
-        with h2_buffer_lock:
-            # Duplikate vermeiden (gleicher Coin + Richtung)
-            exists = any(
-                i["symbol"] == symbol and i["direction"] == direction
-                for i in h2_buffer
-            )
-            if not exists:
-                h2_buffer.append({
-                    "symbol":    symbol,
-                    "direction": direction,
-                    "entry":     entry,
-                    "premium":   premium,
-                    "balance":   balance,
-                    "kelly_pct": kelly["kelly_pct"],
-                    "ts":        time.time(),
-                })
-                log(f"  H2 gepuffert ({len(h2_buffer)} im Puffer)")
-
-        return jsonify({"status": "buffered", "symbol": symbol,
+        balance   = get_futures_balance()
+        kelly     = kelly_recommendation(balance, WINRATE)
+        links     = tv_chart_links(symbol)
+        per_order = balance * 0.10 / 3
+        chk_dir   = "gr\u00fcner" if direction == "long" else "roter"
+        icon      = dir_icon(direction)
+        msg_parts = [
+            f"{icon} <b>H2 Signal \u2014 {symbol} {direction.upper()}</b>",
+            "\u2501" * 12,
+            f"Kurs: {entry}",
+            "",
+            "\U0001f4cb <b>DOMINUS Checkliste:</b>",
+            "\u2610 DOMINUS Impuls Extremzone erreicht?",
+            "\u2610 H4 Trigger best\u00e4tigt?",
+            "\u2610 HARSI nicht in Extremzone?",
+            "\u2610 BTC + Total2 gleiche Richtung?",
+            f"\u2610 Premium Setup? (Impuls dunkel{chk_dir})",
+            "",
+            f"\U0001f4b0 {balance:.0f} USDT  |  Pro Order: {per_order:.0f} USDT",
+            f"\U0001f4ca Kelly: {kelly['kelly_pct']}%",
+            "",
+            "\u23f1 <b>30-Min-Fenster l\u00e4uft!</b>",
+            f"/trade {symbol} {direction.upper()} [HEBEL] {entry:.5f} [SL]",
+            "",
+            "\U0001f4c8 Charts:",
+            f"H2 {symbol}: {links['coin_h2']}",
+            f"H4 {symbol}: {links['coin_h4']}",
+            f"BTC H2: {links['btc_h2']}",
+            f"Total2: {links['total2']}",
+        ]
+        telegram("\n".join(msg_parts))
+        return jsonify({"status": "ok", "symbol": symbol,
                         "direction": direction}), 200
 
     @app.route("/health", methods=["GET"])
@@ -2382,6 +2208,13 @@ def check_and_repair_position(pos: dict):
             log(f"  SL gelesen: @ {sl_price} ({sl_dist_pct_read:.2f}% Abstand)")
     else:
         log(f"  SL gelesen: keiner gefunden auf Bitget")
+        # Schutzfenster: SL kürzlich gesetzt → skip Re-Set
+        if sl_set_ts.get(symbol, 0) > time.time() - SL_TP_GRACE:
+            known_sl_val = trade_data.get(symbol, {}).get("sl", 0)
+            if known_sl_val > 0:
+                sl_price    = known_sl_val
+                sl_is_entry = sl_at_entry.get(symbol, False)
+                log(f"  SL: API gibt 0 → Speicher: {sl_price} (skip Re-Set)")
 
     # 1c. Kombinierte TP1-Erkennung (preislich ODER fill-basiert ODER SL-on-Entry)
     tp1_done = state["tp1_price_hit"] or fill_tp1_hit or sl_is_entry
@@ -2458,8 +2291,8 @@ def check_and_repair_position(pos: dict):
                     "stopLossTriggerType":  "mark_price",
                 }
                 if existing_tp4 > 0:
-                    body_sl["stopSurplusTriggerPrice"] = round_price(existing_tp4, decimals)
-                    body_sl["stopSurplusTriggerType"]  = "mark_price"
+                    body_sl["takeProfitTriggerPrice"] = round_price(existing_tp4, decimals)
+                    body_sl["takeProfitTriggerType"]  = "mark_price"
                 res = api_post("/api/v2/mix/order/place-pos-tpsl", body_sl)
                 if res.get("code") == "00000":
                     sl_price    = avg
@@ -2481,20 +2314,10 @@ def check_and_repair_position(pos: dict):
             log(f"  ✓ SL @ {sl_price} ({sl_dist_pct:.2f}% Abstand)")
 
     else:
-        # Kein SL gefunden auf Bitget — Schutzfenster prüfen
-        # Bitget gibt stopLossPrice immer als 0 zurück (bekanntes API-Problem).
-        # Wenn wir den SL kürzlich gesetzt haben, übernehmen wir den Wert aus dem
-        # Speicher und überspringen alle Re-Set-Pfade.
-        _sl_skip = False
-        if sl_set_ts.get(symbol, 0) > time.time() - SL_TP_GRACE:
-            known_sl_val = trade_data.get(symbol, {}).get("sl", 0)
-            if known_sl_val > 0:
-                sl_price    = known_sl_val
-                sl_is_entry = sl_at_entry.get(symbol, False)
-                log(f"  SL: API gibt 0 → Speicher: {sl_price} (skip Re-Set)")
-            else:
-                log(f"  SL: API gibt 0, kürzlich gesetzt → skip Re-Set")
-            _sl_skip = True
+        # Kein SL gefunden auf Bitget
+        _sl_skip = sl_set_ts.get(symbol, 0) > time.time() - SL_TP_GRACE
+        if _sl_skip:
+            log(f"  SL: kürzlich gesetzt → skip Re-Set (Bitget gibt 0 zurück)")
 
         if not _sl_skip and tp1_done:
             # TP1 bereits ausgelöst → SL muss auf Entry
@@ -2620,18 +2443,15 @@ def check_and_repair_position(pos: dict):
 
     # ── 2. TPs prüfen ─────────────────────────────────────────────────────
     # Nur die TPs prüfen, die laut Preisvergleich noch offen sein sollten.
-    #
     # SCHUTZFENSTER: Da die plan-order API konsistent fehlschlägt, können
     # wir vorhandene TPs nicht aus Bitget lesen. Wenn wir TPs kürzlich gesetzt
     # haben (tp_set_ts), überspringen wir den TP-Re-Check komplett.
     if tp_set_ts.get(symbol, 0) > time.time() - SL_TP_GRACE:
         log(f"  TPs: kürzlich gesetzt — skip TP-Prüfung (plan-order API unzuverlässig)")
-        # sl_at_entry sichern für nächsten Zyklus
         sl_at_entry[symbol] = sl_is_entry
         trade_data[symbol].update({"sl": sl_price if sl_price > 0 else trade_data.get(symbol, {}).get("sl", 0)})
-        # → direkt zu DCA-Prüfung springen (kein Return — Code weiter unten)
-        existing_tps = []  # leer damit TP-Block übersprungen wird
-        tps_correct  = True  # als korrekt markieren
+        existing_tps = []
+        tps_correct  = True
     else:
         existing_tps = get_existing_tps(symbol)
     tp4_pos      = _get_pos_tp_price(symbol, direction)
@@ -2645,7 +2465,7 @@ def check_and_repair_position(pos: dict):
     pp_count_ok  = (n_act_pp == n_exp_pp)
     pp_price_ok  = tps_are_correct(existing_tps, avg, size, direction,
                                    leverage, decimals, mark) if pp_count_ok else False
-    tps_correct  = tps_correct if tp_set_ts.get(symbol, 0) > time.time() - SL_TP_GRACE \
+    tps_correct  = True if tp_set_ts.get(symbol, 0) > time.time() - SL_TP_GRACE \
                    else (pp_count_ok and pp_price_ok and tp4_ok)
 
     if not (tp_set_ts.get(symbol, 0) > time.time() - SL_TP_GRACE):
@@ -2667,8 +2487,11 @@ def check_and_repair_position(pos: dict):
         if True:  # kein Mindestgrößen-Block: TP4 immer setzen, TP1-3 intern übersprungen wenn qty=0
             cancel_all_tp_orders(symbol)
             time.sleep(1)
+            triggered_rois = {t["roi"] for t in state.get("tps_hit", [])}
+            triggered_rois |= {t["roi"] for t in filled_tps}
             count, tp_prices = place_tp_orders(
-                symbol, avg, size, direction, leverage, mark, known_sl=sl_price
+                symbol, avg, size, direction, leverage, mark, known_sl=sl_price,
+                skip_rois=triggered_rois
             )
             status = "✓ Alle" if count == len(state["tps_remaining"]) else f"⚠ {count}"
             log(f"  {status} TPs gesetzt")
@@ -2841,11 +2664,8 @@ def report_position_startup(pos: dict):
             f"━━━━━━━━━━━━\n"
         )
         body = "\n".join(issues)
-        telegram_kb(
-            header + body,
-            [[{"text": f"🔄 /refresh {symbol}", "callback_data": f"/refresh {symbol}"}]]
-            + chart_kb(symbol, include_btc=False)
-        )
+        telegram(header + body)
+        telegram(f"<code>/refresh {symbol}</code>")
         log(f"  ⚠ {len(issues)} Problem(e) → Telegram gesendet")
     else:
         log(f"  ✓ Kein Handlungsbedarf erkannt")
@@ -2853,7 +2673,6 @@ def report_position_startup(pos: dict):
 
 # ─────────────────────────────────────────────────────────────────────────
 # STATE PERSISTENZ — überlebt Railway-Neustart
-# Speichert SL/TP-Timestamps und Trade-Daten in /tmp/dominus_state.json
 # ─────────────────────────────────────────────────────────────────────────
 STATE_FILE = os.environ.get("STATE_FILE", "/tmp/dominus_state.json")
 
@@ -2883,7 +2702,7 @@ def load_state():
         with open(STATE_FILE) as f:
             s = json.load(f)
         age = time.time() - s.get("saved_at", 0)
-        if age > 43200:  # >12h → zu alt, ignorieren
+        if age > 43200:
             log(f"  State-Datei veraltet ({age/3600:.1f}h) — wird ignoriert")
             return
         sl_set_ts.update(s.get("sl_set_ts", {}))
@@ -2911,7 +2730,7 @@ def main():
     log("Warte auf neue Trades...")
     log("─" * 55)
 
-    # Persistierten State laden (SL/TP-Timestamps, Trade-Daten)
+    # Persistierten State laden
     log("Lade persistierten State...")
     load_state()
 
@@ -2950,13 +2769,6 @@ def main():
                     oldest = min((i["ts"] for i in h4_buffer), default=0)
                 if oldest and __import__("time").time() - oldest >= H4_BUFFER_SEC:
                     flush_h4_buffer()
-
-            # H2 Puffer: nach H2_BUFFER_SEC senden (90s Sammelzeit)
-            if h2_buffer:
-                with h2_buffer_lock:
-                    oldest_h2 = min((i["ts"] for i in h2_buffer), default=0)
-                if oldest_h2 and time.time() - oldest_h2 >= H2_BUFFER_SEC:
-                    flush_h2_buffer()
 
             # ── 1. Neue Fills (Nachkäufe / Einstiege) ──────
             fills      = get_recent_fills_all(last_check_ms)
