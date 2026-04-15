@@ -110,9 +110,11 @@ last_update_id:   int  = 0    # Telegram: letzter verarbeiteter Update-ID
 pending_trade: dict = {}
 
 # Timestamps — verhindern wiederholtes Neu-Setzen wenn Bitget SL/TPs nicht zurückliefert
-sl_set_ts:  dict = {}  # {symbol: unix_ts}  — wann SL zuletzt erfolgreich gesetzt
-tp_set_ts:  dict = {}  # {symbol: unix_ts}  — wann TPs zuletzt erfolgreich gesetzt
-SL_TP_GRACE = int(os.environ.get("SL_TP_GRACE", "1800"))  # 30 Min Schutzfenster
+sl_set_ts:     dict = {}  # {symbol: unix_ts}  — wann SL zuletzt erfolgreich gesetzt
+tp_set_ts:     dict = {}  # {symbol: unix_ts}  — wann TPs zuletzt erfolgreich gesetzt
+sl_first_seen: dict = {}  # {symbol: unix_ts}  — wann neuer Trade ohne SL erstmals gesehen
+SL_TP_GRACE  = int(os.environ.get("SL_TP_GRACE",   "1800"))  # 30 Min: nach erfolgreichem SL-Set
+SL_NEW_GRACE = int(os.environ.get("SL_NEW_GRACE",   "300"))  # 5 Min:  neuer Trade, SL noch nie gesetzt
 
 # Trade-Daten für Auswertung bei Abschluss
 # {symbol: {entry, direction, leverage, sl, peak_size, open_ts}}
@@ -538,12 +540,14 @@ def place_tp_orders(symbol: str, avg: float, size: float,
         tp_str = round_price(tp_raw, decimals)
         tp_val = float(tp_str)
 
-        # Qty-Berechnung: ganzzahlige Kontrakte (>= 1.0) vs. Dezimal-Kontrakte (< 1.0)
-        # max(1, floor()) war falsch für BTC: floor(0.0013 × 0.15)=0 → "1 BTC schliessen"
+        # Qty-Berechnung: round() für alle Grössen — math.floor war falsch.
+        # Beispiel: COMP size=1.76, pct=0.15: floor(0.264)=0 → SKIP (Bug!)
+        #                                     round(0.264,2)=0.26 → gesetzt ✓
+        # BTC size=0.001, pct=0.15:           round(0.00015,4)=0.00015 ✓
         if size >= 1.0:
-            qty = math.floor(size * pct)
+            qty = round(size * pct, 2)    # z.B. 1.76 × 0.15 = 0.26
         else:
-            qty = round(size * pct, 4)
+            qty = round(size * pct, 4)    # BTC-Kontrakte (sehr kleine Dezimalzahlen)
 
         if qty <= 0:
             log(f"    ⏭ {label}: Position zu klein für Teilschliessung (size={size}, pct={pct}) — übersprungen")
@@ -687,6 +691,66 @@ def place_tp_orders(symbol: str, avg: float, size: float,
         save_state()
 
     return count, prices
+
+
+# ═══════════════════════════════════════════════════════════════
+# AUTO-SL MIT VERZÖGERUNG (5-Min-Buffer für neuen Trade)
+# ═══════════════════════════════════════════════════════════════
+
+def _apply_auto_sl_if_needed(symbol: str, direction: str, sl_auto: float):
+    """
+    Wird nach SL_NEW_GRACE Sekunden (Standard 5 Min) aus setup_new_trade aufgerufen.
+    Setzt Auto-SL NUR wenn der User in der Zwischenzeit keinen SL manuell gesetzt hat.
+    """
+    if sl_set_ts.get(symbol, 0) > 0:
+        log(f"[Auto-SL-Timer] {symbol}: SL wurde manuell gesetzt — Auto-SL übersprungen ✓")
+        sl_first_seen.pop(symbol, None)
+        return
+
+    # Position noch offen? (könnte in 5 Min geschlossen worden sein)
+    if last_known_avg.get(symbol, 0) == 0:
+        log(f"[Auto-SL-Timer] {symbol}: Position nicht mehr offen — übersprungen")
+        sl_first_seen.pop(symbol, None)
+        return
+
+    # SL immer noch nicht gesetzt → Auto-SL anwenden
+    decimals = get_price_decimals(symbol)
+    sl_str   = round_price(sl_auto, decimals)
+    sl_dist  = abs(last_known_avg.get(symbol, sl_auto) - sl_auto) / max(sl_auto, 0.001) * 100
+    log(f"[Auto-SL-Timer] {symbol}: 5-Min-Buffer abgelaufen → Auto-SL @ {sl_str}")
+
+    # TP4 lesen und mitschicken (verhindert Überschreiben)
+    existing_tp4 = _get_pos_tp_price(symbol, direction)
+    body = {
+        "symbol":               symbol,
+        "productType":          PRODUCT_TYPE,
+        "marginCoin":           MARGIN_COIN,
+        "holdSide":             direction,
+        "stopLossTriggerPrice": sl_str,
+        "stopLossTriggerType":  "mark_price",
+    }
+    if existing_tp4 > 0:
+        body["takeProfitTriggerPrice"] = round_price(existing_tp4, decimals)
+        body["takeProfitTriggerType"]  = "mark_price"
+
+    res = api_post("/api/v2/mix/order/place-pos-tpsl", body)
+    if res.get("code") == "00000":
+        sl_set_ts[symbol] = time.time()
+        save_state()
+        log(f"[Auto-SL-Timer] ✓ Auto-SL gesetzt @ {sl_str}")
+        telegram(
+            f"🛡 <b>Auto-SL jetzt aktiv — {symbol}</b>\n"
+            f"5-Min-Buffer abgelaufen, kein manueller SL gesetzt\n"
+            f"SL: {sl_str} USDT ({sl_dist:.1f}% Abstand)\n"
+            f"⚠️ Bitte mit Ausstiegslinie abgleichen!"
+        )
+    else:
+        log(f"[Auto-SL-Timer] ✗ Auto-SL fehlgeschlagen: {res.get('msg', res)}")
+        telegram(
+            f"❌ <b>Auto-SL fehlgeschlagen — {symbol}</b>\n"
+            f"Bitte manuell setzen! Empfehlung: {sl_str} USDT"
+        )
+    sl_first_seen.pop(symbol, None)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -919,6 +983,9 @@ def handle_position_closed(symbol: str, reason: str = ""):
     new_trade_done.pop(symbol, None)
     sl_at_entry.pop(symbol, None)
     trade_data.pop(symbol, None)
+    sl_set_ts.pop(symbol, None)
+    tp_set_ts.pop(symbol, None)
+    sl_first_seen.pop(symbol, None)
 
     # Noch offene TP-Orders aufräumen (Sicherheit)
     cancel_all_tp_orders(symbol)
@@ -1146,9 +1213,10 @@ def setup_new_trade(pos: dict):
                 log(f"  ✗ SL aus /trade fehlgeschlagen: {res.get('msg', res)} — fallback Auto-SL")
 
         if sl_price == 0:
-            # ── 2. Fallback: Auto-SL bei -25% Margin-Verlust ──────────────
-            # Long:  SL = entry * (1 - 0.25 / leverage)
-            # Short: SL = entry * (1 + 0.25 / leverage)
+            # ── 2. Fallback: Auto-SL bei -25% — aber MIT 5-Min-Buffer ─────
+            # Der User bekommt SL_NEW_GRACE Sekunden (Standard 5 Min) Zeit,
+            # seinen manuellen SL zu setzen. Danach setzt _apply_auto_sl_if_needed
+            # automatisch den Auto-SL falls noch keiner vorhanden.
             factor   = 0.25 / leverage
             sl_auto  = entry * (1 - factor) if direction == "long" \
                        else entry * (1 + factor)
@@ -1157,48 +1225,26 @@ def setup_new_trade(pos: dict):
             sl_auto  = float(sl_str)
             sl_dist  = abs(entry - sl_auto) / entry * 100
 
-            log(f"  ⚠ Kein SL gefunden — Auto-SL bei -25%: {sl_str} USDT")
-
-            res = api_post("/api/v2/mix/order/place-pos-tpsl", {
-                "symbol":               symbol,
-                "productType":          PRODUCT_TYPE,
-                "marginCoin":           MARGIN_COIN,
-                "holdSide":             direction,
-                "stopLossTriggerPrice": sl_str,
-                "stopLossTriggerType":  "mark_price",
-            })
-
+            log(f"  ⚠ Kein SL — {SL_NEW_GRACE}s-Buffer aktiv (Auto-SL @ {sl_str} in {SL_NEW_GRACE//60} Min)")
             links = tv_chart_links(symbol)
-            if res.get("code") == "00000":
-                log(f"  ✓ Auto-SL gesetzt @ {sl_str} (-25% Schutz)")
-                telegram(
-                    f"\U0001f6e1 <b>Auto-SL gesetzt \u2014 {symbol}</b>\n"
-                    f"Kein SL gefunden \u2192 -25% Schutz aktiviert\n\n"
-                    f"SL: {sl_str} USDT ({sl_dist:.1f}% Abstand)\n"
-                    f"Hebel: {leverage}x | Entry: {entry}\n\n"
-                    f"\u26a0\ufe0f Bitte pr\u00fcfen ob SL mit deiner\n"
-                    f"Ausstiegslinie \u00fcbereinstimmt!\n\n"
-                    f"H4 {symbol}: {links['coin_h4']}\n"
-                    f"H2 {symbol}: {links['coin_h2']}"
-                )
-                sl_set_ts[symbol] = time.time()
-                sl_price = sl_auto
-            else:
-                log(f"  ✗ Auto-SL fehlgeschlagen: {res.get('msg', res)}")
-                telegram(
-                    f"\u274c <b>Kein SL \u2014 {symbol}</b>\n"
-                    f"Auto-SL fehlgeschlagen. Bitte manuell setzen!\n"
-                    f"Empfehlung: {sl_str} USDT ({sl_dist:.1f}%)\n\n"
-                    f"H4: {links['coin_h4']}"
-                )
-                cancel_all_tp_orders(symbol)
-                time.sleep(1)
-                place_tp_orders(symbol, entry, size, direction, leverage, mark,
-                                known_sl=sl_price)
-                last_known_avg[symbol]  = entry
-                last_known_size[symbol] = size
-                new_trade_done[symbol]  = True
-                return
+            telegram(
+                f"⏳ <b>Kein SL — {symbol}</b>\n"
+                f"Bitte SL in den nächsten {SL_NEW_GRACE//60} Min manuell setzen.\n"
+                f"Auto-SL Empfehlung: {sl_str} USDT ({sl_dist:.1f}% Abstand)\n\n"
+                f"H4: {links['coin_h4']}\n"
+                f"H2: {links['coin_h2']}"
+            )
+            # Erster-Gesehen-Timestamp für check_and_repair_position
+            if symbol not in sl_first_seen:
+                sl_first_seen[symbol] = time.time()
+            # Timer: nach SL_NEW_GRACE Sekunden Auto-SL setzen falls noch kein SL
+            _t = threading.Timer(SL_NEW_GRACE, _apply_auto_sl_if_needed,
+                                 args=[symbol, direction, sl_auto])
+            _t.daemon = True
+            _t.start()
+            # sl_price für DCA/TP-Berechnung auf Auto-SL-Wert setzen
+            # (TPs werden basierend auf diesem Wert bereits korrekt platziert)
+            sl_price = sl_auto
 
     # ── Hebel-Empfehlung & R:R-Check ─────────────────────
     sl_dist_pct   = abs(entry - sl_price) / entry * 100
@@ -2532,9 +2578,25 @@ def check_and_repair_position(pos: dict):
 
     else:
         # Kein SL gefunden auf Bitget
-        _sl_skip = sl_set_ts.get(symbol, 0) > time.time() - SL_TP_GRACE
-        if _sl_skip:
+        _sl_ts = sl_set_ts.get(symbol, 0)
+        if _sl_ts > time.time() - SL_TP_GRACE:
+            # SL kürzlich erfolgreich gesetzt — 30-Min-Buffer aktiv
+            _sl_skip = True
             log(f"  SL: kürzlich gesetzt → skip Re-Set (Bitget gibt 0 zurück)")
+        elif _sl_ts == 0:
+            # SL noch nie gesetzt (neuer Trade) — 5-Min-Buffer damit User Zeit hat
+            if symbol not in sl_first_seen:
+                sl_first_seen[symbol] = time.time()
+            _wait_left = SL_NEW_GRACE - (time.time() - sl_first_seen[symbol])
+            if _wait_left > 0:
+                _sl_skip = True
+                log(f"  SL: neuer Trade, noch nie gesetzt — warte {_wait_left:.0f}s "
+                    f"(5-Min-Buffer für manuellen SL)")
+            else:
+                _sl_skip = False
+                log(f"  SL: 5-Min-Buffer abgelaufen → Auto-SL wird gesetzt")
+        else:
+            _sl_skip = False
 
         if not _sl_skip and tp1_done:
             # TP1 bereits ausgelöst → SL muss auf Entry
@@ -2923,14 +2985,16 @@ def load_state():
             log(f"  State-Datei veraltet ({age/3600:.1f}h) — wird ignoriert")
             return
         sl_set_ts.update(s.get("sl_set_ts", {}))
-        tp_set_ts.update(s.get("tp_set_ts", {}))
+        # tp_set_ts wird NICHT geladen — nach jedem Neustart werden TPs einmalig
+        # geprüft und ggf. korrigiert. sl_set_ts wird geladen — verhindert
+        # unerwünschtes SL-Überschreiben nach Neustart.
         sl_at_entry.update(s.get("sl_at_entry", {}))
         new_trade_done.update(s.get("new_trade_done", {}))
         last_known_avg.update(s.get("last_known_avg", {}))
         last_known_size.update(s.get("last_known_size", {}))
         trade_data.update(s.get("trade_data", {}))
         log(f"  ✓ State geladen: {len(trade_data)} Trade(s) | "
-            f"SL-ts: {len(sl_set_ts)} | TP-ts: {len(tp_set_ts)} | "
+            f"SL-ts: {len(sl_set_ts)} | TP-Prüfung erzwungen nach Neustart | "
             f"Alter: {age/60:.0f} Min")
     except Exception as e:
         log(f"  [WARN] State konnte nicht geladen werden: {e}")
@@ -2984,7 +3048,7 @@ def main():
             if h4_buffer:
                 with h4_buffer_lock:
                     oldest = min((i["ts"] for i in h4_buffer), default=0)
-                if oldest and __import__("time").time() - oldest >= H4_BUFFER_SEC:
+                if oldest and time.time() - oldest >= H4_BUFFER_SEC:
                     flush_h4_buffer()
 
             # ── 1. Neue Fills (Nachkäufe / Einstiege) ──────
