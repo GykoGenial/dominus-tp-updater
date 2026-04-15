@@ -105,9 +105,20 @@ new_trade_done:   dict = {}   # {symbol: bool} — DCA bereits gesetzt?
 price_decimals_cache: dict = {}
 last_update_id:   int  = 0    # Telegram: letzter verarbeiteter Update-ID
 
+# Timestamps — verhindern wiederholtes Neu-Setzen wenn Bitget SL/TPs nicht zurückliefert
+# Bitget gibt stopLossPrice=0 und plan-orders API schlägt fehl → Bot würde sonst
+# SL und TPs bei jedem 20s-Zyklus neu setzen obwohl sie korrekt gesetzt sind.
+sl_set_ts:  dict = {}  # {symbol: unix_ts}  — wann SL zuletzt erfolgreich gesetzt
+tp_set_ts:  dict = {}  # {symbol: unix_ts}  — wann TPs zuletzt erfolgreich gesetzt
+SL_TP_GRACE = int(os.environ.get("SL_TP_GRACE", "1800"))  # 30 Min Schutzfenster
+
 # Trade-Daten für Auswertung bei Abschluss
 # {symbol: {entry, direction, leverage, sl, peak_size, open_ts}}
 trade_data: dict = {}
+
+# Vorberechneter SL aus /trade-Befehl — wird in setup_new_trade verwendet
+# {symbol: {sl, direction, entry, leverage, ts}}
+pending_trade: dict = {}
 
 # H4 Trigger-Puffer: sammelt Alerts, sendet gebündelt nach Zeitfenster
 h4_buffer:     list = []
@@ -630,7 +641,7 @@ def place_tp_orders(symbol: str, avg: float, size: float,
             f"TP1–SL-Mechanismus greift nicht automatisch — SL manuell überwachen!"
         )
         log(warn_msg)
-        send_telegram(warn_msg)
+        telegram(warn_msg)
 
     # ── TP4: Full Position Close via place-pos-tpsl ──────────────
     # WICHTIG: place-pos-tpsl verwaltet NUR EINEN kombinierten
@@ -703,6 +714,10 @@ def place_tp_orders(symbol: str, avg: float, size: float,
                     log(f"    ✓ TP4 Full Close @ {tp4_str2} USDT [retry OK]")
                     count += 1
                     prices.append(f"TP4 Full Close: {tp4_str2}")
+
+    if count > 0:
+        tp_set_ts[symbol] = time.time()
+        save_state()
 
     return count, prices
 
@@ -990,8 +1005,10 @@ def set_sl_at_entry(symbol: str, direction: str, entry_price: float):
     if result.get("code") == "00000":
         log(f"  ✓ SL auf Entry gesetzt: {sl_str} USDT ({symbol})")
         sl_at_entry[symbol] = True
+        sl_set_ts[symbol]   = time.time()
         # DCA Limit-Orders stornieren — nicht mehr nötig nach TP1
         cancel_open_dca_orders(symbol, direction)
+        save_state()
         telegram(
             f"🔒 <b>SL auf Entry — {symbol}</b>\n"
             f"TP1 ausgelöst → SL auf {sl_str} USDT\n"
@@ -1127,56 +1144,91 @@ def setup_new_trade(pos: dict):
     sl_price = get_sl_price(symbol, direction)
 
     if sl_price == 0:
-        # ── Kein SL gesetzt → automatisch auf -25% berechnen ─────────
-        # Long:  SL = entry * (1 - 0.25 / leverage)
-        # Short: SL = entry * (1 + 0.25 / leverage)
-        factor   = 0.25 / leverage
-        sl_auto  = entry * (1 - factor) if direction == "long"                    else entry * (1 + factor)
-        decimals = get_price_decimals(symbol)
-        sl_str   = round_price(sl_auto, decimals)
-        sl_auto  = float(sl_str)
-        sl_dist  = abs(entry - sl_auto) / entry * 100
+        # ── 1. Versuch: SL aus /trade-Befehl (pending_trade) ──────────
+        hint = pending_trade.pop(symbol, {})
+        if (hint
+                and hint.get("direction") == direction
+                and time.time() - hint.get("ts", 0) < 3600   # max. 1 Stunde gültig
+                and hint.get("sl", 0) > 0):
+            decimals = get_price_decimals(symbol)
+            sl_str   = round_price(hint["sl"], decimals)
+            sl_hint  = float(sl_str)
+            sl_dist  = abs(entry - sl_hint) / entry * 100
+            log(f"  ✓ SL aus /trade-Berechnung: {sl_str} USDT ({sl_dist:.2f}%)")
 
-        log(f"  ⚠ Kein SL gefunden — Auto-SL bei -25%: {sl_str} USDT")
+            res = api_post("/api/v2/mix/order/place-pos-tpsl", {
+                "symbol":               symbol,
+                "productType":          PRODUCT_TYPE,
+                "marginCoin":           MARGIN_COIN,
+                "holdSide":             direction,
+                "stopLossTriggerPrice": sl_str,
+                "stopLossTriggerType":  "mark_price",
+            })
+            if res.get("code") == "00000":
+                log(f"  ✓ SL gesetzt @ {sl_str} (aus /trade)")
+                sl_set_ts[symbol] = time.time()
+                telegram_kb(
+                    f"🛡 <b>SL gesetzt — {symbol}</b>\n"
+                    f"Übernommen aus deiner /trade-Berechnung\n\n"
+                    f"SL: {sl_str} USDT ({sl_dist:.1f}% Abstand)\n"
+                    f"Hebel: {leverage}x | Entry: {entry}",
+                    chart_kb(symbol, include_btc=False)
+                )
+                sl_price = sl_hint
+            else:
+                log(f"  ✗ SL aus /trade fehlgeschlagen: {res.get('msg', res)} — fallback Auto-SL")
 
-        res = api_post("/api/v2/mix/order/place-pos-tpsl", {
-            "symbol":               symbol,
-            "productType":          PRODUCT_TYPE,
-            "marginCoin":           MARGIN_COIN,
-            "holdSide":             direction,
-            "stopLossTriggerPrice": sl_str,
-            "stopLossTriggerType":  "mark_price",
-        })
+        # ── 2. Fallback: Auto-SL bei -25% Margin-Verlust ──────────────
+        if sl_price == 0:
+            # Long:  SL = entry * (1 - 0.25 / leverage)
+            # Short: SL = entry * (1 + 0.25 / leverage)
+            factor   = 0.25 / leverage
+            sl_auto  = entry * (1 - factor) if direction == "long" \
+                       else entry * (1 + factor)
+            decimals = get_price_decimals(symbol)
+            sl_str   = round_price(sl_auto, decimals)
+            sl_auto  = float(sl_str)
+            sl_dist  = abs(entry - sl_auto) / entry * 100
 
-        links = tv_chart_links(symbol)
-        if res.get("code") == "00000":
-            log(f"  ✓ Auto-SL gesetzt @ {sl_str} (-25% Schutz)")
-            telegram_kb(
-                f"\U0001f6e1 <b>Auto-SL gesetzt \u2014 {symbol}</b>\n"
-                f"Kein SL gefunden \u2192 -25% Schutz aktiviert\n\n"
-                f"SL: {sl_str} USDT ({sl_dist:.1f}% Abstand)\n"
-                f"Hebel: {leverage}x | Entry: {entry}\n\n"
-                f"\u26a0\ufe0f Bitte pr\u00fcfen ob SL mit deiner\n"
-                f"Ausstiegslinie \u00fcbereinstimmt!",
-                chart_kb(symbol, include_btc=False)
-            )
-            sl_price = sl_auto
-        else:
-            log(f"  ✗ Auto-SL fehlgeschlagen: {res.get('msg', res)}")
-            telegram_kb(
-                f"\u274c <b>Kein SL \u2014 {symbol}</b>\n"
-                f"Auto-SL fehlgeschlagen. Bitte manuell setzen!\n"
-                f"Empfehlung: {sl_str} USDT ({sl_dist:.1f}%)",
-                chart_kb(symbol, include_btc=False)
-            )
-            cancel_all_tp_orders(symbol)
-            time.sleep(1)
-            place_tp_orders(symbol, entry, size, direction, leverage, mark,
-                            known_sl=sl_price)
-            last_known_avg[symbol]  = entry
-            last_known_size[symbol] = size
-            new_trade_done[symbol]  = True
-            return
+            log(f"  ⚠ Kein SL gefunden — Auto-SL bei -25%: {sl_str} USDT")
+
+            res = api_post("/api/v2/mix/order/place-pos-tpsl", {
+                "symbol":               symbol,
+                "productType":          PRODUCT_TYPE,
+                "marginCoin":           MARGIN_COIN,
+                "holdSide":             direction,
+                "stopLossTriggerPrice": sl_str,
+                "stopLossTriggerType":  "mark_price",
+            })
+            if res.get("code") == "00000":
+                log(f"  ✓ Auto-SL gesetzt @ {sl_str} (-25% Schutz)")
+                telegram_kb(
+                    f"\U0001f6e1 <b>Auto-SL gesetzt \u2014 {symbol}</b>\n"
+                    f"Kein SL gefunden \u2192 -25% Schutz aktiviert\n\n"
+                    f"SL: {sl_str} USDT ({sl_dist:.1f}% Abstand)\n"
+                    f"Hebel: {leverage}x | Entry: {entry}\n\n"
+                    f"\u26a0\ufe0f Bitte pr\u00fcfen ob SL mit deiner\n"
+                    f"Ausstiegslinie \u00fcbereinstimmt!",
+                    chart_kb(symbol, include_btc=False)
+                )
+                sl_price          = sl_auto
+                sl_set_ts[symbol] = time.time()
+            else:
+                log(f"  ✗ Auto-SL fehlgeschlagen: {res.get('msg', res)}")
+                telegram_kb(
+                    f"\u274c <b>Kein SL \u2014 {symbol}</b>\n"
+                    f"Auto-SL fehlgeschlagen. Bitte manuell setzen!\n"
+                    f"Empfehlung: {sl_str} USDT ({sl_dist:.1f}%)",
+                    chart_kb(symbol, include_btc=False)
+                )
+                cancel_all_tp_orders(symbol)
+                time.sleep(1)
+                place_tp_orders(symbol, entry, size, direction, leverage, mark,
+                                known_sl=sl_price)
+                last_known_avg[symbol]  = entry
+                last_known_size[symbol] = size
+                new_trade_done[symbol]  = True
+                return
 
     # ── Hebel-Empfehlung & R:R-Check ─────────────────────
     sl_dist_pct   = abs(entry - sl_price) / entry * 100
@@ -1375,14 +1427,8 @@ def update_tp_for_position(pos: dict, reason: str):
         log(f"  ⚠ Kein SL ermittelbar — TP4-Aufruf ohne SL-Parameter")
 
     log(f"  TPs löschen und neu setzen (Grund: {reason})")
-
-    min_size_for_tps = 4
-    if total < min_size_for_tps:
-        log(f"  ⚠ Position zu klein (Qty={total}, min. {min_size_for_tps}) — "
-            f"TPs manuell überwachen")
-        last_known_avg[symbol]  = avg
-        last_known_size[symbol] = total
-        return
+    # Kein Mindestgrößen-Block mehr: place_tp_orders überspringt TP1-3 intern
+    # wenn qty=0, setzt aber immer TP4 (Full-Close) via place-pos-tpsl.
 
     cancel_all_tp_orders(symbol)
     time.sleep(1)
@@ -1557,6 +1603,16 @@ def cmd_trade(parts: list):
     opt_leverage = calc_optimal_leverage(entry, sl)
     rr           = calc_rr(entry, sl, leverage, direction)
     kelly        = kelly_recommendation(balance, WINRATE)
+
+    # SL-Hint speichern — wird von setup_new_trade() verwendet wenn Bitget SL nicht liefert
+    pending_trade[symbol] = {
+        "sl":        sl,
+        "direction": direction,
+        "leverage":  leverage,
+        "entry":     entry,
+        "ts":        time.time(),
+    }
+    log(f"  /trade SL-Hint gespeichert: {symbol} {direction.upper()} SL={sl}")
 
     # Position pro Order
     contracts = (per_order * leverage) / entry
@@ -2425,8 +2481,22 @@ def check_and_repair_position(pos: dict):
             log(f"  ✓ SL @ {sl_price} ({sl_dist_pct:.2f}% Abstand)")
 
     else:
-        # Kein SL gefunden auf Bitget
-        if tp1_done:
+        # Kein SL gefunden auf Bitget — Schutzfenster prüfen
+        # Bitget gibt stopLossPrice immer als 0 zurück (bekanntes API-Problem).
+        # Wenn wir den SL kürzlich gesetzt haben, übernehmen wir den Wert aus dem
+        # Speicher und überspringen alle Re-Set-Pfade.
+        _sl_skip = False
+        if sl_set_ts.get(symbol, 0) > time.time() - SL_TP_GRACE:
+            known_sl_val = trade_data.get(symbol, {}).get("sl", 0)
+            if known_sl_val > 0:
+                sl_price    = known_sl_val
+                sl_is_entry = sl_at_entry.get(symbol, False)
+                log(f"  SL: API gibt 0 → Speicher: {sl_price} (skip Re-Set)")
+            else:
+                log(f"  SL: API gibt 0, kürzlich gesetzt → skip Re-Set")
+            _sl_skip = True
+
+        if not _sl_skip and tp1_done:
             # TP1 bereits ausgelöst → SL muss auf Entry
             sl_str   = round_price(avg, decimals)
             sl_valid = (direction == "long" and avg <= mark) or \
@@ -2458,7 +2528,7 @@ def check_and_repair_position(pos: dict):
                 log(f"  ⚠ Mark {mark} bereits hinter Entry {avg} — SL auf Entry nicht setzbar")
                 telegram(f"⚠️ <b>{symbol}</b>: Position im Verlust, SL manuell setzen!")
 
-        elif pnl > 0:
+        elif not _sl_skip and pnl > 0:
             # Position im Gewinn, kein SL gefunden — SL MINDESTENS auf Entry setzen
             # (Floor-Regel: verhindert, dass ein Auto-SL in Verlustzone gesetzt wird
             #  wenn die Position bereits einen Gewinn aufgebaut hat)
@@ -2505,7 +2575,7 @@ def check_and_repair_position(pos: dict):
                 log(f"  ⚠ Mark {mark} hinter Entry {avg} — SL auf Entry nicht setzbar")
                 telegram(f"⚠️ <b>{symbol}</b>: Position im Verlust, SL manuell setzen!")
 
-        else:
+        elif not _sl_skip:
             # Kein TP passiert, kein Gewinn → Auto-SL auf -25% Margin
             sl_str  = round_price(_sl_auto, decimals)
             sl_auto = float(sl_str)
@@ -2550,7 +2620,20 @@ def check_and_repair_position(pos: dict):
 
     # ── 2. TPs prüfen ─────────────────────────────────────────────────────
     # Nur die TPs prüfen, die laut Preisvergleich noch offen sein sollten.
-    existing_tps = get_existing_tps(symbol)
+    #
+    # SCHUTZFENSTER: Da die plan-order API konsistent fehlschlägt, können
+    # wir vorhandene TPs nicht aus Bitget lesen. Wenn wir TPs kürzlich gesetzt
+    # haben (tp_set_ts), überspringen wir den TP-Re-Check komplett.
+    if tp_set_ts.get(symbol, 0) > time.time() - SL_TP_GRACE:
+        log(f"  TPs: kürzlich gesetzt — skip TP-Prüfung (plan-order API unzuverlässig)")
+        # sl_at_entry sichern für nächsten Zyklus
+        sl_at_entry[symbol] = sl_is_entry
+        trade_data[symbol].update({"sl": sl_price if sl_price > 0 else trade_data.get(symbol, {}).get("sl", 0)})
+        # → direkt zu DCA-Prüfung springen (kein Return — Code weiter unten)
+        existing_tps = []  # leer damit TP-Block übersprungen wird
+        tps_correct  = True  # als korrekt markieren
+    else:
+        existing_tps = get_existing_tps(symbol)
     tp4_pos      = _get_pos_tp_price(symbol, direction)
 
     n_exp_pp   = state["n_expected_profit_plan"]   # erwartete profit_plan Orders
@@ -2562,12 +2645,14 @@ def check_and_repair_position(pos: dict):
     pp_count_ok  = (n_act_pp == n_exp_pp)
     pp_price_ok  = tps_are_correct(existing_tps, avg, size, direction,
                                    leverage, decimals, mark) if pp_count_ok else False
-    tps_correct  = pp_count_ok and pp_price_ok and tp4_ok
+    tps_correct  = tps_correct if tp_set_ts.get(symbol, 0) > time.time() - SL_TP_GRACE \
+                   else (pp_count_ok and pp_price_ok and tp4_ok)
 
-    log(f"  TPs: erwartet {n_exp_pp} profit_plan"
-        f" + {'TP4 Full-Close' if tp4_exp else 'kein TP4 (passiert)'}"
-        f" | vorhanden {n_act_pp} profit_plan"
-        f" + {'TP4 @ ' + str(tp4_pos) if tp4_pos > 0 else 'kein TP4'}")
+    if not (tp_set_ts.get(symbol, 0) > time.time() - SL_TP_GRACE):
+        log(f"  TPs: erwartet {n_exp_pp} profit_plan"
+            f" + {'TP4 Full-Close' if tp4_exp else 'kein TP4 (passiert)'}"
+            f" | vorhanden {n_act_pp} profit_plan"
+            f" + {'TP4 @ ' + str(tp4_pos) if tp4_pos > 0 else 'kein TP4'}")
 
     if not tps_correct:
         reasons = []
@@ -2579,9 +2664,7 @@ def check_and_repair_position(pos: dict):
             reasons.append("TP4 Full-Close fehlt")
         log(f"  ⚠ TPs inkorrekt ({'; '.join(reasons)}) → neu setzen")
 
-        if size < 4:
-            log(f"  ⚠ Position zu klein (Qty={size}, min. 4) — TPs manuell setzen")
-        else:
+        if True:  # kein Mindestgrößen-Block: TP4 immer setzen, TP1-3 intern übersprungen wenn qty=0
             cancel_all_tp_orders(symbol)
             time.sleep(1)
             count, tp_prices = place_tp_orders(
@@ -2611,7 +2694,22 @@ def check_and_repair_position(pos: dict):
     existing_dcas = get_existing_dca_orders(symbol, direction)
     n_dca         = len(existing_dcas)
 
-    if n_dca >= 2:
+    if n_dca > 2:
+        # Zu viele DCAs (Duplikate) — Alle stornieren und neu setzen
+        log(f"  ⚠ {n_dca} DCA-Orders gefunden (erwartet: 2) → Duplikate bereinigen")
+        telegram(
+            f"🧹 <b>DCA-Duplikate bereinigt — {symbol}</b>\n"
+            f"{n_dca} DCA-Orders gefunden, nur 2 erwartet.\n"
+            f"Alle storniert und neu gesetzt."
+        )
+        cancel_open_dca_orders(symbol, direction)
+        time.sleep(1)
+        if sl_price and sl_price > 0:
+            place_dca_orders(symbol, avg, sl_price, direction, size,
+                             balance=get_futures_balance(), leverage=leverage)
+        else:
+            log("  Kein SL-Preis — DCA nach Bereinigung nicht neu gesetzt")
+    elif n_dca == 2:
         dca_info = " | ".join(
             f"{o.get('price','?')} × {o.get('size','?')}" for o in existing_dcas[:2]
         )
@@ -2753,6 +2851,55 @@ def report_position_startup(pos: dict):
         log(f"  ✓ Kein Handlungsbedarf erkannt")
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# STATE PERSISTENZ — überlebt Railway-Neustart
+# Speichert SL/TP-Timestamps und Trade-Daten in /tmp/dominus_state.json
+# ─────────────────────────────────────────────────────────────────────────
+STATE_FILE = os.environ.get("STATE_FILE", "/tmp/dominus_state.json")
+
+def save_state():
+    """Persistiert volatile State-Dicts auf Disk."""
+    try:
+        state = {
+            "sl_set_ts":       sl_set_ts,
+            "tp_set_ts":       tp_set_ts,
+            "sl_at_entry":     sl_at_entry,
+            "new_trade_done":  new_trade_done,
+            "last_known_avg":  last_known_avg,
+            "last_known_size": last_known_size,
+            "trade_data":      trade_data,
+            "saved_at":        time.time(),
+        }
+        with open(STATE_FILE, "w") as f:
+            json.dump(state, f)
+    except Exception as e:
+        log(f"  [WARN] State konnte nicht gespeichert werden: {e}")
+
+def load_state():
+    """Lädt persistierten State. Ältere Timestamps (>12h) werden verworfen."""
+    if not os.path.exists(STATE_FILE):
+        return
+    try:
+        with open(STATE_FILE) as f:
+            s = json.load(f)
+        age = time.time() - s.get("saved_at", 0)
+        if age > 43200:  # >12h → zu alt, ignorieren
+            log(f"  State-Datei veraltet ({age/3600:.1f}h) — wird ignoriert")
+            return
+        sl_set_ts.update(s.get("sl_set_ts", {}))
+        tp_set_ts.update(s.get("tp_set_ts", {}))
+        sl_at_entry.update(s.get("sl_at_entry", {}))
+        new_trade_done.update(s.get("new_trade_done", {}))
+        last_known_avg.update(s.get("last_known_avg", {}))
+        last_known_size.update(s.get("last_known_size", {}))
+        trade_data.update(s.get("trade_data", {}))
+        log(f"  ✓ State geladen: {len(trade_data)} Trade(s) | "
+            f"SL-ts: {len(sl_set_ts)} | TP-ts: {len(tp_set_ts)} | "
+            f"Alter: {age/60:.0f} Min")
+    except Exception as e:
+        log(f"  [WARN] State konnte nicht geladen werden: {e}")
+
+
 def main():
     if not API_KEY or not SECRET_KEY or not PASSPHRASE:
         log("FEHLER: API_KEY, SECRET_KEY oder PASSPHRASE fehlen!")
@@ -2763,6 +2910,10 @@ def main():
     log(f"Intervall: {POLL_INTERVAL}s")
     log("Warte auf neue Trades...")
     log("─" * 55)
+
+    # Persistierten State laden (SL/TP-Timestamps, Trade-Daten)
+    log("Lade persistierten State...")
+    load_state()
 
     # Webhook-Server in separatem Thread starten
     t = threading.Thread(target=start_webhook_server, daemon=True)
@@ -2870,6 +3021,9 @@ def main():
                 for sym in list(last_known_avg.keys()):
                     if sym not in active_symbols and last_known_avg.get(sym, 0) > 0:
                         handle_position_closed(sym, "SL oder TP4 ausgelöst")
+
+            # State nach jedem Polling-Zyklus sichern
+            save_state()
 
         except requests.exceptions.ConnectionError:
             log("Verbindungsfehler. Retry in 30s...")
