@@ -114,6 +114,11 @@ h4_buffer:     list = []
 h4_buffer_lock = __import__("threading").Lock()
 H4_BUFFER_SEC  = int(os.environ.get("H4_BUFFER_SEC", "300"))  # 5 Min
 
+# H2 Signal-Puffer: bündelt gleichzeitige H2-Signale zur einer Nachricht
+h2_buffer:     list = []
+h2_buffer_lock = __import__("threading").Lock()
+H2_BUFFER_SEC  = int(os.environ.get("H2_BUFFER_SEC", "90"))   # 90 Sekunden
+
 
 # ═══════════════════════════════════════════════════════════════
 # BASIS-FUNKTIONEN
@@ -660,8 +665,8 @@ def place_tp_orders(symbol: str, avg: float, size: float,
             "productType":            PRODUCT_TYPE,
             "marginCoin":             MARGIN_COIN,
             "holdSide":               direction,
-            "takeProfitTriggerPrice": tp4_str,
-            "takeProfitTriggerType":  "mark_price",
+            "stopSurplusTriggerPrice": tp4_str,
+            "stopSurplusTriggerType":  "mark_price",
         }
         # SL mitschicken wenn vorhanden — verhindert Überschreiben
         if current_sl > 0:
@@ -683,12 +688,12 @@ def place_tp_orders(symbol: str, avg: float, size: float,
                 price_decimals_cache[symbol] = new_dec
                 tp4_str2  = round_price(tp4_raw, new_dec)
                 body4b    = {
-                    "symbol":                 symbol,
-                    "productType":            PRODUCT_TYPE,
-                    "marginCoin":             MARGIN_COIN,
-                    "holdSide":               direction,
-                    "takeProfitTriggerPrice": tp4_str2,
-                    "takeProfitTriggerType":  "mark_price",
+                    "symbol":                  symbol,
+                    "productType":             PRODUCT_TYPE,
+                    "marginCoin":              MARGIN_COIN,
+                    "holdSide":                direction,
+                    "stopSurplusTriggerPrice": tp4_str2,
+                    "stopSurplusTriggerType":  "mark_price",
                 }
                 if current_sl > 0:
                     body4b["stopLossTriggerPrice"] = sl_for_tp4
@@ -950,8 +955,8 @@ def _get_pos_tp_price(symbol: str, direction: str) -> float:
     if result.get("code") == "00000":
         for pos in (result.get("data") or []):
             if pos.get("holdSide") == direction:
-                for field in ("takeProfitPrice", "takeProfit", "tpPrice",
-                              "takeProfitTriggerPrice"):
+                for field in ("stopSurplusTriggerPrice", "takeProfitPrice",
+                              "takeProfit", "tpPrice", "takeProfitTriggerPrice"):
                     tp = float(pos.get(field, 0) or 0)
                     if tp > 0:
                         return tp
@@ -976,8 +981,8 @@ def set_sl_at_entry(symbol: str, direction: str, entry_price: float):
     }
     if existing_tp4 > 0:
         decimals_sl = get_price_decimals(symbol)
-        body_sl["takeProfitTriggerPrice"] = round_price(existing_tp4, decimals_sl)
-        body_sl["takeProfitTriggerType"]  = "mark_price"
+        body_sl["stopSurplusTriggerPrice"] = round_price(existing_tp4, decimals_sl)
+        body_sl["stopSurplusTriggerType"]  = "mark_price"
         log(f"  TP4 @ {existing_tp4} wird mitgeführt")
 
     result = api_post("/api/v2/mix/order/place-pos-tpsl", body_sl)
@@ -1233,11 +1238,16 @@ def setup_new_trade(pos: dict):
     }
 
     # ── 6. Telegram-Zusammenfassung ─────────────────────────
-    dca1_str = dca_results[0] if len(dca_results) > 0 else "Fehler"
-    dca2_str = dca_results[1] if len(dca_results) > 1 else "Fehler"
+    dca1_line = dca_results[0] if len(dca_results) > 0 else "DCA1: Fehler"
+    dca2_line = dca_results[1] if len(dca_results) > 1 else "DCA2: Fehler"
 
+    coin     = symbol.replace("USDT", "")
     rr_icon  = "⚠️" if rr_warn else "✅"
     lev_icon = "⚠️" if lev_diff > 2 else "✅"
+
+    def fmt_qty(q: float) -> str:
+        return str(int(q)) if q == int(q) else str(round(q, 4))
+
     msg = (
         f"🚀 {dir_icon(direction)} <b>Neuer Trade — {symbol}</b>\n"
         f"━━━━━━━━━━━━\n"
@@ -1249,10 +1259,10 @@ def setup_new_trade(pos: dict):
         f"📊 Kelly {WINRATE*100:.0f}%: {kelly['kelly_pct']}% | "
         f"Half-Kelly: {kelly['half_kelly_pct']}%\n\n"
         f"📦 <b>Orders gesetzt:</b>\n"
-        f"Market:  {entry} USDT × {size}\n"
-        f"{dca1_str} × {size}\n"
-        f"{dca2_str} × {size}\n\n"
-        f"🎯 <b>Take-Profits (15/20/25/40%):</b>\n"
+        f"✅ Market:  <b>{fmt_qty(size)} {coin}</b> @ {entry} USDT\n"
+        f"✅ {dca1_line} {coin}  ← auto\n"
+        f"✅ {dca2_line} {coin}  ← auto\n\n"
+        f"🎯 <b>Take-Profits:</b>\n"
         + "\n".join(tp_prices) + "\n\n"
         f"💰 Margin/Order ≈ {order_margin:.2f} USDT\n"
         f"📊 Total ≈ {order_margin*3:.2f} USDT "
@@ -1589,6 +1599,17 @@ def cmd_trade(parts: list):
     rr_icon = "✅" if rr >= MIN_RR else "⚠️"
     lev_icon = "✅" if abs(leverage - opt_leverage) <= 2 else "⚠️"
 
+    coin = symbol.replace("USDT", "")
+    dca1_qty = round(contracts * DCA1_MULTIPLIER, 4)
+    dca2_qty = round(contracts * DCA2_MULTIPLIER, 4)
+
+    def fmt_qty(q: float) -> str:
+        return str(int(q)) if q == int(q) else str(round(q, 4))
+
+    mkt_qty_str  = fmt_qty(contracts)
+    dca1_qty_str = fmt_qty(dca1_qty)
+    dca2_qty_str = fmt_qty(dca2_qty)
+
     lines = [
         f"🧮 <b>Trade-Berechnung — {symbol}</b>",
         f"━━━━━━━━━━━━",
@@ -1599,13 +1620,13 @@ def cmd_trade(parts: list):
         f"{rr_icon} R:R: {rr} (Min: {MIN_RR})",
         f"{lev_icon} Empf. Hebel: {opt_leverage}x",
         f"",
-        f"📦 <b>Orders (je {contracts:.2f} Kontrakte):</b>",
-        f"  Market:  {entry}",
-        f"  DCA1:    {dca1:.4f}",
-        f"  DCA2:    {dca2:.4f}",
+        f"🎯 <b>Bitget Einstieg (Menge-{coin}):</b>",
+        f"  Market:  <b>{mkt_qty_str} {coin}</b>  @ {entry}",
+        f"  DCA1:    {dca1_qty_str} {coin}  @ {dca1:.4f}  ← Script",
+        f"  DCA2:    {dca2_qty_str} {coin}  @ {dca2:.4f}  ← Script",
         f"  SL:      {sl}",
         f"",
-        f"🎯 <b>Take-Profits (15/20/25/40%):</b>",
+        f"🎯 <b>Take-Profits:</b>",
     ] + tps + [
         f"",
         f"💰 <b>Money Management:</b>",
@@ -1624,7 +1645,7 @@ def cmd_trade(parts: list):
         "✔︎ DOMINUS Impuls im Premium-Bereich?",
         "✔︎ BTC + Total2 gleiche Richtung?",
         "",
-        "✅ Wenn ja: Market Order + SL auf Bitget setzen.",
+        f"✅ Wenn ja: <b>{mkt_qty_str} {coin}</b> als Market Order auf Bitget.",
         "Script setzt DCA + TPs automatisch.",
     ]
     telegram_kb("\n".join(lines), chart_kb(symbol))
@@ -1884,6 +1905,86 @@ def flush_h4_buffer():
     log(f"H4-Zusammenfassung gesendet: {len(longs)} Long, {len(shorts)} Short")
 
 
+def flush_h2_buffer():
+    """
+    Bündelt alle gepufferten H2-Signale zu einer einzigen Telegram-Nachricht.
+    Signale werden nach Richtung gruppiert, Checkliste + Konto-Info nur einmal.
+    Chart-Buttons: je H2 + H4 pro Coin, BTC/Total2 am Schluss.
+    """
+    global h2_buffer
+    with h2_buffer_lock:
+        if not h2_buffer:
+            return
+        items     = list(h2_buffer)
+        h2_buffer = []
+
+    longs  = [i for i in items if i["direction"] == "long"]
+    shorts = [i for i in items if i["direction"] == "short"]
+    now_str = __import__("datetime").datetime.now().strftime("%H:%M")
+
+    # Kontoinfo (vom ersten Item, alle teilen denselben Kontostand)
+    balance   = items[0].get("balance", 0)
+    kelly_pct = items[0].get("kelly_pct", "–")
+    per_order = balance * 0.10 / 3 if balance > 0 else 0
+
+    def _coin_label(item: dict) -> str:
+        """Coin-Name mit Premium-Stern falls Premium-Setup."""
+        name = item["symbol"].replace("USDT", "")
+        return f"⭐{name}" if item.get("premium") else name
+
+    lines = [
+        f"📡 <b>H2 Signale \u2014 {now_str} Uhr</b>",
+        "\u2501" * 12,
+    ]
+
+    # Shorts kompakt — Premium-Coins mit ⭐
+    if shorts:
+        sym_list = "  |  ".join(
+            f"{_coin_label(i)} @ {i['entry']}" for i in shorts
+        )
+        lines.append(f"🔴↘️  {sym_list}")
+
+    # Longs kompakt — Premium-Coins mit ⭐
+    if longs:
+        sym_list = "  |  ".join(
+            f"{_coin_label(i)} @ {i['entry']}" for i in longs
+        )
+        lines.append(f"🟢↗️  {sym_list}")
+
+    lines += [
+        "",
+        f"💰 {balance:.0f} USDT  |  Pro Order: {per_order:.0f} USDT  |  Kelly: {kelly_pct}%",
+        "",
+        "\U0001f4cb <b>Checkliste:</b>",
+        "\u2610 Impuls Extremzone?  \u2610 H4 bestätigt?",
+        "\u2610 HARSI OK?  \u2610 BTC+Total2 gleich?  \u2610 Premium?",
+        "",
+        "\u23f1 <b>30-Min-Fenster läuft!</b>",
+    ]
+
+    # Chart-Buttons: je H2 + H4 pro Coin (zwei Coins pro Zeile)
+    btc_lnk  = tv_chart_links("BTCUSDT")
+    all_items = shorts + longs   # Shorts zuerst (häufigste Richtung im Bärmarkt)
+    btn_rows  = []
+    for item in all_items:
+        lnk   = tv_chart_links(item["symbol"])
+        clean = item["symbol"].replace("USDT", "")
+        icon  = "🟢" if item["direction"] == "long" else "🔴"
+        star  = "⭐" if item.get("premium") else ""
+        btn_rows.append([
+            {"text": f"{icon} {star}{clean} H2", "url": lnk["coin_h2"]},
+            {"text": f"{icon} {star}{clean} H4", "url": lnk["coin_h4"]},
+        ])
+    btn_rows.append([
+        {"text": "📊 BTC H2", "url": btc_lnk["btc_h2"]},
+        {"text": "📊 Total2", "url": btc_lnk["total2"]},
+    ])
+
+    telegram_kb("\n".join(lines), btn_rows)
+    log(f"H2-Zusammenfassung gesendet: "
+        f"{len(shorts)} Short, {len(longs)} Long ({len(items)} total)")
+
+
 def start_webhook_server():
     """
     Startet einen Flask HTTP-Server in einem separaten Thread.
@@ -1953,7 +2054,9 @@ def start_webhook_server():
             entry = get_mark_price(symbol)
 
         signal_type = data.get("signal", "").upper()
-        log(f"\U0001f4e1 Alert: {symbol} {direction.upper()} @ {entry} [{timeframe}]")
+        premium     = int(float(data.get("premium", 0) or 0))  # 1 = Premium-Setup
+        log(f"\U0001f4e1 Alert: {symbol} {direction.upper()} @ {entry} "
+            f"[{timeframe}]{' ⭐Premium' if premium else ''}")
 
         # H4 Trigger → gepuffert, nach 5 Min gebündelt senden
         if timeframe == "H4" or signal_type == "H4_TRIGGER":
@@ -1970,40 +2073,30 @@ def start_webhook_server():
                     log(f"  H4 gepuffert ({len(h4_buffer)} im Puffer)")
             return jsonify({"status": "buffered", "symbol": symbol}), 200
 
-        # H2 Signal → H4 Puffer flushen dann sofort senden
+        # H2 Signal → H4-Puffer flushen, dann H2 puffern
         flush_h4_buffer()
-        balance   = get_futures_balance()
-        kelly     = kelly_recommendation(balance, WINRATE)
-        links     = tv_chart_links(symbol)
-        per_order = balance * 0.10 / 3
-        chk_dir   = "gr\u00fcner" if direction == "long" else "roter"
-        icon      = dir_icon(direction)
-        msg_parts = [
-            f"{icon} <b>H2 Signal \u2014 {symbol} {direction.upper()}</b>",
-            "\u2501" * 12,
-            f"Kurs: {entry}",
-            "",
-            "\U0001f4cb <b>DOMINUS Checkliste:</b>",
-            "\u2610 DOMINUS Impuls Extremzone erreicht?",
-            "\u2610 H4 Trigger best\u00e4tigt?",
-            "\u2610 HARSI nicht in Extremzone?",
-            "\u2610 BTC + Total2 gleiche Richtung?",
-            f"\u2610 Premium Setup? (Impuls dunkel{chk_dir})",
-            "",
-            f"\U0001f4b0 {balance:.0f} USDT  |  Pro Order: {per_order:.0f} USDT",
-            f"\U0001f4ca Kelly: {kelly['kelly_pct']}%",
-            "",
-            "\u23f1 <b>30-Min-Fenster l\u00e4uft!</b>",
-            f"/trade {symbol} {direction.upper()} [HEBEL] {entry:.5f} [SL]",
-            "",
-            "\U0001f4c8 Charts:",
-            f"H2 {symbol}: {links['coin_h2']}",
-            f"H4 {symbol}: {links['coin_h4']}",
-            f"BTC H2: {links['btc_h2']}",
-            f"Total2: {links['total2']}",
-        ]
-        telegram("\n".join(msg_parts))
-        return jsonify({"status": "ok", "symbol": symbol,
+        balance = get_futures_balance()
+        kelly   = kelly_recommendation(balance, WINRATE)
+
+        with h2_buffer_lock:
+            # Duplikate vermeiden (gleicher Coin + Richtung)
+            exists = any(
+                i["symbol"] == symbol and i["direction"] == direction
+                for i in h2_buffer
+            )
+            if not exists:
+                h2_buffer.append({
+                    "symbol":    symbol,
+                    "direction": direction,
+                    "entry":     entry,
+                    "premium":   premium,
+                    "balance":   balance,
+                    "kelly_pct": kelly["kelly_pct"],
+                    "ts":        time.time(),
+                })
+                log(f"  H2 gepuffert ({len(h2_buffer)} im Puffer)")
+
+        return jsonify({"status": "buffered", "symbol": symbol,
                         "direction": direction}), 200
 
     @app.route("/health", methods=["GET"])
@@ -2309,8 +2402,8 @@ def check_and_repair_position(pos: dict):
                     "stopLossTriggerType":  "mark_price",
                 }
                 if existing_tp4 > 0:
-                    body_sl["takeProfitTriggerPrice"] = round_price(existing_tp4, decimals)
-                    body_sl["takeProfitTriggerType"]  = "mark_price"
+                    body_sl["stopSurplusTriggerPrice"] = round_price(existing_tp4, decimals)
+                    body_sl["stopSurplusTriggerType"]  = "mark_price"
                 res = api_post("/api/v2/mix/order/place-pos-tpsl", body_sl)
                 if res.get("code") == "00000":
                     sl_price    = avg
@@ -2706,6 +2799,13 @@ def main():
                     oldest = min((i["ts"] for i in h4_buffer), default=0)
                 if oldest and __import__("time").time() - oldest >= H4_BUFFER_SEC:
                     flush_h4_buffer()
+
+            # H2 Puffer: nach H2_BUFFER_SEC senden (90s Sammelzeit)
+            if h2_buffer:
+                with h2_buffer_lock:
+                    oldest_h2 = min((i["ts"] for i in h2_buffer), default=0)
+                if oldest_h2 and time.time() - oldest_h2 >= H2_BUFFER_SEC:
+                    flush_h2_buffer()
 
             # ── 1. Neue Fills (Nachkäufe / Einstiege) ──────
             fills      = get_recent_fills_all(last_check_ms)
