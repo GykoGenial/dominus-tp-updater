@@ -142,6 +142,72 @@ def telegram(msg: str):
         pass
 
 
+def telegram_kb(msg: str, buttons: list):
+    """
+    Sendet Telegram-Nachricht mit Inline-Keyboard-Buttons.
+
+    buttons: Liste von Zeilen, jede Zeile ist eine Liste von Button-Dicts.
+    Button-Typen:
+      Callback: {"text": "Label", "callback_data": "/refresh BTCUSDT"}
+      URL:      {"text": "Label", "url": "https://..."}
+
+    Beispiel:
+      [[{"text": "🔄 Refresh", "callback_data": "/refresh BTCUSDT"}],
+       [{"text": "📊 H2", "url": "https://..."}, {"text": "📊 H4", "url": "..."}]]
+    """
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={
+                "chat_id":      TELEGRAM_CHAT_ID,
+                "text":         msg,
+                "parse_mode":   "HTML",
+                "reply_markup": {"inline_keyboard": buttons},
+            },
+            timeout=5
+        )
+    except Exception:
+        pass
+
+
+def answer_callback(callback_query_id: str, text: str = ""):
+    """Bestätigt Button-Klick (entfernt Spinner-Animation im Telegram)."""
+    if not TELEGRAM_TOKEN:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery",
+            json={"callback_query_id": callback_query_id, "text": text},
+            timeout=5
+        )
+    except Exception:
+        pass
+
+
+def chart_kb(symbol: str, include_btc: bool = True) -> list:
+    """
+    Erstellt Inline-Button-Zeilen für TradingView Chart-Links.
+    Gibt eine Liste von Button-Zeilen zurück (direkt für telegram_kb nutzbar).
+
+    include_btc=True  → zweite Zeile mit BTC H2 + Total2
+    include_btc=False → nur Coin-Zeile (H2 + H4)
+    """
+    lnk = tv_chart_links(symbol)
+    clean = symbol.replace("USDT", "")
+    rows = [[
+        {"text": f"📊 {clean} H2", "url": lnk["coin_h2"]},
+        {"text": f"📊 {clean} H4", "url": lnk["coin_h4"]},
+    ]]
+    if include_btc:
+        rows.append([
+            {"text": "📊 BTC H2",  "url": lnk["btc_h2"]},
+            {"text": "📊 Total2",  "url": lnk["total2"]},
+        ])
+    return rows
+
+
 def sign(timestamp: str, method: str, path: str, body: str = "") -> str:
     msg = timestamp + method.upper() + path + body
     sig = hmac.new(SECRET_KEY.encode(), msg.encode(), hashlib.sha256).digest()
@@ -1080,24 +1146,23 @@ def setup_new_trade(pos: dict):
         links = tv_chart_links(symbol)
         if res.get("code") == "00000":
             log(f"  ✓ Auto-SL gesetzt @ {sl_str} (-25% Schutz)")
-            telegram(
+            telegram_kb(
                 f"\U0001f6e1 <b>Auto-SL gesetzt \u2014 {symbol}</b>\n"
                 f"Kein SL gefunden \u2192 -25% Schutz aktiviert\n\n"
                 f"SL: {sl_str} USDT ({sl_dist:.1f}% Abstand)\n"
                 f"Hebel: {leverage}x | Entry: {entry}\n\n"
                 f"\u26a0\ufe0f Bitte pr\u00fcfen ob SL mit deiner\n"
-                f"Ausstiegslinie \u00fcbereinstimmt!\n\n"
-                f"H4 {symbol}: {links['coin_h4']}\n"
-                f"H2 {symbol}: {links['coin_h2']}"
+                f"Ausstiegslinie \u00fcbereinstimmt!",
+                chart_kb(symbol, include_btc=False)
             )
             sl_price = sl_auto
         else:
             log(f"  ✗ Auto-SL fehlgeschlagen: {res.get('msg', res)}")
-            telegram(
+            telegram_kb(
                 f"\u274c <b>Kein SL \u2014 {symbol}</b>\n"
                 f"Auto-SL fehlgeschlagen. Bitte manuell setzen!\n"
-                f"Empfehlung: {sl_str} USDT ({sl_dist:.1f}%)\n\n"
-                f"H4: {links['coin_h4']}"
+                f"Empfehlung: {sl_str} USDT ({sl_dist:.1f}%)",
+                chart_kb(symbol, include_btc=False)
             )
             cancel_all_tp_orders(symbol)
             time.sleep(1)
@@ -1191,15 +1256,10 @@ def setup_new_trade(pos: dict):
         + "\n".join(tp_prices) + "\n\n"
         f"💰 Margin/Order ≈ {order_margin:.2f} USDT\n"
         f"📊 Total ≈ {order_margin*3:.2f} USDT "
-        f"({order_margin*3/balance*100:.1f}% Kapital)\n\n"
-        f"📈 Charts:\n"
-        f"H2 {symbol}: {tv_chart_links(symbol)['coin_h2']}\n"
-        f"H4 {symbol}: {tv_chart_links(symbol)['coin_h4']}\n"
-        f"BTC H2: {tv_chart_links(symbol)['btc_h2']}\n"
-        f"Total2: {tv_chart_links(symbol)['total2']}"
+        f"({order_margin*3/balance*100:.1f}% Kapital)"
         if balance > 0 else ""
     )
-    telegram(msg)
+    telegram_kb(msg, chart_kb(symbol))
 
     status = "✓ Alle 4" if count == 4 else f"⚠ {count}/4"
     log(f"  {status} TPs gesetzt | "
@@ -1558,11 +1618,6 @@ def cmd_trade(parts: list):
     if warnings:
         lines += ["", "⚠️ <b>Warnungen:</b>"] + warnings
 
-    links       = tv_chart_links(symbol)
-    coin_h2_url = links["coin_h2"]
-    coin_h4_url = links["coin_h4"]
-    btc_url     = links["btc_h2"]
-    total2_url  = links["total2"]
     lines += [
         "",
         "✔︎ HARSI nicht in Extremzone?",
@@ -1571,14 +1626,8 @@ def cmd_trade(parts: list):
         "",
         "✅ Wenn ja: Market Order + SL auf Bitget setzen.",
         "Script setzt DCA + TPs automatisch.",
-        "",
-        "📈 Charts:",
-        f'H2 {symbol} (HARSI): {coin_h2_url}',
-        f'H4 {symbol} (Premium): {coin_h4_url}',
-        f'BTC H2 (Momentum): {btc_url}',
-        f'Total2 H2 (Altcoins): {total2_url}',
     ]
-    reply("\n".join(lines))
+    telegram_kb("\n".join(lines), chart_kb(symbol))
 
 
 def cmd_hilfe():
@@ -1609,7 +1658,7 @@ def cmd_hilfe():
 
 
 def cmd_status():
-    """Kurzer Positionsstatus."""
+    """Kurzer Positionsstatus mit Refresh-Buttons pro Position."""
     positions = get_all_positions()
     if not positions:
         reply("✅ Keine offenen Positionen.")
@@ -1628,7 +1677,20 @@ def cmd_status():
             f"{icon} {sym} {drct} {lev}x | "
             f"Qty={qty:.2f} | Mark={mark} | PnL={pnl:+.2f} USDT"
         )
-    reply("\n".join(lines))
+
+    # Refresh-Buttons: eine Zeile pro Position (max. 4 Buttons nebeneinander)
+    # Buttons in Zweier-Gruppen anordnen damit Schrift lesbar bleibt
+    syms = [p.get("symbol", "?") for p in positions]
+    btn_rows = []
+    for i in range(0, len(syms), 2):
+        row = []
+        for sym in syms[i:i+2]:
+            clean = sym.replace("USDT", "")
+            row.append({"text": f"🔄 {clean}", "callback_data": f"/refresh {sym}"})
+        btn_rows.append(row)
+    btn_rows.append([{"text": "🔄 Alle aktualisieren", "callback_data": "/refresh"}])
+
+    telegram_kb("\n".join(lines), btn_rows)
 
 
 def cmd_refresh(parts: list):
@@ -1708,6 +1770,31 @@ def poll_telegram_commands():
 
     updates = get_telegram_updates()
     for update in updates:
+
+        # ── Callback-Query (Button-Klick) ──────────────────────────────
+        cq = update.get("callback_query")
+        if cq:
+            cq_id   = cq.get("id", "")
+            cq_chat = str(cq.get("message", {}).get("chat", {}).get("id", ""))
+            cq_data = cq.get("data", "").strip()
+            if cq_chat == str(TELEGRAM_CHAT_ID) and cq_data.startswith("/"):
+                answer_callback(cq_id, "⏳ Wird ausgeführt…")
+                log(f"Telegram Button-Klick: {cq_data}")
+                cq_parts = cq_data.split()
+                cq_cmd   = cq_parts[0].lower()
+                if cq_cmd == "/refresh":
+                    cmd_refresh(cq_parts)
+                elif cq_cmd == "/status":
+                    cmd_status()
+                elif cq_cmd == "/berechnen":
+                    cmd_berechnen()
+                elif cq_cmd == "/trade":
+                    cmd_trade(cq_parts)
+            else:
+                answer_callback(cq_id)
+            continue
+
+        # ── Normale Text-Nachricht ─────────────────────────────────────
         msg = update.get("message") or update.get("edited_message")
         if not msg:
             continue
@@ -1767,28 +1854,33 @@ def flush_h4_buffer():
     if longs:
         lines.append("🟢↗️ <b>LONG:</b>")
         for item in longs:
-            lnk = tv_chart_links(item["symbol"])
             lines.append(f"  \u2022 {item['symbol']}  @ {item['entry']:.5f}")
-            lines.append(f"    {lnk['coin_h4']}")
     if longs and shorts:
         lines.append("")
     if shorts:
         lines.append("🔴↘️ <b>SHORT:</b>")
         for item in shorts:
-            lnk = tv_chart_links(item["symbol"])
             lines.append(f"  \u2022 {item['symbol']}  @ {item['entry']:.5f}")
-            lines.append(f"    {lnk['coin_h4']}")
 
-    btc_lnk = tv_chart_links("BTCUSDT")
-    lines += [
-        "",
-        "\u23f1 H2-Alarm f\u00fcr relevante Coins aktivieren",
-        "",
-        "\U0001f4c8 Markt:",
-        f"BTC H2: {btc_lnk['btc_h2']}",
-        f"Total2: {btc_lnk['total2']}",
-    ]
-    telegram("\n".join(lines))
+    lines += ["", "\u23f1 H2-Alarm f\u00fcr relevante Coins aktivieren"]
+
+    # Chart-Buttons: je ein H4-Button pro Coin + BTC/Total2-Zeile
+    btc_lnk  = tv_chart_links("BTCUSDT")
+    all_items = longs + shorts
+    btn_rows = []
+    for i in range(0, len(all_items), 2):
+        row = []
+        for item in all_items[i:i+2]:
+            lnk   = tv_chart_links(item["symbol"])
+            clean = item["symbol"].replace("USDT", "")
+            icon  = "🟢" if item["direction"] == "long" else "🔴"
+            row.append({"text": f"{icon} {clean} H4", "url": lnk["coin_h4"]})
+        btn_rows.append(row)
+    btn_rows.append([
+        {"text": "📊 BTC H2",  "url": btc_lnk["btc_h2"]},
+        {"text": "📊 Total2",  "url": btc_lnk["total2"]},
+    ])
+    telegram_kb("\n".join(lines), btn_rows)
     log(f"H4-Zusammenfassung gesendet: {len(longs)} Long, {len(shorts)} Short")
 
 
@@ -2558,8 +2650,11 @@ def report_position_startup(pos: dict):
             f"━━━━━━━━━━━━\n"
         )
         body = "\n".join(issues)
-        telegram(header + body)
-        telegram(f"<code>/refresh {symbol}</code>")
+        telegram_kb(
+            header + body,
+            [[{"text": f"🔄 /refresh {symbol}", "callback_data": f"/refresh {symbol}"}]]
+            + chart_kb(symbol, include_btc=False)
+        )
         log(f"  ⚠ {len(issues)} Problem(e) → Telegram gesendet")
     else:
         log(f"  ✓ Kein Handlungsbedarf erkannt")
