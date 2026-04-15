@@ -1156,6 +1156,20 @@ def tv_chart_links(symbol: str) -> dict:
     }
 
 
+def chart_links_html(symbol: str) -> str:
+    """Gibt alle 4 Chart-Links als kompakte HTML-Zeile zurück.
+    Beispiel: 📊 <a href="...">H2</a>  <a href="...">H4</a>  <a href="...">BTC H2</a>  <a href="...">Total2</a>
+    """
+    lnk  = tv_chart_links(symbol)
+    short = symbol.replace("USDT", "")
+    return (
+        f'📊 <a href="{lnk["coin_h2"]}">{short} H2</a>  '
+        f'<a href="{lnk["coin_h4"]}">{short} H4</a>  '
+        f'<a href="{lnk["btc_h2"]}">BTC H2</a>  '
+        f'<a href="{lnk["total2"]}">Total2</a>'
+    )
+
+
 def setup_new_trade(pos: dict):
     """
     Vollständiges Setup für einen neuen Trade:
@@ -1255,13 +1269,11 @@ def setup_new_trade(pos: dict):
             sl_dist  = abs(entry - sl_auto) / entry * 100
 
             log(f"  ⚠ Kein SL — {SL_NEW_GRACE}s-Buffer aktiv (Auto-SL @ {sl_str} in {SL_NEW_GRACE//60} Min)")
-            links = tv_chart_links(symbol)
             telegram(
                 f"⏳ <b>Kein SL — {symbol}</b>\n"
                 f"Bitte SL in den nächsten {SL_NEW_GRACE//60} Min manuell setzen.\n"
                 f"Auto-SL Empfehlung: {sl_str} USDT ({sl_dist:.1f}% Abstand)\n\n"
-                f"H4: {links['coin_h4']}\n"
-                f"H2: {links['coin_h2']}"
+                + chart_links_html(symbol)
             )
             # Erster-Gesehen-Timestamp für check_and_repair_position
             if symbol not in sl_first_seen:
@@ -1359,12 +1371,7 @@ def setup_new_trade(pos: dict):
         f"💰 Margin/Order ≈ {order_margin:.2f} USDT\n"
         f"📊 Total ≈ {order_margin*3:.2f} USDT "
         f"({order_margin*3/balance*100:.1f}% Kapital)\n\n"
-        f"📈 Charts:\n"
-        f"H2 {symbol}: {tv_chart_links(symbol)['coin_h2']}\n"
-        f"H4 {symbol}: {tv_chart_links(symbol)['coin_h4']}\n"
-        f"BTC H2: {tv_chart_links(symbol)['btc_h2']}\n"
-        f"Total2: {tv_chart_links(symbol)['total2']}"
-        if balance > 0 else ""
+        + ("\n\n" + chart_links_html(symbol) if balance > 0 else "")
     )
     telegram(msg)
 
@@ -1730,11 +1737,6 @@ def cmd_trade(parts: list):
     if warnings:
         lines += ["", "⚠️ <b>Warnungen:</b>"] + warnings
 
-    links       = tv_chart_links(symbol)
-    coin_h2_url = links["coin_h2"]
-    coin_h4_url = links["coin_h4"]
-    btc_url     = links["btc_h2"]
-    total2_url  = links["total2"]
     lines += [
         "",
         "✔︎ HARSI nicht in Extremzone?",
@@ -1744,11 +1746,7 @@ def cmd_trade(parts: list):
         "✅ Wenn ja: Market Order + SL auf Bitget setzen.",
         "Script setzt DCA + TPs automatisch.",
         "",
-        "📈 Charts:",
-        f'H2 {symbol} (HARSI): {coin_h2_url}',
-        f'H4 {symbol} (Premium): {coin_h4_url}',
-        f'BTC H2 (Momentum): {btc_url}',
-        f'Total2 H2 (Altcoins): {total2_url}',
+        chart_links_html(symbol),
     ]
     reply("\n".join(lines))
 
@@ -1921,11 +1919,7 @@ def _send_h2_trade_detail(symbol: str, direction: str, entry: float,
         "⏱ <b>30-Min-Fenster läuft!</b>",
         f"/trade {symbol} {direction.upper()} [HEBEL] {entry:.5f} [SL]",
         "",
-        "📈 Charts:",
-        f"H2 {symbol}: {links['coin_h2']}",
-        f"H4 {symbol}: {links['coin_h4']}",
-        f"BTC H2: {links['btc_h2']}",
-        f"Total2: {links['total2']}",
+        chart_links_html(symbol),
     ])
     telegram(msg)
 
@@ -1964,6 +1958,23 @@ def poll_telegram_commands():
                     entry_str = parts[3]
                     is_prem   = len(parts) == 5 and parts[4] == "1"
                     _send_h2_trade_detail(sym, drct, float(entry_str or 0), premium=is_prem)
+
+            elif cb_data.startswith("trade_hint:"):
+                # Format: trade_hint:SYMBOL:direction:leverage:entry:sl
+                # Sendet fertigen /trade-Befehl als kopierbaren Code-Block
+                parts = cb_data.split(":", 5)
+                if len(parts) == 6:
+                    _sym  = parts[1]
+                    _drct = parts[2].upper()
+                    _lev  = parts[3]
+                    _ent  = parts[4]
+                    _sl   = parts[5]
+                    reply(
+                        f"📋 <b>Trade-Vorschlag</b>\n"
+                        f"<code>/trade {_sym} {_drct} {_lev} {_ent} {_sl}</code>\n\n"
+                        f"Hebel: {_lev}x (Standard) · SL: {_sl} USDT\n"
+                        f"Passe Hebel und SL nach deiner Ausstiegslinie an."
+                    )
             elif cb_data == "cmd:berechnen":
                 cmd_berechnen()
             elif cb_data == "cmd:status":
@@ -2033,25 +2044,32 @@ def flush_h4_buffer():
         lines.append("🟢↗️ <b>LONG:</b>")
         for item in longs:
             lnk = tv_chart_links(item["symbol"])
-            lines.append(f"  \u2022 {item['symbol']}  @ {item['entry']:.5f}")
-            lines.append(f"    {lnk['coin_h4']}")
+            short_s = item["symbol"].replace("USDT","")
+            lines.append(
+                f'  \u2022 <a href="{lnk["coin_h4"]}">{short_s} H4</a>'
+                f'  <a href="{lnk["coin_h2"]}">{short_s} H2</a>'
+                f'  @ {item["entry"]:.5f}'
+            )
     if longs and shorts:
         lines.append("")
     if shorts:
         lines.append("🔴↘️ <b>SHORT:</b>")
         for item in shorts:
             lnk = tv_chart_links(item["symbol"])
-            lines.append(f"  \u2022 {item['symbol']}  @ {item['entry']:.5f}")
-            lines.append(f"    {lnk['coin_h4']}")
+            short_s = item["symbol"].replace("USDT","")
+            lines.append(
+                f'  \u2022 <a href="{lnk["coin_h4"]}">{short_s} H4</a>'
+                f'  <a href="{lnk["coin_h2"]}">{short_s} H2</a>'
+                f'  @ {item["entry"]:.5f}'
+            )
 
     btc_lnk = tv_chart_links("BTCUSDT")
     lines += [
         "",
-        "\u23f1 H2-Alarm f\u00fcr relevante Coins aktivieren",
+        "⏱ H2-Alarm für relevante Coins aktivieren",
         "",
-        "\U0001f4c8 Markt:",
-        f"BTC H2: {btc_lnk['btc_h2']}",
-        f"Total2: {btc_lnk['total2']}",
+        f'📈 <a href="{btc_lnk["btc_h2"]}">BTC H2</a>  '
+        f'<a href="{btc_lnk["total2"]}">Total2</a>',
     ]
     telegram("\n".join(lines))
     log(f"H4-Zusammenfassung gesendet: {len(longs)} Long, {len(shorts)} Short")
@@ -2185,41 +2203,48 @@ def flush_h2_buffer():
         f"<a href=\"{btc_lnk['total2']}\">Total2</a>",
     ]
 
-    # ── InlineKeyboard — URL-Links zu TradingView Charts ─────────────────────
-    # Jeder Button öffnet den H2-Chart des Coins direkt (wie in /berechnen).
-    # Einheitliches Label: 🔴↘️[⭐] COINNAME  /  🟢↗️[⭐] COINNAME
-    # (gleiche Beschriftung unabhängig von halber oder ganzer Breite)
-    #
-    # Dynamische Breite:
-    #   ≤ 4 Signale → 1 Button/Zeile (volle Breite)
-    #   > 4 Signale → 2 Buttons/Zeile (halbe Breite)
-    n         = len(ordered)
-    use_2cols = n > 4
+    # ── InlineKeyboard ────────────────────────────────────────────────────────
+    # Jede Zeile = 2 Buttons nebeneinander:
+    #   Links:  Chart-Button  [🔴↘️[⭐] COINNAME]  → H2-Chart URL
+    #   Rechts: /trade-Vorschlag [📋 10x · SL 0.xxxx] → callback → Bot sendet
+    #           den fertigen /trade-Befehl mit Default-Hebel 10 und SL -25%/Hebel
     keyboard  = []
+    _lev_default = 10
+    _factor      = 0.25 / _lev_default   # 2.5% bei Hebel 10
 
-    def _btn(item):
+    def _btn_pair(item):
         sym       = item["symbol"]
         drct      = item["direction"]
         prem      = item.get("premium", False)
         short_sym = sym.replace("USDT", "")
-        icon      = ("🔴↘️⭐" if prem else "🔴↘️") if drct == "short" \
-                    else ("🟢↗️⭐" if prem else "🟢↗️")
-        label     = f"{icon} {short_sym}"          # einheitlich: gleich für 1- und 2-spaltig
-        url       = tv_chart_links(sym)["coin_h2"]  # direkt zum H2-Chart
-        return {"text": label, "url": url}
+        entry_val = float(item.get("entry", 0))
+        decimals  = get_price_decimals(sym)
 
-    if use_2cols:
-        row = []
-        for item in ordered:
-            row.append(_btn(item))
-            if len(row) == 2:
-                keyboard.append(row)
-                row = []
-        if row:
-            keyboard.append(row)
-    else:
-        for item in ordered:
-            keyboard.append([_btn(item)])
+        # Chart-Button
+        icon  = ("🔴↘️⭐" if prem else "🔴↘️") if drct == "short" \
+                else ("🟢↗️⭐" if prem else "🟢↗️")
+        chart_btn = {
+            "text": f"{icon} {short_sym}",
+            "url":  tv_chart_links(sym)["coin_h2"],
+        }
+
+        # /trade-Vorschlag Button (Default: Hebel 10, SL -25%/Hebel)
+        if entry_val > 0:
+            sl_val = entry_val * (1 - _factor) if drct == "long" \
+                     else entry_val * (1 + _factor)
+            entry_str = round_price(entry_val, decimals)
+            sl_str    = round_price(sl_val,    decimals)
+        else:
+            entry_str = "0"
+            sl_str    = "0"
+        trade_btn = {
+            "text":          f"📋 {_lev_default}x · SL {sl_str}",
+            "callback_data": f"trade_hint:{sym}:{drct}:{_lev_default}:{entry_str}:{sl_str}",
+        }
+        return [chart_btn, trade_btn]
+
+    for item in ordered:
+        keyboard.append(_btn_pair(item))
 
     # Unterste Zeile: BTC + Total2 Charts (wie in /berechnen)
     btc_lnk2 = tv_chart_links("BTCUSDT")
@@ -2396,11 +2421,7 @@ def start_webhook_server():
             "⏱ <b>30-Min-Fenster läuft!</b>",
             f"/trade {symbol} {direction.upper()} [HEBEL] {entry:.5f} [SL]",
             "",
-            "📈 Charts:",
-            f"H2 {symbol}: {links['coin_h2']}",
-            f"H4 {symbol}: {links['coin_h4']}",
-            f"BTC H2: {links['btc_h2']}",
-            f"Total2: {links['total2']}",
+            chart_links_html(symbol),
         ]
         telegram("\n".join(msg_parts))
         return jsonify({"status": "ok", "symbol": symbol,
