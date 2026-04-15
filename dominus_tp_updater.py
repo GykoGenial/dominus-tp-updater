@@ -290,13 +290,21 @@ def get_recent_fills_all(since_ms: int) -> list:
 
 def _get_plan_orders(symbol: str) -> list:
     """
-    Liest alle offenen Plan-Orders (TPs, SL) für ein Symbol.
+    Liest alle offenen TPSL-Orders (profit_plan / loss_plan) für ein Symbol.
 
-    Bitget v2 bietet zwei relevante Endpoints — beide werden versucht:
-      1. orders-plan-pending  (mit / ohne marginCoin, mit / ohne symbol)
-      2. tpsl-pending-orders  (als Fallback)
+    Bitget v2: orders-plan-pending benötigt planType=profit_loss für TPSL-Orders.
+    Ohne planType liefert die API "Parameter verification failed".
 
-    Deckt ab: profit_plan (TP1-TP3), loss_plan / pos_loss (SL).
+    Gültige planType-Werte für orders-plan-pending:
+      normal_plan  → reguläre Trigger-Orders (Entry)
+      profit_loss  → TPSL-Orders (TP + SL zusammen) ← das brauchen wir
+      track_plan   → Trailing-Stop-Orders
+
+    Zurückgegebene planType-Felder in den Orders:
+      profit_plan  → TP-Order (TP1–TP3 via place-tpsl-order)
+      loss_plan    → SL-Order (plan-basiert)
+      pos_loss     → SL via place-pos-tpsl (position-level)
+      pos_profit   → TP via place-pos-tpsl (TP4)
     """
     def _parse(raw) -> list:
         if isinstance(raw, list):
@@ -304,37 +312,44 @@ def _get_plan_orders(symbol: str) -> list:
         if isinstance(raw, dict):
             for key in ("entrustedList", "planList", "orderList", "data"):
                 lst = raw.get(key)
-                if isinstance(lst, list) and lst:
+                if isinstance(lst, list):
                     return lst
             # leeres dict aber code 00000 → leere Liste ist korrekt
             return []
         return []
 
-    # Versuch 1: orders-plan-pending mit symbol + marginCoin
+    # Versuch 1: profit_loss planType mit Symbol
     r = api_get("/api/v2/mix/order/orders-plan-pending", {
         "productType": PRODUCT_TYPE,
         "symbol":      symbol,
-        "marginCoin":  MARGIN_COIN,
+        "planType":    "profit_loss",
     })
     if r.get("code") == "00000":
-        return _parse(r.get("data"))
+        orders = _parse(r.get("data"))
+        log(f"  [plan-orders] {len(orders)} TPSL-Orders für {symbol} (Versuch 1)")
+        return orders
 
-    # Versuch 2: orders-plan-pending nur mit productType (dann symbol-Filter in Python)
+    # Versuch 2: profit_loss planType ohne Symbol (Python-Filter)
     r2 = api_get("/api/v2/mix/order/orders-plan-pending", {
         "productType": PRODUCT_TYPE,
+        "planType":    "profit_loss",
     })
     if r2.get("code") == "00000":
         all_orders = _parse(r2.get("data"))
-        return [o for o in all_orders if o.get("symbol") == symbol]
+        orders = [o for o in all_orders if o.get("symbol") == symbol]
+        log(f"  [plan-orders] {len(orders)}/{len(all_orders)} TPSL-Orders für {symbol} (Versuch 2)")
+        return orders
 
-    # Versuch 3: tpsl-pending-orders mit marginCoin
-    r3 = api_get("/api/v2/mix/order/tpsl-pending-orders", {
-        "symbol":      symbol,
+    # Versuch 3: ohne planType + Symbol (ältere API-Versionen)
+    r3 = api_get("/api/v2/mix/order/orders-plan-pending", {
         "productType": PRODUCT_TYPE,
+        "symbol":      symbol,
         "marginCoin":  MARGIN_COIN,
     })
     if r3.get("code") == "00000":
-        return _parse(r3.get("data"))
+        orders = _parse(r3.get("data"))
+        log(f"  [plan-orders] {len(orders)} Orders für {symbol} (Versuch 3)")
+        return orders
 
     log(f"  [WARN] Alle Plan-Order Endpoints für {symbol} fehlgeschlagen: "
         f"1={r.get('msg','?')} | 2={r2.get('msg','?')} | 3={r3.get('msg','?')}")
@@ -439,31 +454,37 @@ def kelly_recommendation(balance: float, winrate: float) -> dict:
 
 def cancel_all_tp_orders(symbol: str):
     """
-    Storniert alle TP-Orders (profit_plan) für ein Symbol.
-    Liest via orders-plan-pending, storniert via cancel-plan-order.
+    Storniert alle TP-Orders (profit_plan / pos_profit) für ein Symbol.
+    Liest via orders-plan-pending (planType=profit_loss), storniert via cancel-plan-order.
     SL-Typen (loss_plan, pos_loss) werden nie angefasst.
+
+    Bitget v2 cancel-plan-order erwartet orderIdList (Array), nicht einzelne orderId.
     """
+    TP_TYPES = {"profit_plan", "pos_profit"}
     orders = _get_plan_orders(symbol)
-    tp_orders = [o for o in orders if o.get("planType") == "profit_plan"]
+    tp_orders = [o for o in orders if o.get("planType") in TP_TYPES]
 
     if not tp_orders:
-        log(f"  Keine TP-Orders gefunden")
+        log(f"  Keine TP-Orders gefunden (von {len(orders)} plan-orders)")
         return
 
-    log(f"  {len(tp_orders)} TP(s) stornieren...")
+    log(f"  {len(tp_orders)} TP(s) stornieren (von {len(orders)} plan-orders)...")
     for order in tp_orders:
-        oid   = order.get("orderId")
-        price = order.get("triggerPrice", "?")
-        res   = api_post("/api/v2/mix/order/cancel-plan-order", {
+        oid      = order.get("orderId")
+        price    = order.get("triggerPrice", "?")
+        ptype    = order.get("planType", "?")
+        # Bitget v2 cancel-plan-order: orderIdList ist ein Array von {orderId: ...}
+        res = api_post("/api/v2/mix/order/cancel-plan-order", {
             "symbol":      symbol,
             "productType": PRODUCT_TYPE,
             "marginCoin":  MARGIN_COIN,
-            "orderId":     oid,
+            "planType":    ptype,
+            "orderIdList": [{"orderId": oid}],
         })
         if res.get("code") == "00000":
-            log(f"    ✓ TP storniert @ {price}: {oid}")
+            log(f"    ✓ TP storniert [{ptype}] @ {price}: {oid}")
         else:
-            log(f"    ✗ Fehler: {res.get('msg', res)}")
+            log(f"    ✗ Fehler [{ptype}] @ {price}: {res.get('msg', res)}")
 
 
 def calc_tp_price(avg: float, roi: float,
