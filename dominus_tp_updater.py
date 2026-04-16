@@ -3280,16 +3280,23 @@ def main():
                             log(f"Neuer Trade erkannt: {sym}")
                             setup_new_trade(pos)
 
-                    # TP1-Erkennung: Grösse ~25% kleiner → SL auf Entry
+                    # TP1-Erkennung: Grösse ≥ 13% kleiner als Peak → SL auf Entry
+                    # TP1 schliesst 15% der Position → verbleibend = 85%.
+                    # Threshold 0.87 statt 0.85 damit 85% < 87% → True.
+                    # peak_size statt kno_size: bei DCA wird kno_size grösser,
+                    # aber TP1 schliesst nur % der Original-Grösse → mit kno_size
+                    # wird die Reduktion relativ zu klein und nie erkannt.
                     elif (kno_size > 0
-                            and cur_size < kno_size * 0.85
                             and not sl_at_entry.get(sym, False)):
-                        red = (kno_size - cur_size) / kno_size * 100
-                        log(f"TP1 erkannt ({sym}): "
-                            f"{kno_size:.2f} → {cur_size:.2f} "
-                            f"(-{red:.0f}%) → SL auf Entry")
-                        set_sl_at_entry(sym, direction, cur_avg)
-                        last_known_size[sym] = cur_size
+                        peak = trade_data.get(sym, {}).get("peak_size", kno_size)
+                        ref  = peak if peak > 0 else kno_size
+                        if cur_size < ref * 0.87:
+                            red = (ref - cur_size) / ref * 100
+                            log(f"TP1 erkannt ({sym}): "
+                                f"peak={ref:.2f} → jetzt={cur_size:.2f} "
+                                f"(-{red:.0f}%) → SL auf Entry")
+                            set_sl_at_entry(sym, direction, cur_avg)
+                            last_known_size[sym] = cur_size
 
                     # Grösse aktualisieren (Position teilweise geschlossen)
                     elif kno_size > 0 and cur_size != kno_size:
