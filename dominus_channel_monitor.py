@@ -8,11 +8,12 @@ Sendet bei neuen Coins eine aktualisierte TradingView-Watchlist
 als importierbare .txt-Datei per Telegram.
 
 Benötigte Railway-Variablen:
-  TELEGRAM_CHAT_ID        → Deine Chat-ID (= Telegram API ID)
+  TELEGRAM_API_ID         → my.telegram.org API ID
   TELEGRAM_API_HASH       → my.telegram.org API Hash
   DOMINUS_SESSION_STRING  → Telethon StringSession
   DOMINUS_CHANNEL_LINK    → Kanal-Einladungslink (t.me/+...)
   TELEGRAM_TOKEN          → Bot-Token
+  TELEGRAM_CHAT_ID        → Deine Chat-ID
 ════════════════════════════════════════════════════════════════
 """
 
@@ -26,12 +27,12 @@ logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(message)s", date
 log = logging.getLogger("dominus_monitor")
 
 # ── Konfiguration ────────────────────────────────────────────────
-CHAT_ID        = os.environ["TELEGRAM_CHAT_ID"]
-API_ID         = int(CHAT_ID)               # gleicher Wert wie TELEGRAM_CHAT_ID
+API_ID         = int(os.environ["TELEGRAM_API_ID"])
 API_HASH       = os.environ["TELEGRAM_API_HASH"]
 SESSION_STRING = os.environ["DOMINUS_SESSION_STRING"]
 CHANNEL_LINK   = os.environ["DOMINUS_CHANNEL_LINK"]
 BOT_TOKEN      = os.environ["TELEGRAM_TOKEN"]
+CHAT_ID        = os.environ["TELEGRAM_CHAT_ID"]
 
 STATE_FILE     = "/tmp/dominus_watchlist.json"
 SYMBOL_CACHE_TTL = 6 * 3600   # Exchange-Listen alle 6h neu laden
