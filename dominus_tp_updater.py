@@ -3084,13 +3084,17 @@ def report_position_startup(pos: dict):
     tp1_done = state["tp1_price_hit"] or fill_tp1
 
     # Trade-Daten für Polling-Loop speichern
+    # SL aus geladenem State erhalten (load_state hat ihn korrekt geladen —
+    # nicht mit 0 überschreiben, sonst geht der SL-Fallback für TP4 verloren)
+    _existing_sl   = trade_data.get(symbol, {}).get("sl", 0)
+    _existing_open = trade_data.get(symbol, {}).get("open_ts", int(time.time() * 1000))
     trade_data[symbol] = {
         "entry":     avg,
         "direction": direction,
         "leverage":  leverage,
-        "sl":        0,   # nicht lesbar via API
+        "sl":        _existing_sl,   # aus State erhalten, nicht überschreiben
         "peak_size": size,
-        "open_ts":   int(time.time() * 1000),
+        "open_ts":   _existing_open,
     }
     if tp1_done:
         sl_at_entry[symbol] = False   # unklar, da SL nicht lesbar
