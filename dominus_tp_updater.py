@@ -110,11 +110,9 @@ last_update_id:   int  = 0    # Telegram: letzter verarbeiteter Update-ID
 pending_trade: dict = {}
 
 # Timestamps — verhindern wiederholtes Neu-Setzen wenn Bitget SL/TPs nicht zurückliefert
-sl_set_ts:     dict = {}  # {symbol: unix_ts}  — wann SL zuletzt erfolgreich gesetzt
-tp_set_ts:     dict = {}  # {symbol: unix_ts}  — wann TPs zuletzt erfolgreich gesetzt
-sl_first_seen: dict = {}  # {symbol: unix_ts}  — wann neuer Trade ohne SL erstmals gesehen
-SL_TP_GRACE  = int(os.environ.get("SL_TP_GRACE",   "1800"))  # 30 Min: nach erfolgreichem SL-Set
-SL_NEW_GRACE = int(os.environ.get("SL_NEW_GRACE",   "300"))  # 5 Min:  neuer Trade, SL noch nie gesetzt
+sl_set_ts:  dict = {}  # {symbol: unix_ts}  — wann SL zuletzt erfolgreich gesetzt
+tp_set_ts:  dict = {}  # {symbol: unix_ts}  — wann TPs zuletzt erfolgreich gesetzt
+SL_TP_GRACE = int(os.environ.get("SL_TP_GRACE", "1800"))  # 30 Min Schutzfenster
 
 # Trade-Daten für Auswertung bei Abschluss
 # {symbol: {entry, direction, leverage, sl, peak_size, open_ts}}
@@ -124,17 +122,6 @@ trade_data: dict = {}
 h4_buffer:     list = []
 h4_buffer_lock = __import__("threading").Lock()
 H4_BUFFER_SEC  = int(os.environ.get("H4_BUFFER_SEC", "300"))  # 5 Min
-
-# H2 Trigger-Puffer: sammelt Alerts, sendet gebündelt nach kurzem Zeitfenster
-h2_buffer:      list = []
-h2_buffer_lock  = __import__("threading").Lock()
-h2_flush_timer  = None   # threading.Timer — löst Flush nach H2_BUFFER_SEC aus
-H2_BUFFER_SEC   = int(os.environ.get("H2_BUFFER_SEC", "30"))   # 30 Sekunden
-
-# BTC + Total2 Trend-Tracker: letzter bekannter H4-Trend (aus Webhook)
-# Wird in flush_h2_buffer verwendet um Signale im herrschenden Trend zuerst zu zeigen.
-btc_trend:    str = ""   # "long" / "short" / "" — letzter BTC H4-Trend
-total2_trend: str = ""   # "long" / "short" / "" — letzter Total2 H4-Trend
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -158,30 +145,6 @@ def telegram(msg: str):
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
             json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"},
-            timeout=5
-        )
-    except Exception:
-        pass
-
-
-def telegram_with_buttons(msg: str, keyboard: list):
-    """
-    Sendet Telegram-Nachricht mit InlineKeyboard-Buttons.
-
-    keyboard ist eine Liste von Zeilen, jede Zeile eine Liste von Button-Dicts:
-      [[{"text": "Label", "callback_data": "data"}], [...]]
-    """
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={
-                "chat_id":      TELEGRAM_CHAT_ID,
-                "text":         msg,
-                "parse_mode":   "HTML",
-                "reply_markup": {"inline_keyboard": keyboard},
-            },
             timeout=5
         )
     except Exception:
@@ -327,13 +290,21 @@ def get_recent_fills_all(since_ms: int) -> list:
 
 def _get_plan_orders(symbol: str) -> list:
     """
-    Liest alle offenen Plan-Orders (TPs, SL) für ein Symbol.
+    Liest alle offenen TPSL-Orders (profit_plan / loss_plan) für ein Symbol.
 
-    Bitget v2 bietet zwei relevante Endpoints — beide werden versucht:
-      1. orders-plan-pending  (mit / ohne marginCoin, mit / ohne symbol)
-      2. tpsl-pending-orders  (als Fallback)
+    Bitget v2: orders-plan-pending benötigt planType=profit_loss für TPSL-Orders.
+    Ohne planType liefert die API "Parameter verification failed".
 
-    Deckt ab: profit_plan (TP1-TP3), loss_plan / pos_loss (SL).
+    Gültige planType-Werte für orders-plan-pending:
+      normal_plan  → reguläre Trigger-Orders (Entry)
+      profit_loss  → TPSL-Orders (TP + SL zusammen) ← das brauchen wir
+      track_plan   → Trailing-Stop-Orders
+
+    Zurückgegebene planType-Felder in den Orders:
+      profit_plan  → TP-Order (TP1–TP3 via place-tpsl-order)
+      loss_plan    → SL-Order (plan-basiert)
+      pos_loss     → SL via place-pos-tpsl (position-level)
+      pos_profit   → TP via place-pos-tpsl (TP4)
     """
     def _parse(raw) -> list:
         if isinstance(raw, list):
@@ -341,37 +312,44 @@ def _get_plan_orders(symbol: str) -> list:
         if isinstance(raw, dict):
             for key in ("entrustedList", "planList", "orderList", "data"):
                 lst = raw.get(key)
-                if isinstance(lst, list) and lst:
+                if isinstance(lst, list):
                     return lst
             # leeres dict aber code 00000 → leere Liste ist korrekt
             return []
         return []
 
-    # Versuch 1: orders-plan-pending mit symbol + marginCoin
+    # Versuch 1: profit_loss planType mit Symbol
     r = api_get("/api/v2/mix/order/orders-plan-pending", {
         "productType": PRODUCT_TYPE,
         "symbol":      symbol,
-        "marginCoin":  MARGIN_COIN,
+        "planType":    "profit_loss",
     })
     if r.get("code") == "00000":
-        return _parse(r.get("data"))
+        orders = _parse(r.get("data"))
+        log(f"  [plan-orders] {len(orders)} TPSL-Orders für {symbol} (Versuch 1)")
+        return orders
 
-    # Versuch 2: orders-plan-pending nur mit productType (dann symbol-Filter in Python)
+    # Versuch 2: profit_loss planType ohne Symbol (Python-Filter)
     r2 = api_get("/api/v2/mix/order/orders-plan-pending", {
         "productType": PRODUCT_TYPE,
+        "planType":    "profit_loss",
     })
     if r2.get("code") == "00000":
         all_orders = _parse(r2.get("data"))
-        return [o for o in all_orders if o.get("symbol") == symbol]
+        orders = [o for o in all_orders if o.get("symbol") == symbol]
+        log(f"  [plan-orders] {len(orders)}/{len(all_orders)} TPSL-Orders für {symbol} (Versuch 2)")
+        return orders
 
-    # Versuch 3: tpsl-pending-orders mit marginCoin
-    r3 = api_get("/api/v2/mix/order/tpsl-pending-orders", {
-        "symbol":      symbol,
+    # Versuch 3: ohne planType + Symbol (ältere API-Versionen)
+    r3 = api_get("/api/v2/mix/order/orders-plan-pending", {
         "productType": PRODUCT_TYPE,
+        "symbol":      symbol,
         "marginCoin":  MARGIN_COIN,
     })
     if r3.get("code") == "00000":
-        return _parse(r3.get("data"))
+        orders = _parse(r3.get("data"))
+        log(f"  [plan-orders] {len(orders)} Orders für {symbol} (Versuch 3)")
+        return orders
 
     log(f"  [WARN] Alle Plan-Order Endpoints für {symbol} fehlgeschlagen: "
         f"1={r.get('msg','?')} | 2={r2.get('msg','?')} | 3={r3.get('msg','?')}")
@@ -474,33 +452,65 @@ def kelly_recommendation(balance: float, winrate: float) -> dict:
     }
 
 
-def cancel_all_tp_orders(symbol: str):
+def cancel_all_tp_orders(symbol: str, stored_ids: list = None):
     """
-    Storniert alle TP-Orders (profit_plan) für ein Symbol.
-    Liest via orders-plan-pending, storniert via cancel-plan-order.
+    Storniert alle TP-Orders für ein Symbol.
+
+    Primär: Direktstornierung via gespeicherte Order-IDs (stored_ids aus trade_data).
+            Umgeht den defekten orders-plan-pending Endpoint — verhindert TP-Duplikate.
+    Fallback: Liest via orders-plan-pending und storniert gefundene profit_plan-Orders.
+
     SL-Typen (loss_plan, pos_loss) werden nie angefasst.
     """
-    orders = _get_plan_orders(symbol)
-    tp_orders = [o for o in orders if o.get("planType") == "profit_plan"]
+    TP_TYPES = {"profit_plan", "pos_profit"}
+    cancelled = set()
 
-    if not tp_orders:
+    # ── Primär: Stornierung via gespeicherte IDs ──────────────────
+    if stored_ids:
+        log(f"  {len(stored_ids)} gespeicherte TP-ID(s) direkt stornieren...")
+        for oid in stored_ids:
+            if not oid:
+                continue
+            res = api_post("/api/v2/mix/order/cancel-plan-order", {
+                "symbol":      symbol,
+                "productType": PRODUCT_TYPE,
+                "marginCoin":  MARGIN_COIN,
+                "planType":    "profit_plan",
+                "orderIdList": [{"orderId": str(oid)}],
+            })
+            if res.get("code") == "00000":
+                log(f"    ✓ TP storniert (ID {oid})")
+                cancelled.add(str(oid))
+            else:
+                # Bereits ausgelöst oder nicht mehr vorhanden → kein Fehler
+                log(f"    ~ TP {oid}: {res.get('msg', '?')} (evtl. bereits ausgelöst)")
+                cancelled.add(str(oid))   # trotzdem als erledigt markieren
+
+    # ── Fallback: via Plan-Order-Liste (falls IDs unvollständig) ──
+    orders   = _get_plan_orders(symbol)
+    tp_orders = [o for o in orders if o.get("planType") in TP_TYPES
+                 and str(o.get("orderId", "")) not in cancelled]
+
+    if not tp_orders and not stored_ids:
         log(f"  Keine TP-Orders gefunden")
         return
-
-    log(f"  {len(tp_orders)} TP(s) stornieren...")
-    for order in tp_orders:
-        oid   = order.get("orderId")
-        price = order.get("triggerPrice", "?")
-        res   = api_post("/api/v2/mix/order/cancel-plan-order", {
-            "symbol":      symbol,
-            "productType": PRODUCT_TYPE,
-            "marginCoin":  MARGIN_COIN,
-            "orderId":     oid,
-        })
-        if res.get("code") == "00000":
-            log(f"    ✓ TP storniert @ {price}: {oid}")
-        else:
-            log(f"    ✗ Fehler: {res.get('msg', res)}")
+    if tp_orders:
+        log(f"  {len(tp_orders)} weitere TP(s) via Plan-Liste stornieren...")
+        for order in tp_orders:
+            oid   = order.get("orderId")
+            price = order.get("triggerPrice", "?")
+            ptype = order.get("planType", "?")
+            res = api_post("/api/v2/mix/order/cancel-plan-order", {
+                "symbol":      symbol,
+                "productType": PRODUCT_TYPE,
+                "marginCoin":  MARGIN_COIN,
+                "planType":    ptype,
+                "orderIdList": [{"orderId": oid}],
+            })
+            if res.get("code") == "00000":
+                log(f"    ✓ TP storniert [{ptype}] @ {price}: {oid}")
+            else:
+                log(f"    ✗ Fehler [{ptype}] @ {price}: {res.get('msg', res)}")
 
 
 def calc_tp_price(avg: float, roi: float,
@@ -522,9 +532,10 @@ def place_tp_orders(symbol: str, avg: float, size: float,
                      Schliesst automatisch ALLES was noch offen ist.
                      (DOMINUS: "letzte TP schliesst Trade automatisch")
     """
-    decimals = get_price_decimals(symbol)
-    count    = 0
-    prices   = []
+    decimals   = get_price_decimals(symbol)
+    count      = 0
+    prices     = []
+    order_ids  = []   # erfasste Order-IDs für spätere Direktstornierung
 
     # ── TP1–TP3: Teilschliessungen ───────────────────────────────
     partial_tps = [
@@ -545,17 +556,16 @@ def place_tp_orders(symbol: str, avg: float, size: float,
         tp_str = round_price(tp_raw, decimals)
         tp_val = float(tp_str)
 
-        # Qty-Berechnung: round() für alle Grössen — math.floor war falsch.
-        # Beispiel: COMP size=1.76, pct=0.15: floor(0.264)=0 → SKIP (Bug!)
-        #                                     round(0.264,2)=0.26 → gesetzt ✓
-        # BTC size=0.001, pct=0.15:           round(0.00015,4)=0.00015 ✓
+        # Qty-Berechnung: 2 Dezimalstellen für Futures-Kontrakte >= 1.0
+        # (z.B. COMP 1.76 × 0.15 = 0.264 → floor=0 [falsch!], round=0.26 [korrekt])
+        # Für Kleinkontrakts-Symbole (BTC 0.001 etc.) mehr Präzision
         if size >= 1.0:
-            qty = round(size * pct, 2)    # z.B. 1.76 × 0.15 = 0.26
+            qty = round(size * pct, 2)  # 2 Dezimalstellen — deckt Bitget-Mindestschritt ab
         else:
-            qty = round(size * pct, 4)    # BTC-Kontrakte (sehr kleine Dezimalzahlen)
+            qty = round(size * pct, 4)
 
         if qty <= 0:
-            log(f"    ⏭ {label}: Position zu klein für Teilschliessung (size={size}, pct={pct}) — übersprungen")
+            log(f"    ⏭ {label}: qty=0 (size={size}, pct={pct}) — übersprungen")
             partial_tps_skipped += 1
             continue
 
@@ -579,6 +589,9 @@ def place_tp_orders(symbol: str, avg: float, size: float,
             "size":         str(qty),
         })
         if res.get("code") == "00000":
+            oid = (res.get("data") or {}).get("orderId", "")
+            if oid:
+                order_ids.append(str(oid))
             log(f"    ✓ {label} @ {tp_str} USDT (Qty: {qty})")
             count += 1
             prices.append(f"{label}: {tp_str}")
@@ -586,37 +599,27 @@ def place_tp_orders(symbol: str, avg: float, size: float,
             msg = res.get("msg", str(res))
             log(f"    ✗ {label} FEHLER: {msg}")
             if "checkBDScale" in msg or "checkScale" in msg:
-                # Bitget gibt checkScale=N zurück — N = erlaubte Dezimalstellen
-                # checkScale=0 → Integer  |  checkScale=1 → 1 Stelle  |  usw.
-                import re as _re
-                _m = _re.search(r'checkScale=(\d+)', msg)
-                scale = int(_m.group(1)) if _m else 0
-                if scale == 0:
-                    qty_rounded = int(qty)
-                    qty_str_r   = str(qty_rounded)
-                else:
-                    qty_rounded = round(qty, scale)
-                    qty_str_r   = str(qty_rounded)
-                if qty_rounded <= 0:
-                    log(f"    ✗ {label}: qty {qty} → Rundung auf {scale} Dez. = 0 — übersprungen")
-                    partial_tps_skipped += 1
-                    continue
-                log(f"    ↩ Retry checkScale={scale}: {qty} → {qty_str_r}")
+                new_dec = max(1, decimals - 1)
+                price_decimals_cache[symbol] = new_dec
+                tp_str2 = round_price(tp_raw, new_dec)
                 res2 = api_post("/api/v2/mix/order/place-tpsl-order", {
                     "symbol":       symbol,
                     "productType":  PRODUCT_TYPE,
                     "marginCoin":   MARGIN_COIN,
                     "planType":     "profit_plan",
-                    "triggerPrice": tp_str,
+                    "triggerPrice": tp_str2,
                     "triggerType":  "mark_price",
                     "executePrice": "0",
                     "holdSide":     direction,
-                    "size":         qty_str_r,
+                    "size":         str(qty),
                 })
                 if res2.get("code") == "00000":
-                    log(f"    ✓ {label} @ {tp_str} USDT [checkScale={scale} qty {qty_str_r} ✓]")
+                    oid2 = (res2.get("data") or {}).get("orderId", "")
+                    if oid2:
+                        order_ids.append(str(oid2))
+                    log(f"    ✓ {label} @ {tp_str2} USDT [retry OK]")
                     count += 1
-                    prices.append(f"{label}: {tp_str}")
+                    prices.append(f"{label}: {tp_str2}")
 
     # Warnung wenn Teilschliessungen wegen zu kleiner Position nicht setzbar waren
     if partial_tps_skipped > 0:
@@ -634,7 +637,7 @@ def place_tp_orders(symbol: str, avg: float, size: float,
     # sonst überschreibt TP4 den bestehenden SL (oder umgekehrt).
     if TP4_ROI in _skip_rois:
         log(f"    ⏭ TP4: bereits ausgelöst — übersprungen")
-        return count, prices
+        return count, prices, order_ids
 
     tp4_raw = calc_tp_price(avg, TP4_ROI, direction, leverage)
     tp4_str = round_price(tp4_raw, decimals)
@@ -660,19 +663,15 @@ def place_tp_orders(symbol: str, avg: float, size: float,
                 f"(bestehender Bitget-SL bleibt erhalten wenn API das unterstützt)")
         sl_for_tp4 = round_price(current_sl, decimals) if current_sl > 0 else "0"
 
-        # Bitget place-pos-tpsl erwartet:
-        #   stopSurplusTriggerPrice  = TP (NICHT takeProfitTriggerPrice!)
-        #   stopLossTriggerPrice     = SL
-        # Mindestens eines von beiden muss gesetzt sein.
         body4 = {
-            "symbol":                  symbol,
-            "productType":             PRODUCT_TYPE,
-            "marginCoin":              MARGIN_COIN,
-            "holdSide":                direction,
-            "stopSurplusTriggerPrice": tp4_str,
-            "stopSurplusTriggerType":  "mark_price",
+            "symbol":                 symbol,
+            "productType":            PRODUCT_TYPE,
+            "marginCoin":             MARGIN_COIN,
+            "holdSide":               direction,
+            "takeProfitTriggerPrice": tp4_str,
+            "takeProfitTriggerType":  "mark_price",
         }
-        # SL mitschicken — verhindert Überschreiben des bestehenden Bitget-SL
+        # SL mitschicken wenn vorhanden — verhindert Überschreiben
         if current_sl > 0:
             body4["stopLossTriggerPrice"] = sl_for_tp4
             body4["stopLossTriggerType"]  = "mark_price"
@@ -692,12 +691,12 @@ def place_tp_orders(symbol: str, avg: float, size: float,
                 price_decimals_cache[symbol] = new_dec
                 tp4_str2  = round_price(tp4_raw, new_dec)
                 body4b    = {
-                    "symbol":                  symbol,
-                    "productType":             PRODUCT_TYPE,
-                    "marginCoin":              MARGIN_COIN,
-                    "holdSide":                direction,
-                    "stopSurplusTriggerPrice": tp4_str2,
-                    "stopSurplusTriggerType":  "mark_price",
+                    "symbol":                 symbol,
+                    "productType":            PRODUCT_TYPE,
+                    "marginCoin":             MARGIN_COIN,
+                    "holdSide":               direction,
+                    "takeProfitTriggerPrice": tp4_str2,
+                    "takeProfitTriggerType":  "mark_price",
                 }
                 if current_sl > 0:
                     body4b["stopLossTriggerPrice"] = sl_for_tp4
@@ -712,67 +711,7 @@ def place_tp_orders(symbol: str, avg: float, size: float,
         tp_set_ts[symbol] = time.time()
         save_state()
 
-    return count, prices
-
-
-# ═══════════════════════════════════════════════════════════════
-# AUTO-SL MIT VERZÖGERUNG (5-Min-Buffer für neuen Trade)
-# ═══════════════════════════════════════════════════════════════
-
-def _apply_auto_sl_if_needed(symbol: str, direction: str, sl_auto: float):
-    """
-    Wird nach SL_NEW_GRACE Sekunden (Standard 5 Min) aus setup_new_trade aufgerufen.
-    Setzt Auto-SL NUR wenn der User in der Zwischenzeit keinen SL manuell gesetzt hat.
-    """
-    if sl_set_ts.get(symbol, 0) > 0:
-        log(f"[Auto-SL-Timer] {symbol}: SL wurde manuell gesetzt — Auto-SL übersprungen ✓")
-        sl_first_seen.pop(symbol, None)
-        return
-
-    # Position noch offen? (könnte in 5 Min geschlossen worden sein)
-    if last_known_avg.get(symbol, 0) == 0:
-        log(f"[Auto-SL-Timer] {symbol}: Position nicht mehr offen — übersprungen")
-        sl_first_seen.pop(symbol, None)
-        return
-
-    # SL immer noch nicht gesetzt → Auto-SL anwenden
-    decimals = get_price_decimals(symbol)
-    sl_str   = round_price(sl_auto, decimals)
-    sl_dist  = abs(last_known_avg.get(symbol, sl_auto) - sl_auto) / max(sl_auto, 0.001) * 100
-    log(f"[Auto-SL-Timer] {symbol}: 5-Min-Buffer abgelaufen → Auto-SL @ {sl_str}")
-
-    # TP4 lesen und mitschicken (verhindert Überschreiben)
-    existing_tp4 = _get_pos_tp_price(symbol, direction)
-    body = {
-        "symbol":               symbol,
-        "productType":          PRODUCT_TYPE,
-        "marginCoin":           MARGIN_COIN,
-        "holdSide":             direction,
-        "stopLossTriggerPrice": sl_str,
-        "stopLossTriggerType":  "mark_price",
-    }
-    if existing_tp4 > 0:
-        body["stopSurplusTriggerPrice"] = round_price(existing_tp4, decimals)
-        body["stopSurplusTriggerType"]  = "mark_price"
-
-    res = api_post("/api/v2/mix/order/place-pos-tpsl", body)
-    if res.get("code") == "00000":
-        sl_set_ts[symbol] = time.time()
-        save_state()
-        log(f"[Auto-SL-Timer] ✓ Auto-SL gesetzt @ {sl_str}")
-        telegram(
-            f"🛡 <b>Auto-SL jetzt aktiv — {symbol}</b>\n"
-            f"5-Min-Buffer abgelaufen, kein manueller SL gesetzt\n"
-            f"SL: {sl_str} USDT ({sl_dist:.1f}% Abstand)\n"
-            f"⚠️ Bitte mit Ausstiegslinie abgleichen!"
-        )
-    else:
-        log(f"[Auto-SL-Timer] ✗ Auto-SL fehlgeschlagen: {res.get('msg', res)}")
-        telegram(
-            f"❌ <b>Auto-SL fehlgeschlagen — {symbol}</b>\n"
-            f"Bitte manuell setzen! Empfehlung: {sl_str} USDT"
-        )
-    sl_first_seen.pop(symbol, None)
+    return count, prices, order_ids
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1004,13 +943,10 @@ def handle_position_closed(symbol: str, reason: str = ""):
     last_known_size.pop(symbol, None)
     new_trade_done.pop(symbol, None)
     sl_at_entry.pop(symbol, None)
-    trade_data.pop(symbol, None)
-    sl_set_ts.pop(symbol, None)
-    tp_set_ts.pop(symbol, None)
-    sl_first_seen.pop(symbol, None)
+    _closed_ids = trade_data.pop(symbol, {}).get("tp_order_ids")
 
     # Noch offene TP-Orders aufräumen (Sicherheit)
-    cancel_all_tp_orders(symbol)
+    cancel_all_tp_orders(symbol, _closed_ids)
 
 
 def _get_pos_tp_price(symbol: str, direction: str) -> float:
@@ -1026,9 +962,8 @@ def _get_pos_tp_price(symbol: str, direction: str) -> float:
     if result.get("code") == "00000":
         for pos in (result.get("data") or []):
             if pos.get("holdSide") == direction:
-                # Bitget place-pos-tpsl verwendet stopSurplusTriggerPrice für TP
-                for field in ("stopSurplusTriggerPrice", "takeProfitPrice",
-                              "takeProfit", "tpPrice"):
+                for field in ("takeProfitPrice", "takeProfit", "tpPrice",
+                              "takeProfitTriggerPrice"):
                     tp = float(pos.get(field, 0) or 0)
                     if tp > 0:
                         return tp
@@ -1053,8 +988,8 @@ def set_sl_at_entry(symbol: str, direction: str, entry_price: float):
     }
     if existing_tp4 > 0:
         decimals_sl = get_price_decimals(symbol)
-        body_sl["stopSurplusTriggerPrice"] = round_price(existing_tp4, decimals_sl)
-        body_sl["stopSurplusTriggerType"]  = "mark_price"
+        body_sl["takeProfitTriggerPrice"] = round_price(existing_tp4, decimals_sl)
+        body_sl["takeProfitTriggerType"]  = "mark_price"
         log(f"  TP4 @ {existing_tp4} wird mitgeführt")
 
     result = api_post("/api/v2/mix/order/place-pos-tpsl", body_sl)
@@ -1156,20 +1091,6 @@ def tv_chart_links(symbol: str) -> dict:
     }
 
 
-def chart_links_html(symbol: str) -> str:
-    """Gibt alle 4 Chart-Links als kompakte HTML-Zeile zurück.
-    Beispiel: 📊 <a href="...">H2</a>  <a href="...">H4</a>  <a href="...">BTC H2</a>  <a href="...">Total2</a>
-    """
-    lnk  = tv_chart_links(symbol)
-    short = symbol.replace("USDT", "")
-    return (
-        f'📊 <a href="{lnk["coin_h2"]}">{short} H2</a>  '
-        f'<a href="{lnk["coin_h4"]}">{short} H4</a>  '
-        f'<a href="{lnk["btc_h2"]}">BTC H2</a>  '
-        f'<a href="{lnk["total2"]}">Total2</a>'
-    )
-
-
 def setup_new_trade(pos: dict):
     """
     Vollständiges Setup für einen neuen Trade:
@@ -1216,9 +1137,7 @@ def setup_new_trade(pos: dict):
 
     if sl_price == 0:
         # ── 1. Versuch: SL aus /trade-Befehl (pending_trade) ──────────
-        # .get() statt .pop() — Hint bleibt erhalten falls diese Funktion
-        # abstürzt. Wird erst nach erfolgreichem SL-Setzen entfernt (s.u.)
-        hint = pending_trade.get(symbol, {})
+        hint = pending_trade.pop(symbol, {})
         if (hint
                 and hint.get("direction") == direction
                 and time.time() - hint.get("ts", 0) < 3600   # max. 1 Stunde gültig
@@ -1240,26 +1159,21 @@ def setup_new_trade(pos: dict):
             if res.get("code") == "00000":
                 log(f"  ✓ SL gesetzt @ {sl_str} (aus /trade)")
                 sl_set_ts[symbol] = time.time()
-                save_state()  # sofort persistieren — Crash-Schutz damit sl_set_ts nach Neustart bekannt ist
-                pending_trade.pop(symbol, None)  # Hint verbraucht — SL erfolgreich gesetzt
-                _lnk = tv_chart_links(symbol)
-                telegram_with_buttons(
+                telegram_kb(
                     f"🛡 <b>SL gesetzt — {symbol}</b>\n"
                     f"Übernommen aus deiner /trade-Berechnung\n\n"
                     f"SL: {sl_str} USDT ({sl_dist:.1f}% Abstand)\n"
                     f"Hebel: {leverage}x | Entry: {entry}",
-                    [[{"text": f"📈 {symbol.replace('USDT','')} H2",
-                       "url": _lnk["coin_h2"]}]]
+                    chart_kb(symbol, include_btc=False)
                 )
                 sl_price = sl_hint
             else:
                 log(f"  ✗ SL aus /trade fehlgeschlagen: {res.get('msg', res)} — fallback Auto-SL")
 
         if sl_price == 0:
-            # ── 2. Fallback: Auto-SL bei -25% — aber MIT 5-Min-Buffer ─────
-            # Der User bekommt SL_NEW_GRACE Sekunden (Standard 5 Min) Zeit,
-            # seinen manuellen SL zu setzen. Danach setzt _apply_auto_sl_if_needed
-            # automatisch den Auto-SL falls noch keiner vorhanden.
+            # ── 2. Fallback: Auto-SL bei -25% Margin-Verlust ──────────────
+            # Long:  SL = entry * (1 - 0.25 / leverage)
+            # Short: SL = entry * (1 + 0.25 / leverage)
             factor   = 0.25 / leverage
             sl_auto  = entry * (1 - factor) if direction == "long" \
                        else entry * (1 + factor)
@@ -1268,24 +1182,50 @@ def setup_new_trade(pos: dict):
             sl_auto  = float(sl_str)
             sl_dist  = abs(entry - sl_auto) / entry * 100
 
-            log(f"  ⚠ Kein SL — {SL_NEW_GRACE}s-Buffer aktiv (Auto-SL @ {sl_str} in {SL_NEW_GRACE//60} Min)")
-            telegram(
-                f"⏳ <b>Kein SL — {symbol}</b>\n"
-                f"Bitte SL in den nächsten {SL_NEW_GRACE//60} Min manuell setzen.\n"
-                f"Auto-SL Empfehlung: {sl_str} USDT ({sl_dist:.1f}% Abstand)\n\n"
-                + chart_links_html(symbol)
-            )
-            # Erster-Gesehen-Timestamp für check_and_repair_position
-            if symbol not in sl_first_seen:
-                sl_first_seen[symbol] = time.time()
-            # Timer: nach SL_NEW_GRACE Sekunden Auto-SL setzen falls noch kein SL
-            _t = threading.Timer(SL_NEW_GRACE, _apply_auto_sl_if_needed,
-                                 args=[symbol, direction, sl_auto])
-            _t.daemon = True
-            _t.start()
-            # sl_price für DCA/TP-Berechnung auf Auto-SL-Wert setzen
-            # (TPs werden basierend auf diesem Wert bereits korrekt platziert)
-            sl_price = sl_auto
+            log(f"  ⚠ Kein SL gefunden — Auto-SL bei -25%: {sl_str} USDT")
+
+            res = api_post("/api/v2/mix/order/place-pos-tpsl", {
+                "symbol":               symbol,
+                "productType":          PRODUCT_TYPE,
+                "marginCoin":           MARGIN_COIN,
+                "holdSide":             direction,
+                "stopLossTriggerPrice": sl_str,
+                "stopLossTriggerType":  "mark_price",
+            })
+
+            links = tv_chart_links(symbol)
+            if res.get("code") == "00000":
+                log(f"  ✓ Auto-SL gesetzt @ {sl_str} (-25% Schutz)")
+                telegram(
+                    f"\U0001f6e1 <b>Auto-SL gesetzt \u2014 {symbol}</b>\n"
+                    f"Kein SL gefunden \u2192 -25% Schutz aktiviert\n\n"
+                    f"SL: {sl_str} USDT ({sl_dist:.1f}% Abstand)\n"
+                    f"Hebel: {leverage}x | Entry: {entry}\n\n"
+                    f"\u26a0\ufe0f Bitte pr\u00fcfen ob SL mit deiner\n"
+                    f"Ausstiegslinie \u00fcbereinstimmt!\n\n"
+                    f"H4 {symbol}: {links['coin_h4']}\n"
+                    f"H2 {symbol}: {links['coin_h2']}"
+                )
+                sl_set_ts[symbol] = time.time()
+                sl_price = sl_auto
+            else:
+                log(f"  ✗ Auto-SL fehlgeschlagen: {res.get('msg', res)}")
+                telegram(
+                    f"\u274c <b>Kein SL \u2014 {symbol}</b>\n"
+                    f"Auto-SL fehlgeschlagen. Bitte manuell setzen!\n"
+                    f"Empfehlung: {sl_str} USDT ({sl_dist:.1f}%)\n\n"
+                    f"H4: {links['coin_h4']}"
+                )
+                cancel_all_tp_orders(symbol, trade_data.get(symbol, {}).get("tp_order_ids"))
+                time.sleep(1)
+                _, _, _ids = place_tp_orders(symbol, entry, size, direction, leverage, mark,
+                                             known_sl=sl_price)
+                if symbol in trade_data:
+                    trade_data[symbol]["tp_order_ids"] = _ids
+                last_known_avg[symbol]  = entry
+                last_known_size[symbol] = size
+                new_trade_done[symbol]  = True
+                return
 
     # ── Hebel-Empfehlung & R:R-Check ─────────────────────
     sl_dist_pct   = abs(entry - sl_price) / entry * 100
@@ -1325,9 +1265,9 @@ def setup_new_trade(pos: dict):
     # TPs auf Basis der tatsächlichen aktuellen Position setzen.
     # DCA-Orders sind noch nicht gefüllt — wird automatisch angepasst wenn sie füllen.
     log(f"  Setze TPs für aktuelle Position (Qty={size})...")
-    cancel_all_tp_orders(symbol)
+    cancel_all_tp_orders(symbol, trade_data.get(symbol, {}).get("tp_order_ids"))
     time.sleep(1)
-    count, tp_prices = place_tp_orders(
+    count, tp_prices, _tp_ids = place_tp_orders(
         symbol, entry, size, direction, leverage, mark, known_sl=sl_price
     )
 
@@ -1338,12 +1278,13 @@ def setup_new_trade(pos: dict):
     sl_at_entry[symbol]     = False
     # Trade-Daten für spätere Auswertung
     trade_data[symbol] = {
-        "entry":     entry,
-        "direction": direction,
-        "leverage":  leverage,
-        "sl":        sl_price,
-        "peak_size": size,
-        "open_ts":   int(time.time() * 1000),
+        "entry":        entry,
+        "direction":    direction,
+        "leverage":     leverage,
+        "sl":           sl_price,
+        "peak_size":    size,
+        "open_ts":      int(time.time() * 1000),
+        "tp_order_ids": _tp_ids,
     }
 
     # ── 6. Telegram-Zusammenfassung ─────────────────────────
@@ -1371,7 +1312,12 @@ def setup_new_trade(pos: dict):
         f"💰 Margin/Order ≈ {order_margin:.2f} USDT\n"
         f"📊 Total ≈ {order_margin*3:.2f} USDT "
         f"({order_margin*3/balance*100:.1f}% Kapital)\n\n"
-        + ("\n\n" + chart_links_html(symbol) if balance > 0 else "")
+        f"📈 Charts:\n"
+        f"H2 {symbol}: {tv_chart_links(symbol)['coin_h2']}\n"
+        f"H4 {symbol}: {tv_chart_links(symbol)['coin_h4']}\n"
+        f"BTC H2: {tv_chart_links(symbol)['btc_h2']}\n"
+        f"Total2: {tv_chart_links(symbol)['total2']}"
+        if balance > 0 else ""
     )
     telegram(msg)
 
@@ -1483,11 +1429,13 @@ def update_tp_for_position(pos: dict, reason: str):
     # Kein Mindestgrößen-Block mehr: place_tp_orders überspringt TP1-3 intern
     # wenn qty=0, setzt aber immer TP4 (Full-Close) via place-pos-tpsl.
 
-    cancel_all_tp_orders(symbol)
+    cancel_all_tp_orders(symbol, trade_data.get(symbol, {}).get("tp_order_ids"))
     time.sleep(1)
-    count, prices = place_tp_orders(
+    count, prices, _tp_ids = place_tp_orders(
         symbol, avg, total, direction, leverage, mark, known_sl=known_sl
     )
+    if symbol in trade_data:
+        trade_data[symbol]["tp_order_ids"] = _tp_ids
 
     if count > 0:
         status = "✓ Alle 4" if count == 4 else f"⚠ {count}/4"
@@ -1737,6 +1685,11 @@ def cmd_trade(parts: list):
     if warnings:
         lines += ["", "⚠️ <b>Warnungen:</b>"] + warnings
 
+    links       = tv_chart_links(symbol)
+    coin_h2_url = links["coin_h2"]
+    coin_h4_url = links["coin_h4"]
+    btc_url     = links["btc_h2"]
+    total2_url  = links["total2"]
     lines += [
         "",
         "✔︎ HARSI nicht in Extremzone?",
@@ -1746,7 +1699,11 @@ def cmd_trade(parts: list):
         "✅ Wenn ja: Market Order + SL auf Bitget setzen.",
         "Script setzt DCA + TPs automatisch.",
         "",
-        chart_links_html(symbol),
+        "📈 Charts:",
+        f'H2 {symbol} (HARSI): {coin_h2_url}',
+        f'H4 {symbol} (Premium): {coin_h4_url}',
+        f'BTC H2 (Momentum): {btc_url}',
+        f'Total2 H2 (Altcoins): {total2_url}',
     ]
     reply("\n".join(lines))
 
@@ -1867,69 +1824,10 @@ def cmd_refresh(parts: list):
     reply("\n".join(lines))
 
 
-def _answer_callback(callback_id: str):
-    """Quittiert einen Telegram Callback-Query (entfernt Lade-Animation)."""
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery",
-            json={"callback_query_id": callback_id},
-            timeout=3
-        )
-    except Exception:
-        pass
-
-
-def _send_h2_trade_detail(symbol: str, direction: str, entry: float,
-                          premium: bool = False):
-    """
-    Sendet die vollständige Einzel-Trade-Info für ein H2-Signal.
-    Wird ausgelöst wenn der User den Trade-Button oder Premium-Button drückt.
-    premium=True → hebt Full-Kelly hervor (2× Positionsgrösse).
-    """
-    links     = tv_chart_links(symbol)
-    balance   = get_futures_balance()
-    kelly     = kelly_recommendation(balance, WINRATE)
-    per_order = balance * 0.10 / 3   # Normal: 1/3 des 10%-Limits
-    icon      = dir_icon(direction)
-    chk_dir   = "grüner" if direction == "long" else "roter"
-
-    if premium:
-        # PREMIUM: Full-Kelly Grösse, nicht Half-Kelly
-        size_usdt  = kelly["kelly_usdt"]
-        size_label = f"⭐ Full-Kelly: {size_usdt:.0f} USDT ({kelly['kelly_pct']}%)"
-        prem_note  = "\n⭐ <b>PREMIUM Setup</b> — Volle Kelly-Grösse"
-    else:
-        size_usdt  = kelly["half_kelly_usdt"]
-        size_label = f"Half-Kelly: {size_usdt:.0f} USDT ({kelly['half_kelly_pct']}%)"
-        prem_note  = ""
-
-    msg = "\n".join([
-        f"{icon} <b>H2 Signal — {symbol} {direction.upper()}</b>{prem_note}",
-        "━" * 12,
-        f"Kurs: {entry}",
-        "",
-        "📋 <b>DOMINUS Checkliste:</b>",
-        f"☐ Impuls Extremzone?   ☐ H4 bestätigt?",
-        f"☐ HARSI OK?   ☐ BTC+Total2 gleich?",
-        f"☐ Premium? (Impuls dunkel{chk_dir})",
-        "",
-        f"💰 {balance:.0f} USDT  |  Pro Order: {per_order:.0f} USDT",
-        f"📊 {size_label}",
-        "",
-        "⏱ <b>30-Min-Fenster läuft!</b>",
-        f"/trade {symbol} {direction.upper()} [HEBEL] {entry:.5f} [SL]",
-        "",
-        chart_links_html(symbol),
-    ])
-    telegram(msg)
-
-
 def poll_telegram_commands():
     """
     Prüft auf neue Telegram-Nachrichten und führt Befehle aus.
-    Behandelt:
-      - Textnachrichten mit /-Befehlen
-      - callback_query (Inline-Button-Klicks aus H2-Zusammenfassung)
+    Wird jeden Loop-Durchlauf aufgerufen.
     Nur Nachrichten von TELEGRAM_CHAT_ID werden akzeptiert (Sicherheit).
     """
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -1937,53 +1835,6 @@ def poll_telegram_commands():
 
     updates = get_telegram_updates()
     for update in updates:
-
-        # ── Inline-Button-Klick (callback_query) ─────────────────────────────
-        cb = update.get("callback_query")
-        if cb:
-            cb_chat = str(cb.get("message", {}).get("chat", {}).get("id", ""))
-            if cb_chat != str(TELEGRAM_CHAT_ID):
-                continue
-            cb_id   = cb.get("id", "")
-            cb_data = cb.get("data", "")
-            _answer_callback(cb_id)
-            log(f"Telegram Button gedrückt: {cb_data}")
-
-            if cb_data.startswith("h2trade:"):
-                # Format: h2trade:SYMBOL:direction:entry:premium(0/1)
-                parts = cb_data.split(":", 4)
-                if len(parts) >= 4:
-                    sym       = parts[1]
-                    drct      = parts[2]
-                    entry_str = parts[3]
-                    is_prem   = len(parts) == 5 and parts[4] == "1"
-                    _send_h2_trade_detail(sym, drct, float(entry_str or 0), premium=is_prem)
-
-            elif cb_data.startswith("trade_hint:"):
-                # Format: trade_hint:SYMBOL:direction:leverage:entry:sl
-                # Sendet fertigen /trade-Befehl als kopierbaren Code-Block
-                parts = cb_data.split(":", 5)
-                if len(parts) == 6:
-                    _sym  = parts[1]
-                    _drct = parts[2].upper()
-                    _lev  = parts[3]
-                    _ent  = parts[4]
-                    _sl   = parts[5]
-                    reply(
-                        f"📋 <b>Trade-Vorschlag</b>\n"
-                        f"<code>/trade {_sym} {_drct} {_lev} {_ent} {_sl}</code>\n\n"
-                        f"Hebel: {_lev}x (Standard) · SL: {_sl} USDT\n"
-                        f"Passe Hebel und SL nach deiner Ausstiegslinie an."
-                    )
-            elif cb_data == "cmd:berechnen":
-                cmd_berechnen()
-            elif cb_data == "cmd:status":
-                cmd_status()
-            elif cb_data == "cmd:hilfe":
-                cmd_hilfe()
-            continue
-
-        # ── Textnachricht mit Befehl ──────────────────────────────────────────
         msg = update.get("message") or update.get("edited_message")
         if not msg:
             continue
@@ -2044,219 +1895,28 @@ def flush_h4_buffer():
         lines.append("🟢↗️ <b>LONG:</b>")
         for item in longs:
             lnk = tv_chart_links(item["symbol"])
-            short_s = item["symbol"].replace("USDT","")
-            lines.append(
-                f'  \u2022 <a href="{lnk["coin_h4"]}">{short_s} H4</a>'
-                f'  <a href="{lnk["coin_h2"]}">{short_s} H2</a>'
-                f'  @ {item["entry"]:.5f}'
-            )
+            lines.append(f"  \u2022 {item['symbol']}  @ {item['entry']:.5f}")
+            lines.append(f"    {lnk['coin_h4']}")
     if longs and shorts:
         lines.append("")
     if shorts:
         lines.append("🔴↘️ <b>SHORT:</b>")
         for item in shorts:
             lnk = tv_chart_links(item["symbol"])
-            short_s = item["symbol"].replace("USDT","")
-            lines.append(
-                f'  \u2022 <a href="{lnk["coin_h4"]}">{short_s} H4</a>'
-                f'  <a href="{lnk["coin_h2"]}">{short_s} H2</a>'
-                f'  @ {item["entry"]:.5f}'
-            )
+            lines.append(f"  \u2022 {item['symbol']}  @ {item['entry']:.5f}")
+            lines.append(f"    {lnk['coin_h4']}")
 
     btc_lnk = tv_chart_links("BTCUSDT")
     lines += [
         "",
-        "⏱ H2-Alarm für relevante Coins aktivieren",
+        "\u23f1 H2-Alarm f\u00fcr relevante Coins aktivieren",
         "",
-        f'📈 <a href="{btc_lnk["btc_h2"]}">BTC H2</a>  '
-        f'<a href="{btc_lnk["total2"]}">Total2</a>',
+        "\U0001f4c8 Markt:",
+        f"BTC H2: {btc_lnk['btc_h2']}",
+        f"Total2: {btc_lnk['total2']}",
     ]
     telegram("\n".join(lines))
     log(f"H4-Zusammenfassung gesendet: {len(longs)} Long, {len(shorts)} Short")
-
-
-def flush_h2_buffer():
-    """
-    Sendet gesammelte H2-Signale als eine gebündelte Telegram-Nachricht.
-
-    Reihenfolge nach DOMINUS-Priorität:
-      1. 🔴↘️⭐  Premium Short   (Impuls in Premium-Zone + Short)
-      2. 🟢↗️⭐  Premium Long    (Impuls in Premium-Zone + Long)
-      3. 🔴↘️    Standard Short
-      4. 🟢↗️    Standard Long
-
-    Buttons: dynamische Breite
-      ≤ 4 Signale → 1 Button pro Zeile (volle Breite, Label mit Richtung)
-      > 4 Signale → 2 Buttons pro Zeile (halbe Breite, kompaktes Label)
-
-    Callback-Format: h2trade:SYMBOL:direction:entry:premium(0/1)
-    """
-    global h2_buffer, h2_flush_timer
-    with h2_buffer_lock:
-        if not h2_buffer:
-            return
-        items          = list(h2_buffer)
-        h2_buffer      = []
-        h2_flush_timer = None
-
-    # ── Dominanten Trend aus BTC + Total2 bestimmen ──────────────────────────
-    # BTC + Total2 gleich → klarer Trend; nur BTC → Fallback; beides fehlt → kein Trend
-    if btc_trend and total2_trend:
-        dominant = btc_trend if btc_trend == total2_trend else btc_trend  # BTC hat Vorrang
-    elif btc_trend:
-        dominant = btc_trend
-    else:
-        dominant = ""
-
-    # ── Sortierung: Trend-Alignment > Premium > Standard ─────────────────────
-    # Mit bekanntem Trend:
-    #   1. Premium   + Trend-Richtung   (⭐ im Trend)
-    #   2. Standard  + Trend-Richtung   (im Trend)
-    #   3. Premium   + Gegen-Trend      (⭐ gegen Trend)
-    #   4. Standard  + Gegen-Trend      (gegen Trend)
-    #
-    # Ohne bekannten Trend → original DOMINUS-Priorität:
-    #   1. Premium Short  2. Premium Long  3. Standard Short  4. Standard Long
-    def _sort_key(item):
-        prem   = item.get("premium", False)
-        lng    = item["direction"] == "long"
-        in_dom = dominant != "" and item["direction"] == dominant
-        if dominant:
-            if in_dom and prem:      return (0, item["symbol"])  # ⭐ im Trend
-            if in_dom and not prem:  return (1, item["symbol"])  # Standard im Trend
-            if not in_dom and prem:  return (2, item["symbol"])  # ⭐ gegen Trend
-            return                          (3, item["symbol"])  # Standard gegen Trend
-        else:
-            # Fallback: DOMINUS-Reihenfolge (Premium Short zuerst)
-            if prem and not lng:   return (0, item["symbol"])
-            if prem and lng:       return (1, item["symbol"])
-            if not lng:            return (2, item["symbol"])
-            return                        (3, item["symbol"])
-
-    ordered = sorted(items, key=_sort_key)
-
-    # Gruppen für Nachrichtentext (basierend auf sortierter Reihenfolge)
-    prem_shorts = [i for i in ordered if i.get("premium") and i["direction"] == "short"]
-    prem_longs  = [i for i in ordered if i.get("premium") and i["direction"] == "long"]
-    std_shorts  = [i for i in ordered if not i.get("premium") and i["direction"] == "short"]
-    std_longs   = [i for i in ordered if not i.get("premium") and i["direction"] == "long"]
-
-    # Hilfsfunktion: Abschnittsbeschriftung mit optionalem Trend-Badge
-    def _section_label(icon: str, label: str, group: list, direction: str) -> str:
-        n_grp = len(group)
-        cnt   = f"{n_grp}"
-        if dominant and direction == dominant:
-            return f"{icon} <b>{label} — {cnt} ✅ IM TREND</b>"
-        elif dominant and direction != dominant:
-            return f"{icon} <b>{label} — {cnt} ⚠️ GEGEN TREND</b>"
-        return f"{icon} <b>{label} — {cnt}</b>"
-
-    now_str   = datetime.now().strftime("%H:%M")
-    balance   = get_futures_balance()
-    kelly     = kelly_recommendation(balance, WINRATE)
-    per_order = balance * 0.10 / 3
-    btc_lnk   = tv_chart_links("BTCUSDT")
-
-    # ── Nachrichtentext ──────────────────────────────────────────────────────
-    # Trend-Status-Zeile: zeigt BTC + Total2 aktuellen Trend
-    btc_icon    = ("🟢↗️" if btc_trend    == "long" else "🔴↘️") if btc_trend    else "⚪"
-    t2_icon     = ("🟢↗️" if total2_trend == "long" else "🔴↘️") if total2_trend else "⚪"
-    btc_lbl     = btc_trend.upper()    if btc_trend    else "?"
-    t2_lbl      = total2_trend.upper() if total2_trend else "?"
-    dom_lbl     = f" → Trend: <b>{dominant.upper()}</b>" if dominant else " → Trend: <b>unbekannt</b>"
-    trend_line  = f"BTC {btc_icon} {btc_lbl}  |  Total2 {t2_icon} {t2_lbl}{dom_lbl}"
-
-    lines = [f"📡 <b>H2 Signale — {now_str} Uhr</b>", trend_line, "━" * 12]
-
-    def _coins(group):
-        return "  |  ".join(
-            f"<b>{i['symbol'].replace('USDT','')}</b> @ {i['entry']:.5g}"
-            for i in group
-        )
-
-    # Abschnitte in sortierter Reihenfolge ausgeben (konsekutive Gruppen)
-    from itertools import groupby as _groupby
-    first_section = True
-    for key, group_iter in _groupby(ordered, key=lambda i: (i.get("premium", False), i["direction"])):
-        group = list(group_iter)
-        prem, drct = key
-        if not first_section:
-            lines.append("")   # Leerzeile zwischen Abschnitten
-        first_section = False
-        icon  = ("🔴↘️⭐" if prem else "🔴↘️") if drct == "short" \
-                else ("🟢↗️⭐" if prem else "🟢↗️")
-        lbl   = ("PREMIUM SHORT" if prem else "SHORT") if drct == "short" \
-                else ("PREMIUM LONG" if prem else "LONG")
-        lines.append(_section_label(icon, lbl, group, drct))
-        lines.append(_coins(group))
-
-    lines += [
-        "",
-        f"💰 {balance:.0f} USDT  |  Pro Order: {per_order:.0f} USDT  |  Kelly: {kelly['kelly_pct']}%",
-        "",
-        "📋 <b>Checkliste:</b>",
-        "☐ Impuls Extremzone?  ☐ H4 bestätigt?",
-        "☐ HARSI OK?  ☐ BTC+Total2 gleich?",
-        "",
-        "⏱ <b>30-Min-Fenster läuft!</b>",
-        f"📈 <a href=\"{btc_lnk['btc_h2']}\">BTC H2</a>  |  "
-        f"<a href=\"{btc_lnk['total2']}\">Total2</a>",
-    ]
-
-    # ── InlineKeyboard ────────────────────────────────────────────────────────
-    # Jede Zeile = 2 Buttons nebeneinander:
-    #   Links:  Chart-Button  [🔴↘️[⭐] COINNAME]  → H2-Chart URL
-    #   Rechts: /trade-Vorschlag [📋 10x · SL 0.xxxx] → callback → Bot sendet
-    #           den fertigen /trade-Befehl mit Default-Hebel 10 und SL -25%/Hebel
-    keyboard  = []
-    _lev_default = 10
-    _factor      = 0.25 / _lev_default   # 2.5% bei Hebel 10
-
-    def _btn_pair(item):
-        sym       = item["symbol"]
-        drct      = item["direction"]
-        prem      = item.get("premium", False)
-        short_sym = sym.replace("USDT", "")
-        entry_val = float(item.get("entry", 0))
-        decimals  = get_price_decimals(sym)
-
-        # Chart-Button
-        icon  = ("🔴↘️⭐" if prem else "🔴↘️") if drct == "short" \
-                else ("🟢↗️⭐" if prem else "🟢↗️")
-        chart_btn = {
-            "text": f"{icon} {short_sym}",
-            "url":  tv_chart_links(sym)["coin_h2"],
-        }
-
-        # /trade-Vorschlag Button (Default: Hebel 10, SL -25%/Hebel)
-        if entry_val > 0:
-            sl_val = entry_val * (1 - _factor) if drct == "long" \
-                     else entry_val * (1 + _factor)
-            entry_str = round_price(entry_val, decimals)
-            sl_str    = round_price(sl_val,    decimals)
-        else:
-            entry_str = "0"
-            sl_str    = "0"
-        trade_btn = {
-            "text":          f"📋 {_lev_default}x · SL {sl_str}",
-            "callback_data": f"trade_hint:{sym}:{drct}:{_lev_default}:{entry_str}:{sl_str}",
-        }
-        return [chart_btn, trade_btn]
-
-    for item in ordered:
-        keyboard.append(_btn_pair(item))
-
-    # Unterste Zeile: BTC + Total2 Charts (wie in /berechnen)
-    btc_lnk2 = tv_chart_links("BTCUSDT")
-    keyboard.append([
-        {"text": "📊 BTC H2",  "url": btc_lnk2["btc_h2"]},
-        {"text": "📊 Total2",  "url": btc_lnk2["total2"]},
-    ])
-
-    telegram_with_buttons("\n".join(lines), keyboard)
-    log(f"H2-Zusammenfassung: {len(prem_shorts)} Prem-Short, {len(prem_longs)} Prem-Long, "
-        f"{len(std_shorts)} Std-Short, {len(std_longs)} Std-Long — "
-        f"{'2-spaltig' if use_2cols else '1-spaltig'} ({n} Signale)")
 
 
 def start_webhook_server():
@@ -2321,35 +1981,16 @@ def start_webhook_server():
                 f"dir={data.get('direction','')})")
             return jsonify({"status": "ignored", "reason": "no signal"}), 200
 
-        # Timeframe normalisieren: "120" / "240" → "H2" / "H4"
-        _tf_map = {"120": "H2", "120MIN": "H2", "240": "H4", "240MIN": "H4",
-                   "H1": "H1", "60": "H1"}
-        timeframe = _tf_map.get(timeframe, timeframe)
-
-        log(f"📡 TradingView Alert: {symbol} {direction.upper()} @ {entry} [{timeframe}]")
+        log(f"📡 TradingView Alert: {symbol} {direction.upper()} "
+            f"@ {entry} [{timeframe}]")
 
         if entry == 0:
             entry = get_mark_price(symbol)
 
         signal_type = data.get("signal", "").upper()
+        log(f"\U0001f4e1 Alert: {symbol} {direction.upper()} @ {entry} [{timeframe}]")
 
-        # ── BTC / Total2 Trend tracken ────────────────────────────────────────
-        # Jedes Signal (H4 oder H2) von BTC und Total2 aktualisiert den Trend.
-        # flush_h2_buffer nutzt diesen Trend für die Sortierung.
-        global btc_trend, total2_trend
-        if symbol in ("BTCUSDT", "XBTUSDT"):
-            btc_trend = direction
-            log(f"  📊 BTC Trend aktualisiert → {direction.upper()}")
-        elif "TOTAL2" in symbol or symbol == "TOTAL2USDT":
-            total2_trend = direction
-            log(f"  📊 Total2 Trend aktualisiert → {direction.upper()}")
-
-        # Premium-Flag aus TradingView JSON (wie in DOMINUS_Orchestrator)
-        # JSON: "premium": {{plot("Premium Long")}} oder "premium": {{plot("Premium Short")}}
-        # Wert: 1 wenn Impuls in Premium-Zone (dunkel gefärbt), sonst 0
-        premium = int(float(data.get("premium", 0) or 0)) == 1
-
-        # ── H4 Trigger → gepuffert, nach 5 Min gebündelt senden ──────────────
+        # H4 Trigger → gepuffert, nach 5 Min gebündelt senden
         if timeframe == "H4" or signal_type == "H4_TRIGGER":
             with h4_buffer_lock:
                 exists = any(
@@ -2359,69 +2000,42 @@ def start_webhook_server():
                 if not exists:
                     h4_buffer.append({
                         "symbol": symbol, "direction": direction,
-                        "entry": entry, "ts": time.time(),
+                        "entry": entry, "ts": __import__("time").time(),
                     })
                     log(f"  H4 gepuffert ({len(h4_buffer)} im Puffer)")
-            return jsonify({"status": "buffered_h4", "symbol": symbol}), 200
+            return jsonify({"status": "buffered", "symbol": symbol}), 200
 
-        # ── H2 Signal → H4-Puffer flushen, dann H2-Puffer befüllen ──────────
-        # Mehrere H2-Signale (verschiedene Coins) kommen meist innerhalb
-        # weniger Sekunden → 30s sammeln und als EINE Nachricht + Buttons senden.
-        if timeframe in ("H2", "H1") or signal_type == "H2_TRIGGER":
-            flush_h4_buffer()  # H4 vorab senden wenn vorhanden
-            global h2_flush_timer
-            with h2_buffer_lock:
-                exists = any(
-                    i["symbol"] == symbol and i["direction"] == direction
-                    for i in h2_buffer
-                )
-                if not exists:
-                    h2_buffer.append({
-                        "symbol":    symbol,
-                        "direction": direction,
-                        "entry":     entry,
-                        "premium":   premium,   # aus TradingView JSON (0/1)
-                        "ts":        time.time(),
-                    })
-                    prem_tag = " ⭐PREMIUM" if premium else ""
-                    log(f"  H2 gepuffert ({len(h2_buffer)} im Puffer){prem_tag}")
-                # Timer starten wenn noch keiner läuft
-                if h2_flush_timer is None or not h2_flush_timer.is_alive():
-                    t = threading.Timer(H2_BUFFER_SEC, flush_h2_buffer)
-                    t.daemon = True
-                    t.start()
-                    h2_flush_timer = t
-                    log(f"  H2-Flush-Timer gestartet ({H2_BUFFER_SEC}s)")
-            return jsonify({"status": "buffered_h2", "symbol": symbol}), 200
-
-        # ── Sonstiger Timeframe → sofort senden ──────────────────────────────
+        # H2 Signal → H4 Puffer flushen dann sofort senden
         flush_h4_buffer()
-        flush_h2_buffer()
-        links     = tv_chart_links(symbol)
         balance   = get_futures_balance()
         kelly     = kelly_recommendation(balance, WINRATE)
+        links     = tv_chart_links(symbol)
         per_order = balance * 0.10 / 3
-        chk_dir   = "grüner" if direction == "long" else "roter"
+        chk_dir   = "gr\u00fcner" if direction == "long" else "roter"
         icon      = dir_icon(direction)
         msg_parts = [
-            f"{icon} <b>{timeframe} Signal — {symbol} {direction.upper()}</b>",
-            "━" * 12,
+            f"{icon} <b>H2 Signal \u2014 {symbol} {direction.upper()}</b>",
+            "\u2501" * 12,
             f"Kurs: {entry}",
             "",
-            "📋 <b>DOMINUS Checkliste:</b>",
-            "☐ DOMINUS Impuls Extremzone erreicht?",
-            "☐ H4 Trigger bestätigt?",
-            "☐ HARSI nicht in Extremzone?",
-            "☐ BTC + Total2 gleiche Richtung?",
-            f"☐ Premium Setup? (Impuls dunkel{chk_dir})",
+            "\U0001f4cb <b>DOMINUS Checkliste:</b>",
+            "\u2610 DOMINUS Impuls Extremzone erreicht?",
+            "\u2610 H4 Trigger best\u00e4tigt?",
+            "\u2610 HARSI nicht in Extremzone?",
+            "\u2610 BTC + Total2 gleiche Richtung?",
+            f"\u2610 Premium Setup? (Impuls dunkel{chk_dir})",
             "",
-            f"💰 {balance:.0f} USDT  |  Pro Order: {per_order:.0f} USDT",
-            f"📊 Kelly: {kelly['kelly_pct']}%",
+            f"\U0001f4b0 {balance:.0f} USDT  |  Pro Order: {per_order:.0f} USDT",
+            f"\U0001f4ca Kelly: {kelly['kelly_pct']}%",
             "",
-            "⏱ <b>30-Min-Fenster läuft!</b>",
+            "\u23f1 <b>30-Min-Fenster l\u00e4uft!</b>",
             f"/trade {symbol} {direction.upper()} [HEBEL] {entry:.5f} [SL]",
             "",
-            chart_links_html(symbol),
+            "\U0001f4c8 Charts:",
+            f"H2 {symbol}: {links['coin_h2']}",
+            f"H4 {symbol}: {links['coin_h4']}",
+            f"BTC H2: {links['btc_h2']}",
+            f"Total2: {links['total2']}",
         ]
         telegram("\n".join(msg_parts))
         return jsonify({"status": "ok", "symbol": symbol,
@@ -2737,8 +2351,8 @@ def check_and_repair_position(pos: dict):
                     "stopLossTriggerType":  "mark_price",
                 }
                 if existing_tp4 > 0:
-                    body_sl["stopSurplusTriggerPrice"] = round_price(existing_tp4, decimals)
-                    body_sl["stopSurplusTriggerType"]  = "mark_price"
+                    body_sl["takeProfitTriggerPrice"] = round_price(existing_tp4, decimals)
+                    body_sl["takeProfitTriggerType"]  = "mark_price"
                 res = api_post("/api/v2/mix/order/place-pos-tpsl", body_sl)
                 if res.get("code") == "00000":
                     sl_price    = avg
@@ -2761,25 +2375,9 @@ def check_and_repair_position(pos: dict):
 
     else:
         # Kein SL gefunden auf Bitget
-        _sl_ts = sl_set_ts.get(symbol, 0)
-        if _sl_ts > time.time() - SL_TP_GRACE:
-            # SL kürzlich erfolgreich gesetzt — 30-Min-Buffer aktiv
-            _sl_skip = True
+        _sl_skip = sl_set_ts.get(symbol, 0) > time.time() - SL_TP_GRACE
+        if _sl_skip:
             log(f"  SL: kürzlich gesetzt → skip Re-Set (Bitget gibt 0 zurück)")
-        elif _sl_ts == 0:
-            # SL noch nie gesetzt (neuer Trade) — 5-Min-Buffer damit User Zeit hat
-            if symbol not in sl_first_seen:
-                sl_first_seen[symbol] = time.time()
-            _wait_left = SL_NEW_GRACE - (time.time() - sl_first_seen[symbol])
-            if _wait_left > 0:
-                _sl_skip = True
-                log(f"  SL: neuer Trade, noch nie gesetzt — warte {_wait_left:.0f}s "
-                    f"(5-Min-Buffer für manuellen SL)")
-            else:
-                _sl_skip = False
-                log(f"  SL: 5-Min-Buffer abgelaufen → Auto-SL wird gesetzt")
-        else:
-            _sl_skip = False
 
         if not _sl_skip and tp1_done:
             # TP1 bereits ausgelöst → SL muss auf Entry
@@ -2894,22 +2492,37 @@ def check_and_repair_position(pos: dict):
     sl_at_entry[symbol] = sl_is_entry
 
     # Trade-Daten für spätere Auswertung und als SL-Fallback in place_tp_orders
+    # Werte aus geladenem State erhalten wo sinnvoll:
+    #   peak_size  → max(bestehend, aktuell) — nie kleiner setzen als gespeichert
+    #   open_ts    → nicht überschreiben wenn Trade bereits läuft
+    #   tp_order_ids → für Direktstornierung erhalten
+    _prev          = trade_data.get(symbol, {})
+    _prev_peak     = _prev.get("peak_size", 0)
+    _prev_open_ts  = _prev.get("open_ts", int(time.time() * 1000))
+    _prev_tp_ids   = _prev.get("tp_order_ids", [])
     trade_data[symbol] = {
-        "entry":     avg,
-        "direction": direction,
-        "leverage":  leverage,
-        "sl":        sl_price,
-        "peak_size": size,
-        "open_ts":   int(time.time() * 1000),
+        "entry":        avg,
+        "direction":    direction,
+        "leverage":     leverage,
+        "sl":           sl_price,
+        "peak_size":    max(_prev_peak, size),   # nie kleiner als gespeichertes Maximum
+        "open_ts":      _prev_open_ts,
+        "tp_order_ids": _prev_tp_ids,
     }
 
     # ── 2. TPs prüfen ─────────────────────────────────────────────────────
-    # Nur die TPs prüfen, die laut Preisvergleich noch offen sein sollten.
-    # SCHUTZFENSTER: Da die plan-order API konsistent fehlschlägt, können
-    # wir vorhandene TPs nicht aus Bitget lesen. Wenn wir TPs kürzlich gesetzt
-    # haben (tp_set_ts), überspringen wir den TP-Re-Check komplett.
+    # Avg-Änderung erkennen: DCA-Fill verändert den durchschnittlichen Entry.
+    # Wenn der Avg signifikant geändert hat, muss tp_set_ts gelöscht werden
+    # damit die TPs mit dem neuen Avg neuberechnet werden.
+    _prev_avg = last_known_avg.get(symbol, 0)
+    if _prev_avg > 0 and abs(avg - _prev_avg) / _prev_avg > 0.001:  # >0.1%
+        log(f"  Avg verändert ({_prev_avg:.6g} → {avg:.6g}) — DCA erkannt → TP-Neuberechnung")
+        tp_set_ts.pop(symbol, None)   # Grace-Period löschen → TPs werden geprüft
+
+    # SCHUTZFENSTER: TPs kürzlich korrekt gesetzt → API-Abfrage sparen.
+    # Wird automatisch gelöscht wenn avg sich ändert (DCA-Fill erkannt, s.o.).
     if tp_set_ts.get(symbol, 0) > time.time() - SL_TP_GRACE:
-        log(f"  TPs: kürzlich gesetzt — skip TP-Prüfung (plan-order API unzuverlässig)")
+        log(f"  TPs: kürzlich gesetzt — skip TP-Prüfung")
         sl_at_entry[symbol] = sl_is_entry
         trade_data[symbol].update({"sl": sl_price if sl_price > 0 else trade_data.get(symbol, {}).get("sl", 0)})
         existing_tps = []
@@ -2947,14 +2560,16 @@ def check_and_repair_position(pos: dict):
         log(f"  ⚠ TPs inkorrekt ({'; '.join(reasons)}) → neu setzen")
 
         if True:  # kein Mindestgrößen-Block: TP4 immer setzen, TP1-3 intern übersprungen wenn qty=0
-            cancel_all_tp_orders(symbol)
+            cancel_all_tp_orders(symbol, trade_data.get(symbol, {}).get("tp_order_ids"))
             time.sleep(1)
             triggered_rois = {t["roi"] for t in state.get("tps_hit", [])}
             triggered_rois |= {t["roi"] for t in filled_tps}
-            count, tp_prices = place_tp_orders(
+            count, tp_prices, _tp_ids = place_tp_orders(
                 symbol, avg, size, direction, leverage, mark, known_sl=sl_price,
                 skip_rois=triggered_rois
             )
+            if symbol in trade_data:
+                trade_data[symbol]["tp_order_ids"] = _tp_ids
             status = "✓ Alle" if count == len(state["tps_remaining"]) else f"⚠ {count}"
             log(f"  {status} TPs gesetzt")
             if count > 0:
@@ -3061,9 +2676,9 @@ def report_position_startup(pos: dict):
 
     issues   = []   # Gesammelte Probleme → Telegram-Alert
 
-    # ── 1. Zuverlässig lesbare Daten von Bitget holen ─────────────────────
-    # SL/TP-Plan-Orders sind via API nicht lesbar (alle Endpoints schlagen fehl).
-    # Verlässliche Quellen: Fill-Historie, offene DCA-Orders, Positionsdaten.
+    # ── 1. Daten von Bitget lesen ─────────────────────────────────────────
+    # Startup-Check ist bewusst leichtgewichtig: prüft nur kritische Probleme.
+    # Vollständige TP/SL-Prüfung erfolgt im ersten regulären Polling-Zyklus.
     close_fills   = get_symbol_close_fills(symbol, since_hours=48)
     filled_tps    = detect_filled_tps(close_fills, avg, leverage, direction)
     fill_tp1      = any(t["roi"] == TP1_ROI for t in filled_tps)
@@ -3084,17 +2699,24 @@ def report_position_startup(pos: dict):
     tp1_done = state["tp1_price_hit"] or fill_tp1
 
     # Trade-Daten für Polling-Loop speichern
-    # SL aus geladenem State erhalten (load_state hat ihn korrekt geladen —
-    # nicht mit 0 überschreiben, sonst geht der SL-Fallback für TP4 verloren)
-    _existing_sl   = trade_data.get(symbol, {}).get("sl", 0)
-    _existing_open = trade_data.get(symbol, {}).get("open_ts", int(time.time() * 1000))
+    # Bestehende State-Werte erhalten:
+    #   sl         → aus geladenem State (nicht mit 0 überschreiben)
+    #   peak_size  → max(bestehend, aktuell) — nie kleiner setzen
+    #   open_ts    → nicht überschreiben wenn Trade bereits läuft
+    #   tp_order_ids → für Direktstornierung erhalten
+    _prev2         = trade_data.get(symbol, {})
+    _prev2_sl      = _prev2.get("sl", 0)
+    _prev2_peak    = _prev2.get("peak_size", 0)
+    _prev2_open_ts = _prev2.get("open_ts", int(time.time() * 1000))
+    _prev2_tp_ids  = _prev2.get("tp_order_ids", [])
     trade_data[symbol] = {
-        "entry":     avg,
-        "direction": direction,
-        "leverage":  leverage,
-        "sl":        _existing_sl,   # aus State erhalten, nicht überschreiben
-        "peak_size": size,
-        "open_ts":   _existing_open,
+        "entry":        avg,
+        "direction":    direction,
+        "leverage":     leverage,
+        "sl":           _prev2_sl,             # aus State erhalten
+        "peak_size":    max(_prev2_peak, size), # nie kleiner als gespeichertes Maximum
+        "open_ts":      _prev2_open_ts,
+        "tp_order_ids": _prev2_tp_ids,
     }
     if tp1_done:
         sl_at_entry[symbol] = False   # unklar, da SL nicht lesbar
@@ -3161,7 +2783,16 @@ def save_state():
         log(f"  [WARN] State konnte nicht gespeichert werden: {e}")
 
 def load_state():
-    """Lädt persistierten State. Ältere Timestamps (>12h) werden verworfen."""
+    """
+    Lädt persistierten State. Ältere Timestamps (>12h) werden verworfen.
+
+    tp_set_ts wird NICHT geladen — nach jedem Neustart werden TPs einmalig
+    geprüft und ggf. korrigiert. Das verhindert, dass falsche TPs (z.B. nach
+    einem DCA-Fill in der vorigen Session) unbemerkt bestehen bleiben.
+
+    sl_set_ts wird geladen — verhindert unerwünschtes SL-Überschreiben wenn
+    Bitget SL=0 zurückliefert (kurz nach dem Setzen).
+    """
     if not os.path.exists(STATE_FILE):
         return
     try:
@@ -3172,9 +2803,7 @@ def load_state():
             log(f"  State-Datei veraltet ({age/3600:.1f}h) — wird ignoriert")
             return
         sl_set_ts.update(s.get("sl_set_ts", {}))
-        # tp_set_ts wird NICHT geladen — nach jedem Neustart werden TPs einmalig
-        # geprüft und ggf. korrigiert. sl_set_ts wird geladen — verhindert
-        # unerwünschtes SL-Überschreiben nach Neustart.
+        # tp_set_ts wird NICHT geladen → erzwingt TP-Prüfung nach jedem Neustart
         sl_at_entry.update(s.get("sl_at_entry", {}))
         new_trade_done.update(s.get("new_trade_done", {}))
         last_known_avg.update(s.get("last_known_avg", {}))
@@ -3235,7 +2864,7 @@ def main():
             if h4_buffer:
                 with h4_buffer_lock:
                     oldest = min((i["ts"] for i in h4_buffer), default=0)
-                if oldest and time.time() - oldest >= H4_BUFFER_SEC:
+                if oldest and __import__("time").time() - oldest >= H4_BUFFER_SEC:
                     flush_h4_buffer()
 
             # ── 1. Neue Fills (Nachkäufe / Einstiege) ──────
@@ -3280,20 +2909,20 @@ def main():
                             log(f"Neuer Trade erkannt: {sym}")
                             setup_new_trade(pos)
 
-                    # TP1-Erkennung: Grösse ≥ 13% kleiner als Peak → SL auf Entry
-                    # TP1 schliesst 15% der Position → verbleibend = 85%.
+                    # TP1-Erkennung: Grösse ≥13% kleiner als Peak → SL auf Entry
+                    # TP1 schliesst 15% → verbleibend = 85%.
                     # Threshold 0.87 statt 0.85 damit 85% < 87% → True.
                     # peak_size statt kno_size: bei DCA wird kno_size grösser,
-                    # aber TP1 schliesst nur % der Original-Grösse → mit kno_size
-                    # wird die Reduktion relativ zu klein und nie erkannt.
+                    # TP1 schliesst aber nur % der Original-Grösse → Reduktion
+                    # relativ zu kno_size zu klein, wird nie erkannt.
                     elif (kno_size > 0
                             and not sl_at_entry.get(sym, False)):
-                        peak = trade_data.get(sym, {}).get("peak_size", kno_size)
-                        ref  = peak if peak > 0 else kno_size
-                        if cur_size < ref * 0.87:
-                            red = (ref - cur_size) / ref * 100
+                        _peak = trade_data.get(sym, {}).get("peak_size", kno_size)
+                        _ref  = _peak if _peak > 0 else kno_size
+                        if cur_size < _ref * 0.87:
+                            red = (_ref - cur_size) / _ref * 100
                             log(f"TP1 erkannt ({sym}): "
-                                f"peak={ref:.2f} → jetzt={cur_size:.2f} "
+                                f"peak={_ref:.2f} → jetzt={cur_size:.2f} "
                                 f"(-{red:.0f}%) → SL auf Entry")
                             set_sl_at_entry(sym, direction, cur_avg)
                             last_known_size[sym] = cur_size
