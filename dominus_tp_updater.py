@@ -2146,16 +2146,39 @@ def start_webhook_server():
     @app.route("/webhook", methods=["POST"])
     def webhook():
         # ── Token-Prüfung ─────────────────────────────────────
-        token = flask_request.args.get("token", "")
-        if token != WEBHOOK_SECRET:
-            log("⚠ Webhook: Ungültiger Token")
-            return jsonify({"error": "unauthorized"}), 401
+        # Token aus URL-Parameter ODER aus JSON-Body akzeptieren.
+        # WICHTIG: Wir geben bei ungültigem Token TROTZDEM 200 zurück —
+        # ein 401/403 würde TradingView als Fehler anzeigen und Retries auslösen.
+        # Stattdessen: intern loggen und still verwerfen.
+        token_url  = flask_request.args.get("token", "")
+        # Payload zuerst roh lesen (vor JSON-Parse, damit wir token aus body lesen können)
+        raw_body   = flask_request.get_data(as_text=True) or ""
+
+        # ── NaN/Infinity fix ──────────────────────────────────
+        # Pine Script gibt bei uninitialisierten Plots 'na' zurück,
+        # TradingView schreibt das als NaN in den JSON-Body.
+        # NaN ist kein valides JSON → muss VOR dem Parse bereinigt werden.
+        import re as _re
+        raw_clean = _re.sub(r'\bNaN\b',       'null', raw_body)
+        raw_clean = _re.sub(r'\bInfinity\b',  'null', raw_clean)
+        raw_clean = _re.sub(r'\b-Infinity\b', 'null', raw_clean)
 
         # ── Payload parsen ────────────────────────────────────
+        # IMMER 200 zurückgeben — nie 400/401/500 an TradingView senden.
+        # Fehler intern loggen + Telegram-Alert, damit nichts lautlos verschwindet.
         try:
-            data = flask_request.get_json(force=True) or {}
-        except Exception:
-            return jsonify({"error": "invalid json"}), 400
+            data = json.loads(raw_clean) if raw_clean.strip() else {}
+        except Exception as _e:
+            log(f"⚠ Webhook: JSON-Parse-Fehler: {_e} | Body (erste 200 Z.): {raw_body[:200]}")
+            telegram(f"⚠️ <b>Webhook Parse-Fehler</b>\n{_e}\nBody: <code>{raw_body[:150]}</code>")
+            return jsonify({"status": "ignored", "reason": "parse_error"}), 200
+
+        # Token-Prüfung (nach Parse, damit body-Token auch funktioniert)
+        token_body = str(data.get("token", ""))
+        token      = token_url or token_body
+        if WEBHOOK_SECRET and token != WEBHOOK_SECRET:
+            log(f"⚠ Webhook: Ungültiger Token (url='{token_url}' body='{token_body}')")
+            return jsonify({"status": "ignored", "reason": "unauthorized"}), 200
 
         raw_symbol = data.get("symbol", "").upper()
         entry      = float(data.get("entry", 0) or 0)
@@ -2265,7 +2288,7 @@ def start_webhook_server():
     @app.route("/", methods=["GET"])
     @app.route("/health", methods=["GET"])
     def health():
-        return jsonify({"status": "running", "version": "v4.33"}), 200
+        return jsonify({"status": "running", "version": "v4.34"}), 200
 
     port = int(os.environ.get("PORT", 8080))
     log(f"Webhook-Server gestartet auf Port {port}")
@@ -3069,7 +3092,7 @@ def main():
         log("In Railway → Variables eintragen.")
         return
 
-    log("DOMINUS Trade-Automatisierung v4.33 gestartet — mit finanzmathematischen Optimierungen")
+    log("DOMINUS Trade-Automatisierung v4.34 gestartet — mit finanzmathematischen Optimierungen")
     log(f"Intervall: {POLL_INTERVAL}s")
     log("Warte auf neue Trades...")
     log("─" * 55)
