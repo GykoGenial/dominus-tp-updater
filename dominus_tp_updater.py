@@ -132,6 +132,10 @@ H4_BUFFER_SEC  = int(os.environ.get("H4_BUFFER_SEC", "300"))  # 5 Min
 closed_trades: list = []
 daily_report_sent_date: str = ""   # "2026-04-17" — verhindert Doppelversand pro Tag
 
+# Harsi-Ausstiegslinie — letzter gesetzter Harsi-SL pro Symbol
+# {symbol: float}  — wird nie schlechter als Trailing SL
+harsi_sl: dict = {}
+
 
 # ═══════════════════════════════════════════════════════════════
 # BASIS-FUNKTIONEN
@@ -1011,6 +1015,7 @@ def handle_position_closed(symbol: str, reason: str = ""):
     new_trade_done.pop(symbol, None)
     sl_at_entry.pop(symbol, None)
     trailing_sl_level.pop(symbol, None)
+    harsi_sl.pop(symbol, None)
     _closed_ids = trade_data.pop(symbol, {}).get("tp_order_ids")
 
     # Noch offene TP-Orders aufräumen (Sicherheit)
@@ -1185,6 +1190,88 @@ def set_sl_trailing(symbol: str, direction: str, sl_price: float, level: int,
         )
     else:
         log(f"  ✗ Trailing SL Level {level} fehlgeschlagen: {result.get('msg', result)}")
+
+
+def set_sl_harsi(symbol: str, direction: str, harsi_price: float, cur_size: float = 0):
+    """
+    Setzt den SL auf die aktuelle Harsi-Ausstiegslinie — nur wenn dieser
+    Preis schützender ist als der aktuelle SL.
+
+    Logik:
+      Long:  harsi_price > current_sl  → SL nachziehen (höher = besser)
+      Short: harsi_price < current_sl  → SL nachziehen (tiefer = besser)
+
+    Überschreibt nie einen besseren Trailing SL oder einen bereits gesetzten
+    Entry-SL der über dem Harsi-Preis liegt (Long) / darunter (Short).
+    """
+    decimals     = get_price_decimals(symbol)
+    sl_str       = round_price(harsi_price, decimals)
+    current_sl   = _get_pos_sl_price(symbol, direction)
+
+    # Prüfen ob Harsi-SL schützender als aktueller SL
+    if current_sl > 0:
+        if direction == "long"  and harsi_price <= current_sl:
+            log(f"  Harsi-SL {harsi_price:.5f} nicht besser als akt. SL {current_sl:.5f} "
+                f"(Long: höher = besser) — skip")
+            return
+        if direction == "short" and harsi_price >= current_sl:
+            log(f"  Harsi-SL {harsi_price:.5f} nicht besser als akt. SL {current_sl:.5f} "
+                f"(Short: tiefer = besser) — skip")
+            return
+
+    existing_tp4 = _get_pos_tp_price(symbol, direction)
+    body_sl = {
+        "symbol":               symbol,
+        "productType":          PRODUCT_TYPE,
+        "marginCoin":           MARGIN_COIN,
+        "holdSide":             direction,
+        "stopLossTriggerPrice": sl_str,
+        "stopLossTriggerType":  "mark_price",
+    }
+    if existing_tp4 > 0:
+        body_sl["takeProfitTriggerPrice"] = round_price(existing_tp4, decimals)
+        body_sl["takeProfitTriggerType"]  = "mark_price"
+        log(f"  TP4 @ {existing_tp4} wird mitgeführt")
+
+    result = api_post("/api/v2/mix/order/place-pos-tpsl", body_sl)
+    if result.get("code") == "00000":
+        harsi_sl[symbol]  = harsi_price
+        sl_set_ts[symbol] = time.time()
+        save_state()
+
+        # Telegram: Restposition + gesicherter Mindestgewinn
+        td    = trade_data.get(symbol, {})
+        entry = float(td.get("entry", 0))
+        if cur_size > 0 and entry > 0:
+            if direction == "long":
+                guaranteed = cur_size * (harsi_price - entry)
+            else:
+                guaranteed = cur_size * (entry - harsi_price)
+            size_str      = f"{cur_size:.2f} Kontrakte"
+            guaranteed_str = (f"+{guaranteed:.2f} USDT" if guaranteed >= 0
+                              else f"{guaranteed:.2f} USDT")
+        else:
+            size_str       = "—"
+            guaranteed_str = "—"
+
+        prev_sl_str = f"{current_sl:.5f}" if current_sl > 0 else "—"
+        log(f"  ✓ Harsi-SL gesetzt: {sl_str} USDT ({symbol}) | "
+            f"vorher: {prev_sl_str} | Rest: {size_str} | Min: {guaranteed_str}")
+        telegram(
+            f"📉 <b>Harsi-Ausstiegslinie — {symbol}</b>\n"
+            f"SL → {sl_str} USDT  (vorher: {prev_sl_str})\n"
+            f"━━━━━━━━━━\n"
+            f"📦 Restposition:     {size_str}\n"
+            f"🛡 Min. Gewinn:      {guaranteed_str}\n"
+            f"⚠️ Harsi-Momentum dreht — SL auf Ausstiegslinie gesetzt"
+        )
+    else:
+        log(f"  ✗ Harsi-SL fehlgeschlagen: {result.get('msg', result)}")
+        telegram(
+            f"❌ <b>Harsi-SL fehlgeschlagen — {symbol}</b>\n"
+            f"Ziel: {sl_str} USDT\n"
+            f"Bitte SL manuell prüfen!"
+        )
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -2327,7 +2414,33 @@ def start_webhook_server():
             entry = get_mark_price(symbol)
 
         signal_type = data.get("signal", "").upper()
-        log(f"\U0001f4e1 Alert: {symbol} {direction.upper()} @ {entry} [{timeframe}]")
+        log(f"📡 Alert: {symbol} {direction.upper()} @ {entry} [{timeframe}] signal={signal_type}")
+
+        # ── HARSI_EXIT: Ausstiegslinie als neuen SL setzen ───────────────
+        if signal_type == "HARSI_EXIT":
+            harsi_price = float(data.get("price", 0) or data.get("sl", 0) or 0)
+            if harsi_price == 0:
+                log(f"  ⚠ HARSI_EXIT ohne Preis — ignoriert")
+                return jsonify({"status": "ignored", "reason": "no price"}), 200
+
+            log(f"  Harsi-Ausstiegslinie: {symbol} {direction.upper()} "
+                f"SL → {harsi_price}")
+
+            # Position suchen — cur_size für Telegram-Notification
+            cur_size = 0
+            for pos in get_all_positions():
+                if pos.get("symbol") == symbol and pos.get("holdSide") == direction:
+                    cur_size = float(pos.get("total", 0))
+                    break
+
+            if cur_size == 0:
+                log(f"  ⚠ Keine offene {direction.upper()}-Position für {symbol} gefunden")
+                return jsonify({"status": "ignored",
+                                "reason": "no open position"}), 200
+
+            set_sl_harsi(symbol, direction, harsi_price, cur_size=cur_size)
+            return jsonify({"status": "ok", "symbol": symbol,
+                            "harsi_sl": harsi_price}), 200
 
         # H4 Trigger → gepuffert, nach 5 Min gebündelt senden
         if timeframe == "H4" or signal_type == "H4_TRIGGER":
@@ -3195,6 +3308,7 @@ def save_state():
             "trade_data":              trade_data,
             "closed_trades":           clean_trades,
             "daily_report_sent_date":  daily_report_sent_date,
+            "harsi_sl":                harsi_sl,
             "saved_at":                time.time(),
         }
         with open(STATE_FILE, "w") as f:
@@ -3235,6 +3349,7 @@ def load_state():
         loaded_trades = s.get("closed_trades", [])
         closed_trades.extend(loaded_trades)
         daily_report_sent_date = s.get("daily_report_sent_date", "")
+        harsi_sl.update(s.get("harsi_sl", {}))
         log(f"  ✓ State geladen: {len(trade_data)} Trade(s) | "
             f"SL-ts: {len(sl_set_ts)} | TP-Prüfung erzwungen nach Neustart | "
             f"Alter: {age/60:.0f} Min")
