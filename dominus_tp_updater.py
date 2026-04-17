@@ -16,6 +16,8 @@ WAS PASSIERT AUTOMATISCH:
                          → Telegram-Vollbericht
   2. Nachkauf erkannt   → Alle TPs neu berechnet
   3. TP1 ausgelöst      → SL auf Entry gezogen
+     TP2 ausgelöst      → Trailing SL auf TP1-Preis
+     TP3 ausgelöst      → Trailing SL auf TP2-Preis
 
 WAS DU TUN MUSST:
   - Market Order auf Bitget platzieren (Long/Short)
@@ -101,6 +103,7 @@ BASE_URL = "https://api.bitget.com"
 last_known_avg:   dict = {}   # {symbol: avg_price}
 last_known_size:  dict = {}   # {symbol: position_size}
 sl_at_entry:      dict = {}   # {symbol: bool}
+trailing_sl_level: dict = {}  # {symbol: int} — 0=initial, 1=Entry, 2=TP1-Preis, 3=TP2-Preis
 new_trade_done:   dict = {}   # {symbol: bool} — DCA bereits gesetzt?
 price_decimals_cache: dict = {}
 last_update_id:   int  = 0    # Telegram: letzter verarbeiteter Update-ID
@@ -983,6 +986,7 @@ def handle_position_closed(symbol: str, reason: str = ""):
     last_known_size.pop(symbol, None)
     new_trade_done.pop(symbol, None)
     sl_at_entry.pop(symbol, None)
+    trailing_sl_level.pop(symbol, None)
     _closed_ids = trade_data.pop(symbol, {}).get("tp_order_ids")
 
     # Noch offene TP-Orders aufräumen (Sicherheit)
@@ -1032,7 +1036,7 @@ def _get_pos_tp_price(symbol: str, direction: str) -> float:
     return 0.0
 
 
-def set_sl_at_entry(symbol: str, direction: str, entry_price: float):
+def set_sl_at_entry(symbol: str, direction: str, entry_price: float, cur_size: float = 0):
     """SL auf Einstiegspreis setzen — DOMINUS-Regel nach TP1."""
     decimals = get_price_decimals(symbol)
     sl_str   = round_price(entry_price, decimals)
@@ -1063,14 +1067,100 @@ def set_sl_at_entry(symbol: str, direction: str, entry_price: float):
         save_state()
         # DCA Limit-Orders stornieren — nicht mehr nötig nach TP1
         cancel_open_dca_orders(symbol, direction)
+
+        # Telegram: Restposition + realisierter TP1-Gewinn berechnen
+        td         = trade_data.get(symbol, {})
+        leverage   = int(td.get("leverage", 20))
+        peak_size  = td.get("peak_size", 0)
+        tp1_price  = calc_tp_price(entry_price, TP1_ROI, direction, leverage)
+        closed_qty = max(0, peak_size - cur_size) if cur_size > 0 and peak_size > 0 else 0
+        tp1_profit = closed_qty * abs(tp1_price - entry_price) if closed_qty > 0 else 0
+        size_str   = f"{cur_size:.2f}" if cur_size > 0 else "—"
+        profit_str = f"+{tp1_profit:.2f} USDT" if tp1_profit > 0 else "—"
+
         telegram(
-            f"🔒 <b>SL auf Entry — {symbol}</b>\n"
-            f"TP1 ausgelöst → SL auf {sl_str} USDT\n"
-            f"✓ Position abgesichert\n"
+            f"🔒 <b>TP1 ausgelöst — {symbol}</b>\n"
+            f"SL → Entry @ {sl_str} USDT (Break-even gesichert)\n"
+            f"━━━━━━━━━━\n"
+            f"💰 Realisiert:      {profit_str}\n"
+            f"📦 Restposition:    {size_str} Kontrakte\n"
+            f"🛡 Min. Gewinn Rest: 0 USDT (Break-even)\n"
             f"✓ DCA-Orders storniert"
         )
     else:
         log(f"  ✗ SL-Anpassung fehlgeschlagen: {result.get('msg', result)}")
+
+
+def set_sl_trailing(symbol: str, direction: str, sl_price: float, level: int,
+                    cur_size: float = 0):
+    """
+    TP-Step Trailing: SL auf den vorherigen TP-Preis nachziehen.
+
+    Wird aufgerufen wenn TP2 oder TP3 ausgelöst wird:
+      TP2 ausgelöst → SL auf TP1-Preis  (level=2)
+      TP3 ausgelöst → SL auf TP2-Preis  (level=3)
+
+    Sichert damit den Gewinn des vorigen TP-Levels auf der Restposition.
+    """
+    if trailing_sl_level.get(symbol, 0) >= level:
+        log(f"  Trailing Level {level} bereits gesetzt — skip")
+        return
+
+    decimals     = get_price_decimals(symbol)
+    sl_str       = round_price(sl_price, decimals)
+    existing_tp4 = _get_pos_tp_price(symbol, direction)
+
+    body_sl = {
+        "symbol":               symbol,
+        "productType":          PRODUCT_TYPE,
+        "marginCoin":           MARGIN_COIN,
+        "holdSide":             direction,
+        "stopLossTriggerPrice": sl_str,
+        "stopLossTriggerType":  "mark_price",
+    }
+    if existing_tp4 > 0:
+        body_sl["takeProfitTriggerPrice"] = round_price(existing_tp4, decimals)
+        body_sl["takeProfitTriggerType"]  = "mark_price"
+        log(f"  TP4 @ {existing_tp4} wird mitgeführt")
+
+    tp_label   = {2: "TP2", 3: "TP3"}.get(level, "?")
+    prev_label = {2: "TP1 (10% ROI)", 3: "TP2 (20% ROI)"}.get(level, "?")
+
+    result = api_post("/api/v2/mix/order/place-pos-tpsl", body_sl)
+    if result.get("code") == "00000":
+        trailing_sl_level[symbol] = level
+        sl_set_ts[symbol]         = time.time()
+        sl_at_entry[symbol]       = True
+        save_state()
+
+        # Telegram: Restposition + gesicherter Mindestgewinn berechnen
+        td        = trade_data.get(symbol, {})
+        entry     = float(td.get("entry", 0))
+        # Gesicherter Mindestgewinn auf Restposition wenn SL greift:
+        # Restposition × Preisdifferenz (SL-Preis − Entry) für Long, umgekehrt für Short
+        if cur_size > 0 and entry > 0:
+            if direction == "long":
+                guaranteed = cur_size * (sl_price - entry)
+            else:
+                guaranteed = cur_size * (entry - sl_price)
+            size_str      = f"{cur_size:.2f} Kontrakte"
+            guaranteed_str = f"+{guaranteed:.2f} USDT" if guaranteed > 0 else f"{guaranteed:.2f} USDT"
+        else:
+            size_str       = "—"
+            guaranteed_str = "—"
+
+        log(f"  ✓ Trailing SL (Level {level}): SL → {sl_str} USDT "
+            f"({prev_label} gesichert | Rest: {size_str} | Min: {guaranteed_str})")
+        telegram(
+            f"📈 <b>{tp_label} ausgelöst — {symbol}</b>\n"
+            f"SL → {sl_str} USDT ({prev_label} gesichert)\n"
+            f"━━━━━━━━━━\n"
+            f"📦 Restposition:     {size_str}\n"
+            f"🛡 Min. Gewinn Rest: {guaranteed_str}\n"
+            f"  (falls SL greift bevor TP{level + 1})"
+        )
+    else:
+        log(f"  ✗ Trailing SL Level {level} fehlgeschlagen: {result.get('msg', result)}")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1334,10 +1424,11 @@ def setup_new_trade(pos: dict):
     )
 
     # ── 5. Status speichern ─────────────────────────────────
-    last_known_avg[symbol]  = entry
-    last_known_size[symbol] = size
-    new_trade_done[symbol]  = True
-    sl_at_entry[symbol]     = False
+    last_known_avg[symbol]     = entry
+    last_known_size[symbol]    = size
+    new_trade_done[symbol]     = True
+    sl_at_entry[symbol]        = False
+    trailing_sl_level[symbol]  = 0    # Trailing-Level zurücksetzen
     # Trade-Daten für spätere Auswertung
     trade_data[symbol] = {
         "entry":        entry,
@@ -1812,10 +1903,12 @@ def cmd_status():
         pnl  = float(pos.get("unrealizedPL", 0))
         mark = get_mark_price(sym)
         secured = sl_at_entry.get(sym, False)
+        trl_lvl = trailing_sl_level.get(sym, 0)
+        trl_tag = {0: "", 1: " · SL=Entry", 2: " · Trail→TP1", 3: " · Trail→TP2"}.get(trl_lvl, "")
         icon = "🔒" if secured else "📈"
         lines.append(
             f"{icon} {sym} {drct} {lev}x | "
-            f"Qty={qty:.2f} | Mark={mark} | PnL={pnl:+.2f} USDT"
+            f"Qty={qty:.2f} | Mark={mark} | PnL={pnl:+.2f} USDT{trl_tag}"
         )
     reply("\n".join(lines))
 
@@ -2851,14 +2944,15 @@ def save_state():
     """Persistiert volatile State-Dicts auf Disk."""
     try:
         state = {
-            "sl_set_ts":       sl_set_ts,
-            "tp_set_ts":       tp_set_ts,
-            "sl_at_entry":     sl_at_entry,
-            "new_trade_done":  new_trade_done,
-            "last_known_avg":  last_known_avg,
-            "last_known_size": last_known_size,
-            "trade_data":      trade_data,
-            "saved_at":        time.time(),
+            "sl_set_ts":          sl_set_ts,
+            "tp_set_ts":          tp_set_ts,
+            "sl_at_entry":        sl_at_entry,
+            "trailing_sl_level":  trailing_sl_level,
+            "new_trade_done":     new_trade_done,
+            "last_known_avg":     last_known_avg,
+            "last_known_size":    last_known_size,
+            "trade_data":         trade_data,
+            "saved_at":           time.time(),
         }
         with open(STATE_FILE, "w") as f:
             json.dump(state, f)
@@ -2888,6 +2982,7 @@ def load_state():
         sl_set_ts.update(s.get("sl_set_ts", {}))
         # tp_set_ts wird NICHT geladen → erzwingt TP-Prüfung nach jedem Neustart
         sl_at_entry.update(s.get("sl_at_entry", {}))
+        trailing_sl_level.update(s.get("trailing_sl_level", {}))
         new_trade_done.update(s.get("new_trade_done", {}))
         last_known_avg.update(s.get("last_known_avg", {}))
         last_known_size.update(s.get("last_known_size", {}))
@@ -2992,22 +3087,53 @@ def main():
                             log(f"Neuer Trade erkannt: {sym}")
                             setup_new_trade(pos)
 
-                    # TP1-Erkennung: Grösse ≥13% kleiner als Peak → SL auf Entry
-                    # TP1 schliesst 15% → verbleibend = 85%.
-                    # Threshold 0.87 statt 0.85 damit 85% < 87% → True.
+                    # TP-Step Trailing: Grössenreduktion erkennen und SL nachziehen
+                    #
+                    # Thresholds relativ zu peak_size (Original-Positionsgrösse):
+                    #   TP1 (15% geschlossen): verbleibend 85% → Threshold 87%
+                    #   TP2 (weitere 20%):     verbleibend 65% → Threshold 67%
+                    #   TP3 (weitere 30%):     verbleibend 35% → Threshold 37%
+                    #
                     # peak_size statt kno_size: bei DCA wird kno_size grösser,
                     # TP1 schliesst aber nur % der Original-Grösse → Reduktion
                     # relativ zu kno_size zu klein, wird nie erkannt.
-                    elif (kno_size > 0
-                            and not sl_at_entry.get(sym, False)):
+                    elif kno_size > 0:
                         _peak = trade_data.get(sym, {}).get("peak_size", kno_size)
                         _ref  = _peak if _peak > 0 else kno_size
-                        if cur_size < _ref * 0.87:
+                        _trl  = trailing_sl_level.get(sym, 0)
+                        _td   = trade_data.get(sym, {})
+                        _avg  = _td.get("entry", cur_avg)
+                        _lev  = _td.get("leverage", 10)
+                        _dir  = _td.get("direction", direction)
+
+                        if cur_size < _ref * 0.87 and not sl_at_entry.get(sym, False):
+                            # TP1 ausgelöst → SL auf Entry
                             red = (_ref - cur_size) / _ref * 100
                             log(f"TP1 erkannt ({sym}): "
                                 f"peak={_ref:.2f} → jetzt={cur_size:.2f} "
                                 f"(-{red:.0f}%) → SL auf Entry")
-                            set_sl_at_entry(sym, direction, cur_avg)
+                            trailing_sl_level[sym] = 1
+                            set_sl_at_entry(sym, _dir, _avg, cur_size=cur_size)
+                            last_known_size[sym] = cur_size
+
+                        elif cur_size < _ref * 0.67 and _trl < 2:
+                            # TP2 ausgelöst → SL auf TP1-Preis
+                            red = (_ref - cur_size) / _ref * 100
+                            tp1_price = calc_tp_price(_avg, TP1_ROI, _dir, _lev)
+                            log(f"TP2 erkannt ({sym}): "
+                                f"peak={_ref:.2f} → jetzt={cur_size:.2f} "
+                                f"(-{red:.0f}%) → Trailing SL auf TP1 @ {tp1_price:.5f}")
+                            set_sl_trailing(sym, _dir, tp1_price, level=2, cur_size=cur_size)
+                            last_known_size[sym] = cur_size
+
+                        elif cur_size < _ref * 0.37 and _trl < 3:
+                            # TP3 ausgelöst → SL auf TP2-Preis
+                            red = (_ref - cur_size) / _ref * 100
+                            tp2_price = calc_tp_price(_avg, TP2_ROI, _dir, _lev)
+                            log(f"TP3 erkannt ({sym}): "
+                                f"peak={_ref:.2f} → jetzt={cur_size:.2f} "
+                                f"(-{red:.0f}%) → Trailing SL auf TP2 @ {tp2_price:.5f}")
+                            set_sl_trailing(sym, _dir, tp2_price, level=3, cur_size=cur_size)
                             last_known_size[sym] = cur_size
 
                     # Grösse aktualisieren (Position teilweise geschlossen)
