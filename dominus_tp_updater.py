@@ -943,6 +943,18 @@ def set_sl_at_entry(symbol: str, direction: str, entry_price: float,
     decimals = get_price_decimals(symbol)
     sl_str   = round_price(entry_price, decimals)
 
+    # Mark-Price-Guard: Entry-SL darf nicht auf der falschen Seite des Mark-Price liegen
+    _mark = get_mark_price(symbol)
+    if _mark > 0:
+        if direction == "long" and entry_price >= _mark:
+            log(f"  ⚠ SL-auf-Entry: entry {entry_price:.5f} >= Mark {_mark:.5f} "
+                f"— skip (Bitget würde ablehnen)")
+            return
+        if direction == "short" and entry_price <= _mark:
+            log(f"  ⚠ SL-auf-Entry: entry {entry_price:.5f} <= Mark {_mark:.5f} "
+                f"— skip (Bitget würde ablehnen)")
+            return
+
     # Vorhandenen TP4 lesen — muss beim SL-Update mitgeschickt werden
     # (place-pos-tpsl überschreibt sonst den TP4)
     existing_tp4 = _get_pos_tp_price(symbol, direction)
@@ -1009,6 +1021,21 @@ def set_sl_trailing(symbol: str, direction: str, sl_price: float, level: int,
     if trailing_sl_level.get(symbol, 0) >= level:
         log(f"  Trailing Level {level} bereits gesetzt — skip")
         return
+
+    # ── Mark-Price-Guard ─────────────────────────────────────────
+    # Bitget lehnt ab wenn SL-Preis auf der falschen Seite des Mark-Price liegt.
+    # Long:  SL muss < Mark-Price (SL über dem Markt → Fehler)
+    # Short: SL muss > Mark-Price (SL unter dem Markt → Fehler)
+    _mark = get_mark_price(symbol)
+    if _mark > 0:
+        if direction == "long" and sl_price >= _mark:
+            log(f"  ⚠ Trailing SL Level {level}: sl_price {sl_price:.5f} >= Mark {_mark:.5f} "
+                f"— skip (Bitget würde ablehnen: SL muss < Mark für Long)")
+            return
+        if direction == "short" and sl_price <= _mark:
+            log(f"  ⚠ Trailing SL Level {level}: sl_price {sl_price:.5f} <= Mark {_mark:.5f} "
+                f"— skip (Bitget würde ablehnen: SL muss > Mark für Short)")
+            return
 
     decimals     = get_price_decimals(symbol)
     sl_str       = round_price(sl_price, decimals)
@@ -2167,7 +2194,10 @@ def start_webhook_server():
         signal_type = data.get("signal", "").upper()
         log(f"\U0001f4e1 Alert: {symbol} {direction.upper()} @ {entry} [{timeframe}]")
 
-        if signal_type == "HARSI_EXIT":
+        if signal_type == "HARSI_SL":
+            # HARSI_SL: SL auf Harsi-Ausstiegslinie setzen (für offene Positionen)
+            # Unterschied zu HARSI_EXIT: HARSI_EXIT = Entry-Signal (Alarm 3/3b)
+            #                            HARSI_SL   = SL-Anpassung bei offenem Trade (Alarm 4/4b)
             harsi_price = float(data.get("price", 0) or data.get("sl", 0) or 0)
             if harsi_price == 0:
                 return jsonify({"status": "ignored", "reason": "no price"}), 200
@@ -2235,7 +2265,7 @@ def start_webhook_server():
     @app.route("/", methods=["GET"])
     @app.route("/health", methods=["GET"])
     def health():
-        return jsonify({"status": "running", "version": "v4.32"}), 200
+        return jsonify({"status": "running", "version": "v4.33"}), 200
 
     port = int(os.environ.get("PORT", 8080))
     log(f"Webhook-Server gestartet auf Port {port}")
@@ -2724,32 +2754,50 @@ def check_and_repair_position(pos: dict):
     sl_at_entry[symbol] = sl_is_entry
 
     # ── Phase 2b: Trailing SL prüfen (TP2 / TP3) ─────────────────────────
-    # Detects whether TP2 or TP3 were triggered using TWO complementary methods:
+    # Erkennung ob TP2 / TP3 bereits ausgelöst wurden — zwei Methoden:
     #
-    # Method A — Fill-based (primary): detect_filled_tps() matches recent fills
-    #   to expected TP prices. Reliable but limited to 48h history.
+    # Methode A — Fill-basiert (primär):
+    #   detect_filled_tps() gleicht Close-Fills mit erwarteten TP-Preisen ab.
+    #   Zuverlässig, aber auf 48h begrenzt.
     #
-    # Method B — Size-based (fallback): compares current size to peak_size.
-    #   TP2 hit: size < peak * 0.67  (35% closed: 15% TP1 + 20% TP2)
-    #   TP3 hit: size < peak * 0.37  (63% closed: 15+20+25% = 60%)
-    #   Catches cases where fills are older than 48h.
+    # Methode B — Grössen-basiert (immer aktiv als Ergänzung):
+    #   peak_size wird rekonstruiert aus: aktuelle Grösse + Summe aller Close-Fill-Grössen.
+    #   Damit ist peak_size auch nach Neustart korrekt ohne gespeicherten State.
+    #   TP2 ausgelöst: size < peak * 0.67  (35% geschlossen: TP1 15% + TP2 20%)
+    #   TP3 ausgelöst: size < peak * 0.37  (63% geschlossen: TP1+TP2+TP3 = 60%)
     #
-    # Both methods must agree on at LEAST TP2 before acting, OR fills alone
-    # if they are present. Size-alone is used as fallback when no fills found.
+    # Kombination: Fill UND/ODER Grösse können TP2/TP3 bestätigen.
+    # Grössen-Methode deaktiviert nur wenn peak_size = aktuelle size (kein Rückschluss möglich).
 
     fill_tp2_hit = any(t["roi"] == TP2_ROI for t in filled_tps)
     fill_tp3_hit = any(t["roi"] == TP3_ROI for t in filled_tps)
 
-    # Size-based detection (fallback)
-    _peak = trade_data.get(symbol, {}).get("peak_size", size)
-    _ref  = _peak if _peak > 0 else size
-    size_tp3_hit = (size < _ref * 0.37) if _ref > 0 else False
-    size_tp2_hit = (size < _ref * 0.67) if _ref > 0 else False
+    # peak_size rekonstruieren: current_size + alle geschlossenen Fill-Mengen
+    # Zuverlässiger als gespeicherter State allein — funktioniert auch nach Neustart
+    _fill_closed_qty = sum(
+        float(f.get("baseVolume", 0) or f.get("size", 0) or 0)
+        for f in close_fills
+    )
+    _reconstructed_peak = size + _fill_closed_qty
+    _state_peak         = trade_data.get(symbol, {}).get("peak_size", 0)
+    # Grösstes der bekannten Werte nehmen — peak_size sinkt nie
+    _ref = max(_state_peak, _reconstructed_peak, size)
 
-    # Combine: fill takes priority; size is fallback when no fills at all
-    has_any_fills = len(close_fills) > 0
-    tp3_confirmed = fill_tp3_hit or (size_tp3_hit and not has_any_fills)
-    tp2_confirmed = fill_tp2_hit or (size_tp2_hit and not has_any_fills)
+    # Grössen-basierte Erkennung (unabhängig von Fill-Alter)
+    # Nur aktiv wenn _ref echt grösser als aktuelle size (belastbare Info)
+    _size_ratio    = size / _ref if _ref > size else 1.0
+    size_tp3_hit   = _size_ratio < 0.37
+    size_tp2_hit   = _size_ratio < 0.67
+
+    # Kombination: Fill ODER Grösse bestätigen TP-Level
+    tp3_confirmed = fill_tp3_hit or size_tp3_hit
+    tp2_confirmed = fill_tp2_hit or size_tp2_hit
+
+    log(f"  Phase 2b | fills={len(close_fills)} | "
+        f"fill_tp2={fill_tp2_hit} fill_tp3={fill_tp3_hit} | "
+        f"peak={_ref:.2f} cur={size:.2f} ratio={_size_ratio:.2f} | "
+        f"size_tp2={size_tp2_hit} size_tp3={size_tp3_hit} | "
+        f"tp2_confirmed={tp2_confirmed} tp3_confirmed={tp3_confirmed}")
 
     if tp3_confirmed:
         exp_trail_sl  = calc_tp_price(avg, TP2_ROI, direction, leverage)
@@ -2779,22 +2827,38 @@ def check_and_repair_position(pos: dict):
 
         if _sl_at_level(sl_price, exp_trail_sl) or _sl_better_than(sl_price, exp_trail_sl):
             trailing_sl_level[symbol] = max(current_trail, exp_trail_lvl)
-            log(f"  {exp_tp_label} erkannt (fill/size), "
+            log(f"  {exp_tp_label} erkannt, "
                 f"Trailing SL Level {exp_trail_lvl}: SL @ {sl_price} bereits korrekt ✓")
         elif current_trail < exp_trail_lvl:
-            log(f"  {exp_tp_label} erkannt (fill/size), "
-                f"SL noch nicht auf Trailing-Niveau — nachziehen auf {exp_trail_sl:.5f}")
+            log(f"  {exp_tp_label} erkannt, "
+                f"SL noch nicht auf Trailing-Niveau → nachziehen auf {exp_trail_sl:.5f}")
             set_sl_trailing(symbol, direction, exp_trail_sl,
                             level=exp_trail_lvl, cur_size=size)
+            # Lokale sl_price-Variable nachführen, damit place_tp_orders den
+            # richtigen (neuen) SL für TP4 mitschickt.
+            # trailing_sl_level wird in set_sl_trailing() nur bei Erfolg gesetzt.
+            if trailing_sl_level.get(symbol, 0) >= exp_trail_lvl:
+                sl_price = exp_trail_sl
+                log(f"  sl_price lokal aktualisiert → {exp_trail_sl:.5f} "
+                    f"(für nachfolgende TP4-Platzierung)")
+                # Kurze Pause — Bitget braucht einen Moment nach place-pos-tpsl
+                # bevor plan-orders (place-tpsl-order) wieder akzeptiert werden.
+                time.sleep(2)
+    else:
+        log(f"  Phase 2b: kein TP2/TP3 erkannt — SL bleibt unverändert")
 
-    # Trade-Daten für spätere Auswertung und als SL-Fallback in place_tp_orders
+    # Trade-Daten aktualisieren — peak_size NIE kleiner setzen als bekanntes Maximum
+    _prev_td   = trade_data.get(symbol, {})
+    _prev_peak = _prev_td.get("peak_size", 0)
+    _prev_ts   = _prev_td.get("open_ts", int(time.time() * 1000))
     trade_data[symbol] = {
-        "entry":     avg,
-        "direction": direction,
-        "leverage":  leverage,
-        "sl":        sl_price,
-        "peak_size": size,
-        "open_ts":   int(time.time() * 1000),
+        "entry":        avg,
+        "direction":    direction,
+        "leverage":     leverage,
+        "sl":           sl_price,
+        "peak_size":    max(_prev_peak, _reconstructed_peak, size),   # nie reduzieren
+        "open_ts":      _prev_ts,                                      # Öffnungszeit erhalten
+        "tp_order_ids": _prev_td.get("tp_order_ids", []),
     }
 
     # ── 2. TPs prüfen ─────────────────────────────────────────────────────
@@ -3005,7 +3069,7 @@ def main():
         log("In Railway → Variables eintragen.")
         return
 
-    log("DOMINUS Trade-Automatisierung v4.32 gestartet — mit finanzmathematischen Optimierungen")
+    log("DOMINUS Trade-Automatisierung v4.33 gestartet — mit finanzmathematischen Optimierungen")
     log(f"Intervall: {POLL_INTERVAL}s")
     log("Warte auf neue Trades...")
     log("─" * 55)
