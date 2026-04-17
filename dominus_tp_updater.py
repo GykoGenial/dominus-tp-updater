@@ -2505,11 +2505,15 @@ def check_and_repair_position(pos: dict):
                     sl_price    = avg
                     sl_is_entry = True
                     log(f"  ✓ SL auf Entry gesetzt (Gewinn-Floor) @ {sl_str}")
+                    # DCA-Orders stornieren — SL auf Entry macht Nachkäufe unterhalb
+                    # des Entries sinnlos (SL würde vor DCA-Fill schliessen)
+                    cancel_open_dca_orders(symbol, direction)
                     telegram(
                         f"🔒 <b>SL auf Entry gesetzt — {symbol}</b>\n"
                         f"Script-Start: Position im Gewinn ({pnl_sign}{pnl}% Margin), "
                         f"kein SL gefunden\n"
                         f"SL: {sl_str} USDT (Schutz: kein Rückfall in Verlust)\n"
+                        f"✓ DCA-Orders storniert\n"
                         f"⚠️ Mit Ausstiegslinie abgleichen!"
                     )
                 else:
