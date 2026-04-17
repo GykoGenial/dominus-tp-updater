@@ -151,6 +151,40 @@ def telegram(msg: str):
         pass
 
 
+def chart_kb(symbol: str, include_btc: bool = True) -> list:
+    """Inline-Keyboard mit TradingView Chart-Links als Buttons."""
+    links = tv_chart_links(symbol)
+    rows = [[
+        {"text": f"📈 H2 {symbol}", "url": links["coin_h2"]},
+        {"text": f"📊 H4 {symbol}", "url": links["coin_h4"]},
+    ]]
+    if include_btc:
+        rows.append([
+            {"text": "₿ BTC H2",   "url": links["btc_h2"]},
+            {"text": "🌐 Total2",   "url": links["total2"]},
+        ])
+    return rows
+
+
+def telegram_kb(msg: str, keyboard: list):
+    """Sendet Telegram-Nachricht mit Inline-Keyboard Buttons (kurze URLs)."""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={
+                "chat_id":     TELEGRAM_CHAT_ID,
+                "text":        msg,
+                "parse_mode":  "HTML",
+                "reply_markup": {"inline_keyboard": keyboard},
+            },
+            timeout=5
+        )
+    except Exception:
+        pass
+
+
 def sign(timestamp: str, method: str, path: str, body: str = "") -> str:
     msg = timestamp + method.upper() + path + body
     sig = hmac.new(SECRET_KEY.encode(), msg.encode(), hashlib.sha256).digest()
@@ -2013,37 +2047,47 @@ def start_webhook_server():
 
         # H2 Signal → H4 Puffer flushen dann sofort senden
         flush_h4_buffer()
-        balance   = get_futures_balance()
-        kelly     = kelly_recommendation(balance, WINRATE)
-        links     = tv_chart_links(symbol)
-        per_order = balance * 0.10 / 3
-        chk_dir   = "gr\u00fcner" if direction == "long" else "roter"
-        icon      = dir_icon(direction)
+        balance     = get_futures_balance()
+        kelly       = kelly_recommendation(balance, WINRATE)
+        per_order   = balance * 0.10 / 3
+        icon        = dir_icon(direction)
+
+        # Statuswerte aus JSON (von DOM-ORC Plots)
+        harsi_warn  = int(data.get("harsi_warn",  0) or 0)
+        btc_t2_warn = int(data.get("btc_t2_warn", 0) or 0)
+        premium     = int(data.get("premium",     0) or 0)
+
+        harsi_line  = "⚠️ HARSI in Extremzone — warten" if harsi_warn  else "✅ HARSI OK"
+        btc_t2_line = "⚠️ BTC/Total2 keine Übereinstimmung" if btc_t2_warn else "✅ BTC + Total2 OK"
+        prem_line   = "⭐ Premium Setup" if premium else "— Kein Premium"
+
+        # /trade-Befehl vorausfüllen: SL = Entry ±25% (anpassbar nach Kerzenschluss)
+        decimals  = len(str(entry).rstrip('0').split('.')[-1]) if '.' in str(entry) else 2
+        sl_factor = 0.75 if direction == "long" else 1.25
+        sl_default = round(entry * sl_factor, decimals)
+        trade_cmd = f"/trade {symbol} {direction.upper()} 10 {entry:.{decimals}f} {sl_default:.{decimals}f}"
+
         msg_parts = [
-            f"{icon} <b>H2 Signal \u2014 {symbol} {direction.upper()}</b>",
-            "\u2501" * 12,
-            f"Kurs: {entry}",
+            f"{icon} <b>H2 Signal — {symbol} {direction.upper()}</b>",
+            "━" * 14,
+            f"Kurs: <b>{entry}</b>",
             "",
-            "\U0001f4cb <b>DOMINUS Checkliste:</b>",
-            "\u2610 DOMINUS Impuls Extremzone erreicht?",
-            "\u2610 H4 Trigger best\u00e4tigt?",
-            "\u2610 HARSI nicht in Extremzone?",
-            "\u2610 BTC + Total2 gleiche Richtung?",
-            f"\u2610 Premium Setup? (Impuls dunkel{chk_dir})",
+            "📋 <b>Status:</b>",
+            harsi_line,
+            btc_t2_line,
+            prem_line,
             "",
-            f"\U0001f4b0 {balance:.0f} USDT  |  Pro Order: {per_order:.0f} USDT",
-            f"\U0001f4ca Kelly: {kelly['kelly_pct']}%",
+            f"💰 {balance:.0f} USDT  |  Pro Order: {per_order:.0f} USDT",
+            f"📊 Kelly: {kelly['kelly_pct']}%",
             "",
-            "\u23f1 <b>30-Min-Fenster l\u00e4uft!</b>",
-            f"/trade {symbol} {direction.upper()} [HEBEL] {entry:.5f} [SL]",
-            "",
-            "\U0001f4c8 Charts:",
-            f"H2 {symbol}: {links['coin_h2']}",
-            f"H4 {symbol}: {links['coin_h4']}",
-            f"BTC H2: {links['btc_h2']}",
-            f"Total2: {links['total2']}",
+            "⏱ <b>30-Min-Fenster läuft!</b>",
+            f"<code>{trade_cmd}</code>",
         ]
-        telegram("\n".join(msg_parts))
+
+        # Keyboard: Chart-Buttons + /trade kopieren
+        kb = chart_kb(symbol)
+        kb.append([{"text": "📋 /trade kopieren", "copy_text": {"text": trade_cmd}}])
+        telegram_kb("\n".join(msg_parts), kb)
         return jsonify({"status": "ok", "symbol": symbol,
                         "direction": direction}), 200
 
