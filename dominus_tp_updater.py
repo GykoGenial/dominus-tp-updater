@@ -2412,6 +2412,8 @@ def check_and_repair_position(pos: dict):
     close_fills  = get_symbol_close_fills(symbol, since_hours=48)
     filled_tps   = detect_filled_tps(close_fills, avg, leverage, direction)
     fill_tp1_hit = any(t["roi"] == TP1_ROI for t in filled_tps)
+    fill_tp2_hit = any(t["roi"] == TP2_ROI for t in filled_tps)
+    fill_tp3_hit = any(t["roi"] == TP3_ROI for t in filled_tps)
 
     if filled_tps:
         fill_labels = ", ".join(t["label"] for t in filled_tps)
@@ -2559,26 +2561,13 @@ def check_and_repair_position(pos: dict):
             if sl_valid:
                 reason = ("fill-basiert" if fill_tp1_hit and not state["tp1_price_hit"]
                           else "preislich passiert")
-                log(f"  TP1 ausgelöst ({reason}), kein SL → setze SL auf Entry @ {sl_str}")
-                res = api_post("/api/v2/mix/order/place-pos-tpsl", {
-                    "symbol":               symbol,
-                    "productType":          PRODUCT_TYPE,
-                    "marginCoin":           MARGIN_COIN,
-                    "holdSide":             direction,
-                    "stopLossTriggerPrice": sl_str,
-                    "stopLossTriggerType":  "mark_price",
-                })
-                if res.get("code") == "00000":
+                log(f"  TP1 ausgelöst ({reason}), kein SL → set_sl_at_entry()")
+                # Trailing Level vorab setzen (Level 1 = SL auf Entry)
+                trailing_sl_level[symbol] = 1
+                set_sl_at_entry(symbol, direction, avg, cur_size=size)
+                if sl_at_entry.get(symbol, False):
                     sl_price    = avg
                     sl_is_entry = True
-                    log(f"  ✓ SL auf Entry gesetzt @ {sl_str}")
-                    telegram(
-                        f"🔒 <b>SL auf Entry gesetzt — {symbol}</b>\n"
-                        f"Script-Start: TP1 ausgelöst ({reason}), kein SL vorhanden\n"
-                        f"SL: {sl_str} USDT"
-                    )
-                else:
-                    log(f"  ✗ SL auf Entry fehlgeschlagen: {res.get('msg', res)}")
             else:
                 log(f"  ⚠ Mark {mark} bereits hinter Entry {avg} — SL auf Entry nicht setzbar")
                 telegram(f"⚠️ <b>{symbol}</b>: Position im Verlust, SL manuell setzen!")
@@ -2604,15 +2593,30 @@ def check_and_repair_position(pos: dict):
                 if res.get("code") == "00000":
                     sl_price    = avg
                     sl_is_entry = True
+                    # Trailing Level 1 setzen — SL auf Entry entspricht Level 1
+                    trailing_sl_level[symbol] = max(trailing_sl_level.get(symbol, 0), 1)
+                    sl_set_ts[symbol] = time.time()
                     log(f"  ✓ SL auf Entry gesetzt (Gewinn-Floor) @ {sl_str}")
                     # DCA-Orders stornieren — SL auf Entry macht Nachkäufe unterhalb
                     # des Entries sinnlos (SL würde vor DCA-Fill schliessen)
                     cancel_open_dca_orders(symbol, direction)
+                    td         = trade_data.get(symbol, {})
+                    leverage_f = int(td.get("leverage", 20))
+                    peak_size  = td.get("peak_size", 0)
+                    closed_qty = max(0, peak_size - size) if size > 0 and peak_size > 0 else 0
+                    tp1_price  = calc_tp_price(avg, TP1_ROI, direction, leverage_f)
+                    tp1_profit = closed_qty * abs(tp1_price - avg) if closed_qty > 0 else 0
+                    size_str   = f"{size:.2f}" if size > 0 else "—"
+                    profit_str = f"+{tp1_profit:.2f} USDT" if tp1_profit > 0 else "—"
                     telegram(
                         f"🔒 <b>SL auf Entry gesetzt — {symbol}</b>\n"
-                        f"Script-Start: Position im Gewinn ({pnl_sign}{pnl}% Margin), "
+                        f"Gewinn-Floor: Position im Gewinn ({pnl_sign}{pnl}% Margin), "
                         f"kein SL gefunden\n"
                         f"SL: {sl_str} USDT (Schutz: kein Rückfall in Verlust)\n"
+                        f"━━━━━━━━━━\n"
+                        f"💰 Realisiert:      {profit_str}\n"
+                        f"📦 Restposition:    {size_str} Kontrakte\n"
+                        f"🛡 Min. Gewinn Rest: 0 USDT (Break-even)\n"
                         f"✓ DCA-Orders storniert\n"
                         f"⚠️ Mit Ausstiegslinie abgleichen!"
                     )
@@ -2666,6 +2670,60 @@ def check_and_repair_position(pos: dict):
                 )
 
     sl_at_entry[symbol] = sl_is_entry
+
+    # ── 2b. Trailing SL prüfen (TP2 / TP3) ───────────────────────────────
+    # Wenn TP2 oder TP3 ausgelöst wurde, muss der SL auf das entsprechende
+    # Niveau nachgezogen sein. Falls nicht → hier reparieren.
+    #
+    # Erwartete SL-Preise:
+    #   TP2 ausgelöst → SL sollte auf TP1-Preis stehen
+    #   TP3 ausgelöst → SL sollte auf TP2-Preis stehen
+    #
+    # Toleranz 0.15% — gleich wie bei Entry-Erkennung.
+
+    def _sl_at_level(sl_val: float, expected: float) -> bool:
+        """True wenn SL-Preis innerhalb 0.15% des erwarteten Niveaus liegt."""
+        if expected == 0 or sl_val == 0:
+            return False
+        return abs(sl_val - expected) / expected * 100 <= 0.15
+
+    def _sl_better_than(sl_val: float, expected: float) -> bool:
+        """True wenn bestehender SL bereits besser (schützender) als erwartet."""
+        if sl_val == 0:
+            return False
+        if direction == "long":
+            return sl_val >= expected   # Long: höher = besser
+        else:
+            return sl_val <= expected   # Short: tiefer = besser
+
+    if fill_tp3_hit:
+        # TP3 ausgelöst → SL sollte auf TP2-Preis stehen
+        exp_trail_sl  = calc_tp_price(avg, TP2_ROI, direction, leverage)
+        exp_trail_lvl = 3
+        exp_tp_label  = "TP3"
+    elif fill_tp2_hit:
+        # TP2 ausgelöst → SL sollte auf TP1-Preis stehen
+        exp_trail_sl  = calc_tp_price(avg, TP1_ROI, direction, leverage)
+        exp_trail_lvl = 2
+        exp_tp_label  = "TP2"
+    else:
+        exp_trail_sl  = 0
+        exp_trail_lvl = 0
+        exp_tp_label  = ""
+
+    if exp_trail_lvl > 0:
+        current_trail = trailing_sl_level.get(symbol, 0)
+        if _sl_at_level(sl_price, exp_trail_sl) or _sl_better_than(sl_price, exp_trail_sl):
+            # SL bereits korrekt oder besser → State aktualisieren, nichts setzen
+            trailing_sl_level[symbol] = max(current_trail, exp_trail_lvl)
+            log(f"  Trailing SL Level {exp_trail_lvl}: SL @ {sl_price} "
+                f"bereits auf/über erwartetem Niveau ({exp_trail_sl:.5f}) ✓")
+        elif current_trail < exp_trail_lvl:
+            # SL noch nicht auf erwartetem Niveau → nachziehen
+            log(f"  {exp_tp_label} ausgelöst (fill-basiert), "
+                f"SL noch nicht auf Trailing-Niveau → nachziehen auf {exp_trail_sl:.5f}")
+            set_sl_trailing(symbol, direction, exp_trail_sl,
+                            level=exp_trail_lvl, cur_size=size)
 
     # Trade-Daten für spätere Auswertung und als SL-Fallback in place_tp_orders
     # Werte aus geladenem State erhalten wo sinnvoll:
