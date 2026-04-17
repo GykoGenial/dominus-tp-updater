@@ -103,19 +103,9 @@ BASE_URL = "https://api.bitget.com"
 last_known_avg:   dict = {}   # {symbol: avg_price}
 last_known_size:  dict = {}   # {symbol: position_size}
 sl_at_entry:      dict = {}   # {symbol: bool}
-trailing_sl_level: dict = {}  # {symbol: int} — 0=initial, 1=Entry, 2=TP1-Preis, 3=TP2-Preis
 new_trade_done:   dict = {}   # {symbol: bool} — DCA bereits gesetzt?
 price_decimals_cache: dict = {}
 last_update_id:   int  = 0    # Telegram: letzter verarbeiteter Update-ID
-
-# Vorberechneter SL aus /trade-Befehl — wird in setup_new_trade verwendet
-# {symbol: {sl, direction, entry, leverage, ts}}
-pending_trade: dict = {}
-
-# Timestamps — verhindern wiederholtes Neu-Setzen wenn Bitget SL/TPs nicht zurückliefert
-sl_set_ts:  dict = {}  # {symbol: unix_ts}  — wann SL zuletzt erfolgreich gesetzt
-tp_set_ts:  dict = {}  # {symbol: unix_ts}  — wann TPs zuletzt erfolgreich gesetzt
-SL_TP_GRACE = int(os.environ.get("SL_TP_GRACE", "1800"))  # 30 Min Schutzfenster
 
 # Trade-Daten für Auswertung bei Abschluss
 # {symbol: {entry, direction, leverage, sl, peak_size, open_ts}}
@@ -126,14 +116,13 @@ h4_buffer:     list = []
 h4_buffer_lock = __import__("threading").Lock()
 H4_BUFFER_SEC  = int(os.environ.get("H4_BUFFER_SEC", "300"))  # 5 Min
 
+trailing_sl_level: dict = {}  # {symbol: int} — 0=initial, 1=Entry, 2=TP1-Preis, 3=TP2-Preis
+
 # Daily P&L Report — Aufzeichnung abgeschlossener Trades
-# [{symbol, direction, leverage, entry, close_price, net_pnl, realized_pnl,
-#   fee, peak_size, hold_str, ts (Unix-Sek.), trailing_level, won}]
 closed_trades: list = []
 daily_report_sent_date: str = ""   # "2026-04-17" — verhindert Doppelversand pro Tag
 
-# Harsi-Ausstiegslinie — letzter gesetzter Harsi-SL pro Symbol
-# {symbol: float}  — wird nie schlechter als Trailing SL
+# Harsi-Ausstiegslinie
 harsi_sl: dict = {}
 
 
@@ -158,40 +147,6 @@ def telegram(msg: str):
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
             json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"},
-            timeout=5
-        )
-    except Exception:
-        pass
-
-
-def chart_kb(symbol: str, include_btc: bool = True) -> list:
-    """Inline-Keyboard mit TradingView Chart-Links als Buttons."""
-    links = tv_chart_links(symbol)
-    rows = [[
-        {"text": f"📈 H2 {symbol}", "url": links["coin_h2"]},
-        {"text": f"📊 H4 {symbol}", "url": links["coin_h4"]},
-    ]]
-    if include_btc:
-        rows.append([
-            {"text": "₿ BTC H2",   "url": links["btc_h2"]},
-            {"text": "🌐 Total2",   "url": links["total2"]},
-        ])
-    return rows
-
-
-def telegram_kb(msg: str, keyboard: list):
-    """Sendet Telegram-Nachricht mit Inline-Keyboard Buttons (kurze URLs)."""
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={
-                "chat_id":     TELEGRAM_CHAT_ID,
-                "text":        msg,
-                "parse_mode":  "HTML",
-                "reply_markup": {"inline_keyboard": keyboard},
-            },
             timeout=5
         )
     except Exception:
@@ -337,21 +292,13 @@ def get_recent_fills_all(since_ms: int) -> list:
 
 def _get_plan_orders(symbol: str) -> list:
     """
-    Liest alle offenen TPSL-Orders (profit_plan / loss_plan) für ein Symbol.
+    Liest alle offenen Plan-Orders (TPs, SL) für ein Symbol.
 
-    Bitget v2: orders-plan-pending benötigt planType=profit_loss für TPSL-Orders.
-    Ohne planType liefert die API "Parameter verification failed".
+    Bitget v2 bietet zwei relevante Endpoints — beide werden versucht:
+      1. orders-plan-pending  (mit / ohne marginCoin, mit / ohne symbol)
+      2. tpsl-pending-orders  (als Fallback)
 
-    Gültige planType-Werte für orders-plan-pending:
-      normal_plan  → reguläre Trigger-Orders (Entry)
-      profit_loss  → TPSL-Orders (TP + SL zusammen) ← das brauchen wir
-      track_plan   → Trailing-Stop-Orders
-
-    Zurückgegebene planType-Felder in den Orders:
-      profit_plan  → TP-Order (TP1–TP3 via place-tpsl-order)
-      loss_plan    → SL-Order (plan-basiert)
-      pos_loss     → SL via place-pos-tpsl (position-level)
-      pos_profit   → TP via place-pos-tpsl (TP4)
+    Deckt ab: profit_plan (TP1-TP3), loss_plan / pos_loss (SL).
     """
     def _parse(raw) -> list:
         if isinstance(raw, list):
@@ -359,44 +306,37 @@ def _get_plan_orders(symbol: str) -> list:
         if isinstance(raw, dict):
             for key in ("entrustedList", "planList", "orderList", "data"):
                 lst = raw.get(key)
-                if isinstance(lst, list):
+                if isinstance(lst, list) and lst:
                     return lst
             # leeres dict aber code 00000 → leere Liste ist korrekt
             return []
         return []
 
-    # Versuch 1: profit_loss planType mit Symbol
+    # Versuch 1: orders-plan-pending mit symbol + marginCoin
     r = api_get("/api/v2/mix/order/orders-plan-pending", {
-        "productType": PRODUCT_TYPE,
-        "symbol":      symbol,
-        "planType":    "profit_loss",
-    })
-    if r.get("code") == "00000":
-        orders = _parse(r.get("data"))
-        log(f"  [plan-orders] {len(orders)} TPSL-Orders für {symbol} (Versuch 1)")
-        return orders
-
-    # Versuch 2: profit_loss planType ohne Symbol (Python-Filter)
-    r2 = api_get("/api/v2/mix/order/orders-plan-pending", {
-        "productType": PRODUCT_TYPE,
-        "planType":    "profit_loss",
-    })
-    if r2.get("code") == "00000":
-        all_orders = _parse(r2.get("data"))
-        orders = [o for o in all_orders if o.get("symbol") == symbol]
-        log(f"  [plan-orders] {len(orders)}/{len(all_orders)} TPSL-Orders für {symbol} (Versuch 2)")
-        return orders
-
-    # Versuch 3: ohne planType + Symbol (ältere API-Versionen)
-    r3 = api_get("/api/v2/mix/order/orders-plan-pending", {
         "productType": PRODUCT_TYPE,
         "symbol":      symbol,
         "marginCoin":  MARGIN_COIN,
     })
+    if r.get("code") == "00000":
+        return _parse(r.get("data"))
+
+    # Versuch 2: orders-plan-pending nur mit productType (dann symbol-Filter in Python)
+    r2 = api_get("/api/v2/mix/order/orders-plan-pending", {
+        "productType": PRODUCT_TYPE,
+    })
+    if r2.get("code") == "00000":
+        all_orders = _parse(r2.get("data"))
+        return [o for o in all_orders if o.get("symbol") == symbol]
+
+    # Versuch 3: tpsl-pending-orders mit marginCoin
+    r3 = api_get("/api/v2/mix/order/tpsl-pending-orders", {
+        "symbol":      symbol,
+        "productType": PRODUCT_TYPE,
+        "marginCoin":  MARGIN_COIN,
+    })
     if r3.get("code") == "00000":
-        orders = _parse(r3.get("data"))
-        log(f"  [plan-orders] {len(orders)} Orders für {symbol} (Versuch 3)")
-        return orders
+        return _parse(r3.get("data"))
 
     log(f"  [WARN] Alle Plan-Order Endpoints für {symbol} fehlgeschlagen: "
         f"1={r.get('msg','?')} | 2={r2.get('msg','?')} | 3={r3.get('msg','?')}")
@@ -499,65 +439,33 @@ def kelly_recommendation(balance: float, winrate: float) -> dict:
     }
 
 
-def cancel_all_tp_orders(symbol: str, stored_ids: list = None):
+def cancel_all_tp_orders(symbol: str):
     """
-    Storniert alle TP-Orders für ein Symbol.
-
-    Primär: Direktstornierung via gespeicherte Order-IDs (stored_ids aus trade_data).
-            Umgeht den defekten orders-plan-pending Endpoint — verhindert TP-Duplikate.
-    Fallback: Liest via orders-plan-pending und storniert gefundene profit_plan-Orders.
-
+    Storniert alle TP-Orders (profit_plan) für ein Symbol.
+    Liest via orders-plan-pending, storniert via cancel-plan-order.
     SL-Typen (loss_plan, pos_loss) werden nie angefasst.
     """
-    TP_TYPES = {"profit_plan", "pos_profit"}
-    cancelled = set()
+    orders = _get_plan_orders(symbol)
+    tp_orders = [o for o in orders if o.get("planType") == "profit_plan"]
 
-    # ── Primär: Stornierung via gespeicherte IDs ──────────────────
-    if stored_ids:
-        log(f"  {len(stored_ids)} gespeicherte TP-ID(s) direkt stornieren...")
-        for oid in stored_ids:
-            if not oid:
-                continue
-            res = api_post("/api/v2/mix/order/cancel-plan-order", {
-                "symbol":      symbol,
-                "productType": PRODUCT_TYPE,
-                "marginCoin":  MARGIN_COIN,
-                "planType":    "profit_plan",
-                "orderIdList": [{"orderId": str(oid)}],
-            })
-            if res.get("code") == "00000":
-                log(f"    ✓ TP storniert (ID {oid})")
-                cancelled.add(str(oid))
-            else:
-                # Bereits ausgelöst oder nicht mehr vorhanden → kein Fehler
-                log(f"    ~ TP {oid}: {res.get('msg', '?')} (evtl. bereits ausgelöst)")
-                cancelled.add(str(oid))   # trotzdem als erledigt markieren
-
-    # ── Fallback: via Plan-Order-Liste (falls IDs unvollständig) ──
-    orders   = _get_plan_orders(symbol)
-    tp_orders = [o for o in orders if o.get("planType") in TP_TYPES
-                 and str(o.get("orderId", "")) not in cancelled]
-
-    if not tp_orders and not stored_ids:
+    if not tp_orders:
         log(f"  Keine TP-Orders gefunden")
         return
-    if tp_orders:
-        log(f"  {len(tp_orders)} weitere TP(s) via Plan-Liste stornieren...")
-        for order in tp_orders:
-            oid   = order.get("orderId")
-            price = order.get("triggerPrice", "?")
-            ptype = order.get("planType", "?")
-            res = api_post("/api/v2/mix/order/cancel-plan-order", {
-                "symbol":      symbol,
-                "productType": PRODUCT_TYPE,
-                "marginCoin":  MARGIN_COIN,
-                "planType":    ptype,
-                "orderIdList": [{"orderId": oid}],
-            })
-            if res.get("code") == "00000":
-                log(f"    ✓ TP storniert [{ptype}] @ {price}: {oid}")
-            else:
-                log(f"    ✗ Fehler [{ptype}] @ {price}: {res.get('msg', res)}")
+
+    log(f"  {len(tp_orders)} TP(s) stornieren...")
+    for order in tp_orders:
+        oid   = order.get("orderId")
+        price = order.get("triggerPrice", "?")
+        res   = api_post("/api/v2/mix/order/cancel-plan-order", {
+            "symbol":      symbol,
+            "productType": PRODUCT_TYPE,
+            "marginCoin":  MARGIN_COIN,
+            "orderId":     oid,
+        })
+        if res.get("code") == "00000":
+            log(f"    ✓ TP storniert @ {price}: {oid}")
+        else:
+            log(f"    ✗ Fehler: {res.get('msg', res)}")
 
 
 def calc_tp_price(avg: float, roi: float,
@@ -568,8 +476,7 @@ def calc_tp_price(avg: float, roi: float,
 
 def place_tp_orders(symbol: str, avg: float, size: float,
                     direction: str, leverage: int,
-                    mark_price: float, known_sl: float = 0, decimals: int = None,
-                    skip_rois: set = None) -> tuple:
+                    mark_price: float, known_sl: float = 0) -> tuple:
     """
     Setzt TP1–TP4 nach DOMINUS-Schema:
       TP1 (10% ROI): schliesst 15% der Position  → place-tpsl-order
@@ -579,10 +486,9 @@ def place_tp_orders(symbol: str, avg: float, size: float,
                      Schliesst automatisch ALLES was noch offen ist.
                      (DOMINUS: "letzte TP schliesst Trade automatisch")
     """
-    decimals   = get_price_decimals(symbol)
-    count      = 0
-    prices     = []
-    order_ids  = []   # erfasste Order-IDs für spätere Direktstornierung
+    decimals = get_price_decimals(symbol)
+    count    = 0
+    prices   = []
 
     # ── TP1–TP3: Teilschliessungen ───────────────────────────────
     partial_tps = [
@@ -593,32 +499,20 @@ def place_tp_orders(symbol: str, avg: float, size: float,
 
     partial_tps_skipped = 0  # zählt übersprungene Teilschliessungen (Position zu klein)
 
-    _skip_rois = set(skip_rois) if skip_rois else set()
-
     for roi, label, pct in partial_tps:
-        if roi in _skip_rois:
-            log(f"    ⏭ {label}: bereits ausgelöst — übersprungen")
-            continue
         tp_raw = calc_tp_price(avg, roi, direction, leverage)
         tp_str = round_price(tp_raw, decimals)
         tp_val = float(tp_str)
 
-        # Qty-Berechnung: Präzision von der tatsächlichen Positionsgrösse ableiten.
-        # Bitget checkScale=0 bedeutet: nur Ganzzahlen erlaubt (z.B. BANUSDT, TRXUSDT).
-        # Wenn size eine Ganzzahl ist (z.B. 2017.5 gerundet auf 2018), muss qty ebenfalls
-        # eine Ganzzahl sein. Wir leiten die Lot-Dezimalstellen direkt aus size ab.
-        size_str = str(size).rstrip('0')
-        if '.' in size_str and size_str.split('.')[1]:
-            size_lot_decimals = len(size_str.split('.')[1])
+        # Qty-Berechnung: ganzzahlige Kontrakte (>= 1.0) vs. Dezimal-Kontrakte (< 1.0)
+        # max(1, floor()) war falsch für BTC: floor(0.0013 × 0.15)=0 → "1 BTC schliessen"
+        if size >= 1.0:
+            qty = math.floor(size * pct)
         else:
-            size_lot_decimals = 0
-        raw_qty = size * pct
-        qty = round(raw_qty, size_lot_decimals)
-        if size_lot_decimals == 0:
-            qty = int(qty)
+            qty = round(size * pct, 4)
 
         if qty <= 0:
-            log(f"    ⏭ {label}: qty=0 (size={size}, pct={pct}) — übersprungen")
+            log(f"    ⏭ {label}: Position zu klein für Teilschliessung (size={size}, pct={pct}) — übersprungen")
             partial_tps_skipped += 1
             continue
 
@@ -642,9 +536,6 @@ def place_tp_orders(symbol: str, avg: float, size: float,
             "size":         str(qty),
         })
         if res.get("code") == "00000":
-            oid = (res.get("data") or {}).get("orderId", "")
-            if oid:
-                order_ids.append(str(oid))
             log(f"    ✓ {label} @ {tp_str} USDT (Qty: {qty})")
             count += 1
             prices.append(f"{label}: {tp_str}")
@@ -667,9 +558,6 @@ def place_tp_orders(symbol: str, avg: float, size: float,
                     "size":         str(qty),
                 })
                 if res2.get("code") == "00000":
-                    oid2 = (res2.get("data") or {}).get("orderId", "")
-                    if oid2:
-                        order_ids.append(str(oid2))
                     log(f"    ✓ {label} @ {tp_str2} USDT [retry OK]")
                     count += 1
                     prices.append(f"{label}: {tp_str2}")
@@ -682,16 +570,12 @@ def place_tp_orders(symbol: str, avg: float, size: float,
             f"TP1–SL-Mechanismus greift nicht automatisch — SL manuell überwachen!"
         )
         log(warn_msg)
-        telegram(warn_msg)
+        send_telegram(warn_msg)
 
     # ── TP4: Full Position Close via place-pos-tpsl ──────────────
     # WICHTIG: place-pos-tpsl verwaltet NUR EINEN kombinierten
     # Eintrag pro Position. TP4 und SL MÜSSEN zusammen gesetzt werden,
     # sonst überschreibt TP4 den bestehenden SL (oder umgekehrt).
-    if TP4_ROI in _skip_rois:
-        log(f"    ⏭ TP4: bereits ausgelöst — übersprungen")
-        return count, prices, order_ids
-
     tp4_raw = calc_tp_price(avg, TP4_ROI, direction, leverage)
     tp4_str = round_price(tp4_raw, decimals)
     tp4_val = float(tp4_str)
@@ -760,11 +644,7 @@ def place_tp_orders(symbol: str, avg: float, size: float,
                     count += 1
                     prices.append(f"TP4 Full Close: {tp4_str2}")
 
-    if count > 0:
-        tp_set_ts[symbol] = time.time()
-        save_state()
-
-    return count, prices, order_ids
+    return count, prices
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -991,7 +871,7 @@ def handle_position_closed(symbol: str, reason: str = ""):
 
     telegram("\n".join(msg_lines))
 
-    # ── Trade für Daily Report aufzeichnen ────────────────────────────────
+    # Trade für Daily Report aufzeichnen
     closed_trades.append({
         "symbol":       symbol,
         "direction":    direction,
@@ -1014,26 +894,20 @@ def handle_position_closed(symbol: str, reason: str = ""):
     last_known_size.pop(symbol, None)
     new_trade_done.pop(symbol, None)
     sl_at_entry.pop(symbol, None)
-    trailing_sl_level.pop(symbol, None)
     harsi_sl.pop(symbol, None)
-    _closed_ids = trade_data.pop(symbol, {}).get("tp_order_ids")
+    trailing_sl_level.pop(symbol, None)
+    trade_data.pop(symbol, None)
 
     # Noch offene TP-Orders aufräumen (Sicherheit)
-    cancel_all_tp_orders(symbol, _closed_ids)
+    cancel_all_tp_orders(symbol)
 
 
 def _get_pos_tp_price(symbol: str, direction: str) -> float:
     """
     Liest den TP4-Preis für eine Position — zwei Wege:
-
-    Methode 1: takeProfitPrice aus Positionsdaten
-               (gesetzt via place-pos-tpsl, z.B. durch das Script).
-    Methode 2: pos_profit aus orders-plan-pending
-               (gesetzt via Bitget-UI "SL/TP"-Button der Positionszeile).
-
-    Beide Varianten werden als gültiger TP4 anerkannt.
+    Methode 1: takeProfitPrice aus Positionsdaten (place-pos-tpsl).
+    Methode 2: pos_profit aus orders-plan-pending (Bitget-UI "SL/TP"-Button).
     """
-    # Methode 1: TP aus Positionsdaten (position-level via place-pos-tpsl)
     result = api_get("/api/v2/mix/position/single-position", {
         "symbol":      symbol,
         "productType": PRODUCT_TYPE,
@@ -1049,11 +923,9 @@ def _get_pos_tp_price(symbol: str, direction: str) -> float:
                         log(f"  TP4 aus Position.{field}: {tp}")
                         return tp
 
-    # Methode 2: pos_profit aus Plan-Orders (Bitget-UI "SL/TP"-Button)
     orders = _get_plan_orders(symbol)
     for o in orders:
         if o.get("planType") == "pos_profit":
-            # Richtungsfilter: holdSide prüfen falls vorhanden
             hold = o.get("holdSide", direction)
             if hold != direction:
                 continue
@@ -1065,7 +937,8 @@ def _get_pos_tp_price(symbol: str, direction: str) -> float:
     return 0.0
 
 
-def set_sl_at_entry(symbol: str, direction: str, entry_price: float, cur_size: float = 0):
+def set_sl_at_entry(symbol: str, direction: str, entry_price: float,
+                    cur_size: float = 0):
     """SL auf Einstiegspreis setzen — DOMINUS-Regel nach TP1."""
     decimals = get_price_decimals(symbol)
     sl_str   = round_price(entry_price, decimals)
@@ -1092,12 +965,8 @@ def set_sl_at_entry(symbol: str, direction: str, entry_price: float, cur_size: f
     if result.get("code") == "00000":
         log(f"  ✓ SL auf Entry gesetzt: {sl_str} USDT ({symbol})")
         sl_at_entry[symbol] = True
-        sl_set_ts[symbol]   = time.time()
         save_state()
-        # DCA Limit-Orders stornieren — nicht mehr nötig nach TP1
         cancel_open_dca_orders(symbol, direction)
-
-        # Telegram: Restposition + realisierter TP1-Gewinn berechnen
         td         = trade_data.get(symbol, {})
         leverage   = int(td.get("leverage", 20))
         peak_size  = td.get("peak_size", 0)
@@ -1106,7 +975,6 @@ def set_sl_at_entry(symbol: str, direction: str, entry_price: float, cur_size: f
         tp1_profit = closed_qty * abs(tp1_price - entry_price) if closed_qty > 0 else 0
         size_str   = f"{cur_size:.2f}" if cur_size > 0 else "—"
         profit_str = f"+{tp1_profit:.2f} USDT" if tp1_profit > 0 else "—"
-
         telegram(
             f"🔒 <b>TP1 ausgelöst — {symbol}</b>\n"
             f"SL → Entry @ {sl_str} USDT (Break-even gesichert)\n"
@@ -1120,16 +988,23 @@ def set_sl_at_entry(symbol: str, direction: str, entry_price: float, cur_size: f
         log(f"  ✗ SL-Anpassung fehlgeschlagen: {result.get('msg', result)}")
 
 
+sl_set_ts: dict = {}  # {symbol: float} — Timestamp der letzten SL-Setzung
+
+
+def _get_pos_sl_price(symbol: str, direction: str) -> float:
+    """
+    Liest den aktuellen SL-Preis aus Positionsdaten oder Plan-Orders.
+    Alias für get_sl_price — wird von set_sl_harsi() verwendet.
+    """
+    return get_sl_price(symbol, direction)
+
+
 def set_sl_trailing(symbol: str, direction: str, sl_price: float, level: int,
                     cur_size: float = 0):
     """
     TP-Step Trailing: SL auf den vorherigen TP-Preis nachziehen.
-
-    Wird aufgerufen wenn TP2 oder TP3 ausgelöst wird:
-      TP2 ausgelöst → SL auf TP1-Preis  (level=2)
-      TP3 ausgelöst → SL auf TP2-Preis  (level=3)
-
-    Sichert damit den Gewinn des vorigen TP-Levels auf der Restposition.
+    TP2 ausgelöst → SL auf TP1-Preis  (level=2)
+    TP3 ausgelöst → SL auf TP2-Preis  (level=3)
     """
     if trailing_sl_level.get(symbol, 0) >= level:
         log(f"  Trailing Level {level} bereits gesetzt — skip")
@@ -1162,24 +1037,19 @@ def set_sl_trailing(symbol: str, direction: str, sl_price: float, level: int,
         sl_at_entry[symbol]       = True
         save_state()
 
-        # Telegram: Restposition + gesicherter Mindestgewinn berechnen
-        td        = trade_data.get(symbol, {})
-        entry     = float(td.get("entry", 0))
-        # Gesicherter Mindestgewinn auf Restposition wenn SL greift:
-        # Restposition × Preisdifferenz (SL-Preis − Entry) für Long, umgekehrt für Short
+        td    = trade_data.get(symbol, {})
+        entry = float(td.get("entry", 0))
         if cur_size > 0 and entry > 0:
-            if direction == "long":
-                guaranteed = cur_size * (sl_price - entry)
-            else:
-                guaranteed = cur_size * (entry - sl_price)
-            size_str      = f"{cur_size:.2f} Kontrakte"
-            guaranteed_str = f"+{guaranteed:.2f} USDT" if guaranteed > 0 else f"{guaranteed:.2f} USDT"
+            guaranteed = (cur_size * (sl_price - entry) if direction == "long"
+                          else cur_size * (entry - sl_price))
+            size_str       = f"{cur_size:.2f} Kontrakte"
+            guaranteed_str = (f"+{guaranteed:.2f} USDT" if guaranteed > 0
+                              else f"{guaranteed:.2f} USDT")
         else:
             size_str       = "—"
             guaranteed_str = "—"
 
-        log(f"  ✓ Trailing SL (Level {level}): SL → {sl_str} USDT "
-            f"({prev_label} gesichert | Rest: {size_str} | Min: {guaranteed_str})")
+        log(f"  ✓ Trailing SL (Level {level}): SL → {sl_str} USDT")
         telegram(
             f"📈 <b>{tp_label} ausgelöst — {symbol}</b>\n"
             f"SL → {sl_str} USDT ({prev_label} gesichert)\n"
@@ -1194,29 +1064,20 @@ def set_sl_trailing(symbol: str, direction: str, sl_price: float, level: int,
 
 def set_sl_harsi(symbol: str, direction: str, harsi_price: float, cur_size: float = 0):
     """
-    Setzt den SL auf die aktuelle Harsi-Ausstiegslinie — nur wenn dieser
-    Preis schützender ist als der aktuelle SL.
-
-    Logik:
-      Long:  harsi_price > current_sl  → SL nachziehen (höher = besser)
-      Short: harsi_price < current_sl  → SL nachziehen (tiefer = besser)
-
-    Überschreibt nie einen besseren Trailing SL oder einen bereits gesetzten
-    Entry-SL der über dem Harsi-Preis liegt (Long) / darunter (Short).
+    Setzt den SL auf die Harsi-Ausstiegslinie — nur wenn schützender als aktueller SL.
+    Long:  harsi_price > current_sl  → SL nachziehen
+    Short: harsi_price < current_sl  → SL nachziehen
     """
-    decimals     = get_price_decimals(symbol)
-    sl_str       = round_price(harsi_price, decimals)
-    current_sl   = _get_pos_sl_price(symbol, direction)
+    decimals   = get_price_decimals(symbol)
+    sl_str     = round_price(harsi_price, decimals)
+    current_sl = _get_pos_sl_price(symbol, direction)
 
-    # Prüfen ob Harsi-SL schützender als aktueller SL
     if current_sl > 0:
         if direction == "long"  and harsi_price <= current_sl:
-            log(f"  Harsi-SL {harsi_price:.5f} nicht besser als akt. SL {current_sl:.5f} "
-                f"(Long: höher = besser) — skip")
+            log(f"  Harsi-SL {harsi_price:.5f} nicht besser als SL {current_sl:.5f} — skip")
             return
         if direction == "short" and harsi_price >= current_sl:
-            log(f"  Harsi-SL {harsi_price:.5f} nicht besser als akt. SL {current_sl:.5f} "
-                f"(Short: tiefer = besser) — skip")
+            log(f"  Harsi-SL {harsi_price:.5f} nicht besser als SL {current_sl:.5f} — skip")
             return
 
     existing_tp4 = _get_pos_tp_price(symbol, direction)
@@ -1231,7 +1092,6 @@ def set_sl_harsi(symbol: str, direction: str, harsi_price: float, cur_size: floa
     if existing_tp4 > 0:
         body_sl["takeProfitTriggerPrice"] = round_price(existing_tp4, decimals)
         body_sl["takeProfitTriggerType"]  = "mark_price"
-        log(f"  TP4 @ {existing_tp4} wird mitgeführt")
 
     result = api_post("/api/v2/mix/order/place-pos-tpsl", body_sl)
     if result.get("code") == "00000":
@@ -1239,15 +1099,12 @@ def set_sl_harsi(symbol: str, direction: str, harsi_price: float, cur_size: floa
         sl_set_ts[symbol] = time.time()
         save_state()
 
-        # Telegram: Restposition + gesicherter Mindestgewinn
         td    = trade_data.get(symbol, {})
         entry = float(td.get("entry", 0))
         if cur_size > 0 and entry > 0:
-            if direction == "long":
-                guaranteed = cur_size * (harsi_price - entry)
-            else:
-                guaranteed = cur_size * (entry - harsi_price)
-            size_str      = f"{cur_size:.2f} Kontrakte"
+            guaranteed = (cur_size * (harsi_price - entry) if direction == "long"
+                          else cur_size * (entry - harsi_price))
+            size_str       = f"{cur_size:.2f} Kontrakte"
             guaranteed_str = (f"+{guaranteed:.2f} USDT" if guaranteed >= 0
                               else f"{guaranteed:.2f} USDT")
         else:
@@ -1255,8 +1112,7 @@ def set_sl_harsi(symbol: str, direction: str, harsi_price: float, cur_size: floa
             guaranteed_str = "—"
 
         prev_sl_str = f"{current_sl:.5f}" if current_sl > 0 else "—"
-        log(f"  ✓ Harsi-SL gesetzt: {sl_str} USDT ({symbol}) | "
-            f"vorher: {prev_sl_str} | Rest: {size_str} | Min: {guaranteed_str}")
+        log(f"  ✓ Harsi-SL gesetzt: {sl_str} USDT ({symbol})")
         telegram(
             f"📉 <b>Harsi-Ausstiegslinie — {symbol}</b>\n"
             f"SL → {sl_str} USDT  (vorher: {prev_sl_str})\n"
@@ -1267,11 +1123,7 @@ def set_sl_harsi(symbol: str, direction: str, harsi_price: float, cur_size: floa
         )
     else:
         log(f"  ✗ Harsi-SL fehlgeschlagen: {result.get('msg', result)}")
-        telegram(
-            f"❌ <b>Harsi-SL fehlgeschlagen — {symbol}</b>\n"
-            f"Ziel: {sl_str} USDT\n"
-            f"Bitte SL manuell prüfen!"
-        )
+        telegram(f"❌ <b>Harsi-SL fehlgeschlagen — {symbol}</b>\nBitte SL manuell prüfen!")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1399,96 +1251,57 @@ def setup_new_trade(pos: dict):
     sl_price = get_sl_price(symbol, direction)
 
     if sl_price == 0:
-        # ── 1. Versuch: SL aus /trade-Befehl (pending_trade) ──────────
-        hint = pending_trade.pop(symbol, {})
-        if (hint
-                and hint.get("direction") == direction
-                and time.time() - hint.get("ts", 0) < 3600   # max. 1 Stunde gültig
-                and hint.get("sl", 0) > 0):
-            decimals = get_price_decimals(symbol)
-            sl_str   = round_price(hint["sl"], decimals)
-            sl_hint  = float(sl_str)
-            sl_dist  = abs(entry - sl_hint) / entry * 100
-            log(f"  ✓ SL aus /trade-Berechnung: {sl_str} USDT ({sl_dist:.2f}%)")
+        # ── Kein SL gesetzt → automatisch auf -25% berechnen ─────────
+        # Long:  SL = entry * (1 - 0.25 / leverage)
+        # Short: SL = entry * (1 + 0.25 / leverage)
+        factor   = 0.25 / leverage
+        sl_auto  = entry * (1 - factor) if direction == "long"                    else entry * (1 + factor)
+        decimals = get_price_decimals(symbol)
+        sl_str   = round_price(sl_auto, decimals)
+        sl_auto  = float(sl_str)
+        sl_dist  = abs(entry - sl_auto) / entry * 100
 
-            res = api_post("/api/v2/mix/order/place-pos-tpsl", {
-                "symbol":               symbol,
-                "productType":          PRODUCT_TYPE,
-                "marginCoin":           MARGIN_COIN,
-                "holdSide":             direction,
-                "stopLossTriggerPrice": sl_str,
-                "stopLossTriggerType":  "mark_price",
-            })
-            if res.get("code") == "00000":
-                log(f"  ✓ SL gesetzt @ {sl_str} (aus /trade)")
-                sl_set_ts[symbol] = time.time()
-                telegram_kb(
-                    f"🛡 <b>SL gesetzt — {symbol}</b>\n"
-                    f"Übernommen aus deiner /trade-Berechnung\n\n"
-                    f"SL: {sl_str} USDT ({sl_dist:.1f}% Abstand)\n"
-                    f"Hebel: {leverage}x | Entry: {entry}",
-                    chart_kb(symbol, include_btc=False)
-                )
-                sl_price = sl_hint
-            else:
-                log(f"  ✗ SL aus /trade fehlgeschlagen: {res.get('msg', res)} — fallback Auto-SL")
+        log(f"  ⚠ Kein SL gefunden — Auto-SL bei -25%: {sl_str} USDT")
 
-        if sl_price == 0:
-            # ── 2. Fallback: Auto-SL bei -25% Margin-Verlust ──────────────
-            # Long:  SL = entry * (1 - 0.25 / leverage)
-            # Short: SL = entry * (1 + 0.25 / leverage)
-            factor   = 0.25 / leverage
-            sl_auto  = entry * (1 - factor) if direction == "long" \
-                       else entry * (1 + factor)
-            decimals = get_price_decimals(symbol)
-            sl_str   = round_price(sl_auto, decimals)
-            sl_auto  = float(sl_str)
-            sl_dist  = abs(entry - sl_auto) / entry * 100
+        res = api_post("/api/v2/mix/order/place-pos-tpsl", {
+            "symbol":               symbol,
+            "productType":          PRODUCT_TYPE,
+            "marginCoin":           MARGIN_COIN,
+            "holdSide":             direction,
+            "stopLossTriggerPrice": sl_str,
+            "stopLossTriggerType":  "mark_price",
+        })
 
-            log(f"  ⚠ Kein SL gefunden — Auto-SL bei -25%: {sl_str} USDT")
-
-            res = api_post("/api/v2/mix/order/place-pos-tpsl", {
-                "symbol":               symbol,
-                "productType":          PRODUCT_TYPE,
-                "marginCoin":           MARGIN_COIN,
-                "holdSide":             direction,
-                "stopLossTriggerPrice": sl_str,
-                "stopLossTriggerType":  "mark_price",
-            })
-
-            links = tv_chart_links(symbol)
-            if res.get("code") == "00000":
-                log(f"  ✓ Auto-SL gesetzt @ {sl_str} (-25% Schutz)")
-                telegram(
-                    f"\U0001f6e1 <b>Auto-SL gesetzt \u2014 {symbol}</b>\n"
-                    f"Kein SL gefunden \u2192 -25% Schutz aktiviert\n\n"
-                    f"SL: {sl_str} USDT ({sl_dist:.1f}% Abstand)\n"
-                    f"Hebel: {leverage}x | Entry: {entry}\n\n"
-                    f"\u26a0\ufe0f Bitte pr\u00fcfen ob SL mit deiner\n"
-                    f"Ausstiegslinie \u00fcbereinstimmt!\n\n"
-                    f"H4 {symbol}: {links['coin_h4']}\n"
-                    f"H2 {symbol}: {links['coin_h2']}"
-                )
-                sl_set_ts[symbol] = time.time()
-                sl_price = sl_auto
-            else:
-                log(f"  ✗ Auto-SL fehlgeschlagen: {res.get('msg', res)}")
-                telegram(
-                    f"\u274c <b>Kein SL \u2014 {symbol}</b>\n"
-                    f"Auto-SL fehlgeschlagen. Bitte manuell setzen!\n"
-                    f"Empfehlung: {sl_str} USDT ({sl_dist:.1f}%)\n\n"
-                    f"H4: {links['coin_h4']}"
-                )
-                cancel_all_tp_orders(symbol, trade_data.get(symbol, {}).get("tp_order_ids"))
-                time.sleep(1)
-                _, _, _ids = place_tp_orders(symbol, entry, size, direction, leverage, mark,
-                                             known_sl=sl_price)
-                if symbol in trade_data:
-                    trade_data[symbol]["tp_order_ids"] = _ids
-                last_known_avg[symbol]  = entry
-                last_known_size[symbol] = size
-                new_trade_done[symbol]  = True
-                return
+        links = tv_chart_links(symbol)
+        if res.get("code") == "00000":
+            log(f"  ✓ Auto-SL gesetzt @ {sl_str} (-25% Schutz)")
+            telegram(
+                f"\U0001f6e1 <b>Auto-SL gesetzt \u2014 {symbol}</b>\n"
+                f"Kein SL gefunden \u2192 -25% Schutz aktiviert\n\n"
+                f"SL: {sl_str} USDT ({sl_dist:.1f}% Abstand)\n"
+                f"Hebel: {leverage}x | Entry: {entry}\n\n"
+                f"\u26a0\ufe0f Bitte pr\u00fcfen ob SL mit deiner\n"
+                f"Ausstiegslinie \u00fcbereinstimmt!\n\n"
+                f"H4 {symbol}: {links['coin_h4']}\n"
+                f"H2 {symbol}: {links['coin_h2']}"
+            )
+            sl_price = sl_auto
+        else:
+            log(f"  ✗ Auto-SL fehlgeschlagen: {res.get('msg', res)}")
+            telegram(
+                f"\u274c <b>Kein SL \u2014 {symbol}</b>\n"
+                f"Auto-SL fehlgeschlagen. Bitte manuell setzen!\n"
+                f"Empfehlung: {sl_str} USDT ({sl_dist:.1f}%)\n\n"
+                f"H4: {links['coin_h4']}"
+            )
+            cancel_all_tp_orders(symbol)
+            time.sleep(1)
+            place_tp_orders(symbol, entry, size, direction, leverage, mark,
+                            known_sl=sl_price)
+            last_known_avg[symbol]  = entry
+            last_known_size[symbol] = size
+            new_trade_done[symbol]  = True
+            return
 
     # ── Hebel-Empfehlung & R:R-Check ─────────────────────
     sl_dist_pct   = abs(entry - sl_price) / entry * 100
@@ -1528,27 +1341,27 @@ def setup_new_trade(pos: dict):
     # TPs auf Basis der tatsächlichen aktuellen Position setzen.
     # DCA-Orders sind noch nicht gefüllt — wird automatisch angepasst wenn sie füllen.
     log(f"  Setze TPs für aktuelle Position (Qty={size})...")
-    cancel_all_tp_orders(symbol, trade_data.get(symbol, {}).get("tp_order_ids"))
+    cancel_all_tp_orders(symbol)
     time.sleep(1)
-    count, tp_prices, _tp_ids = place_tp_orders(
+    count, tp_prices = place_tp_orders(
         symbol, entry, size, direction, leverage, mark, known_sl=sl_price
     )
 
     # ── 5. Status speichern ─────────────────────────────────
-    last_known_avg[symbol]     = entry
-    last_known_size[symbol]    = size
-    new_trade_done[symbol]     = True
-    sl_at_entry[symbol]        = False
-    trailing_sl_level[symbol]  = 0    # Trailing-Level zurücksetzen
+    last_known_avg[symbol]  = entry
+    last_known_size[symbol] = size
+    new_trade_done[symbol]  = True
+    sl_at_entry[symbol]     = False
+    trailing_sl_level[symbol] = 0
+    harsi_sl.pop(symbol, None)
     # Trade-Daten für spätere Auswertung
     trade_data[symbol] = {
-        "entry":        entry,
-        "direction":    direction,
-        "leverage":     leverage,
-        "sl":           sl_price,
-        "peak_size":    size,
-        "open_ts":      int(time.time() * 1000),
-        "tp_order_ids": _tp_ids,
+        "entry":     entry,
+        "direction": direction,
+        "leverage":  leverage,
+        "sl":        sl_price,
+        "peak_size": size,
+        "open_ts":   int(time.time() * 1000),
     }
 
     # ── 6. Telegram-Zusammenfassung ─────────────────────────
@@ -1690,16 +1503,19 @@ def update_tp_for_position(pos: dict, reason: str):
 
     log(f"  TPs löschen und neu setzen (Grund: {reason})")
 
-    # Kein Mindestgrößen-Block mehr: place_tp_orders überspringt TP1-3 intern
-    # wenn qty=0, setzt aber immer TP4 (Full-Close) via place-pos-tpsl.
+    min_size_for_tps = 4
+    if total < min_size_for_tps:
+        log(f"  ⚠ Position zu klein (Qty={total}, min. {min_size_for_tps}) — "
+            f"TPs manuell überwachen")
+        last_known_avg[symbol]  = avg
+        last_known_size[symbol] = total
+        return
 
-    cancel_all_tp_orders(symbol, trade_data.get(symbol, {}).get("tp_order_ids"))
+    cancel_all_tp_orders(symbol)
     time.sleep(1)
-    count, prices, _tp_ids = place_tp_orders(
+    count, prices = place_tp_orders(
         symbol, avg, total, direction, leverage, mark, known_sl=known_sl
     )
-    if symbol in trade_data:
-        trade_data[symbol]["tp_order_ids"] = _tp_ids
 
     if count > 0:
         status = "✓ Alle 4" if count == 4 else f"⚠ {count}/4"
@@ -1869,16 +1685,6 @@ def cmd_trade(parts: list):
     rr           = calc_rr(entry, sl, leverage, direction)
     kelly        = kelly_recommendation(balance, WINRATE)
 
-    # SL-Hint speichern — wird von setup_new_trade() verwendet wenn Bitget SL nicht liefert
-    pending_trade[symbol] = {
-        "sl":        sl,
-        "direction": direction,
-        "leverage":  leverage,
-        "entry":     entry,
-        "ts":        time.time(),
-    }
-    log(f"  /trade SL-Hint gespeichert: {symbol} {direction.upper()} SL={sl}")
-
     # Position pro Order
     contracts = (per_order * leverage) / entry
 
@@ -1983,8 +1789,6 @@ def cmd_hilfe():
         "/status — Kurzstatus aller Positionen\n"
         "/refresh [SYMBOL] — SL/TP/DCA sofort prüfen & reparieren\n"
         "   Beispiel: /refresh BTCUSDT  (oder /refresh für alle)\n"
-        "/report — Daily P&L Report sofort abrufen\n"
-        "   (automatisch täglich um 23:59 Uhr)\n"
         "/hilfe — diese Übersicht\n"
         "\n"
         "🎯 <b>Premium Setup (DOMINUS):</b>\n"
@@ -2094,154 +1898,105 @@ def cmd_refresh(parts: list):
 
 def build_daily_report(date_str: str = None) -> str:
     """
-    Erstellt den Daily P&L Report für ein bestimmtes Datum (Standard: heute).
-    Enthält: Tages-Zusammenfassung, abgeschlossene Trades, offene Positionen,
-             kumulative Monats-Bilanz.
+    Erstellt einen täglichen P&L-Report als HTML-String für Telegram.
+    Zeigt: Trades des Tages, Monats-Gesamtperformance, offene Positionen.
     """
-    now         = datetime.now()
-    today_str   = date_str or now.strftime("%Y-%m-%d")
-    month_str   = today_str[:7]   # "2026-04"
-    day_display = datetime.strptime(today_str, "%Y-%m-%d").strftime("%a., %d. %b %Y")
+    if date_str is None:
+        date_str = datetime.now().strftime("%Y-%m-%d")
+    month_str = date_str[:7]  # "2026-04"
 
-    # Wochentag auf Deutsch
-    de_days = {"Mon": "Mo", "Tue": "Di", "Wed": "Mi", "Thu": "Do",
-               "Fri": "Fr", "Sat": "Sa", "Sun": "So"}
-    de_months = {"Jan": "Jan", "Feb": "Feb", "Mar": "Mär", "Apr": "Apr",
-                 "May": "Mai", "Jun": "Jun", "Jul": "Jul", "Aug": "Aug",
-                 "Sep": "Sep", "Oct": "Okt", "Nov": "Nov", "Dec": "Dez"}
-    for en, de in {**de_days, **de_months}.items():
-        day_display = day_display.replace(en, de)
+    # Tages-Trades filtern
+    day_trades = [
+        t for t in closed_trades
+        if datetime.fromtimestamp(t.get("ts", 0)).strftime("%Y-%m-%d") == date_str
+    ]
+    # Monats-Trades filtern
+    month_trades = [
+        t for t in closed_trades
+        if datetime.fromtimestamp(t.get("ts", 0)).strftime("%Y-%m") == month_str
+    ]
 
-    # ── Trades für heute und diesen Monat filtern ─────────────────────────
-    today_trades = [t for t in closed_trades
-                    if datetime.fromtimestamp(t.get("ts", 0)).strftime("%Y-%m-%d") == today_str]
-    month_trades = [t for t in closed_trades
-                    if datetime.fromtimestamp(t.get("ts", 0)).strftime("%Y-%m")   == month_str]
+    def _summary(trades: list) -> dict:
+        if not trades:
+            return {"count": 0, "wins": 0, "losses": 0, "total_pnl": 0.0,
+                    "win_rate": 0.0, "best": 0.0, "worst": 0.0}
+        wins    = sum(1 for t in trades if t.get("won", False))
+        losses  = len(trades) - wins
+        pnls    = [float(t.get("net_pnl", 0)) for t in trades]
+        total   = sum(pnls)
+        best    = max(pnls) if pnls else 0.0
+        worst   = min(pnls) if pnls else 0.0
+        return {
+            "count":    len(trades),
+            "wins":     wins,
+            "losses":   losses,
+            "total_pnl": total,
+            "win_rate": wins / len(trades) * 100 if trades else 0.0,
+            "best":     best,
+            "worst":    worst,
+        }
 
-    # ── Tages-Zusammenfassung ─────────────────────────────────────────────
-    day_wins    = sum(1 for t in today_trades if t.get("won", False))
-    day_losses  = len(today_trades) - day_wins
-    day_pnl     = sum(t.get("net_pnl", 0) for t in today_trades)
-    day_wr      = (day_wins / len(today_trades) * 100) if today_trades else 0
-    day_pnl_str = f"{day_pnl:+.2f}" if today_trades else "—"
+    day_s   = _summary(day_trades)
+    month_s = _summary(month_trades)
 
-    best_trade  = max(today_trades, key=lambda t: t.get("net_pnl", 0), default=None)
-    worst_trade = min(today_trades, key=lambda t: t.get("net_pnl", 0), default=None)
+    # Offene Positionen
+    open_positions = get_all_positions()
 
     lines = [
-        f"📊 <b>Daily P&L Report — {day_display}</b>",
-        f"━━━━━━━━━━━━━━━━",
+        f"📊 <b>DOMINUS Daily Report — {date_str}</b>",
+        "━━━━━━━━━━━━",
         f"",
-        f"📈 <b>Tages-Zusammenfassung</b>",
+        f"📅 <b>Heute ({date_str}):</b>",
+        f"Trades: {day_s['count']}  |  🏆 {day_s['wins']} / 🔴 {day_s['losses']}",
+        f"Win-Rate: {day_s['win_rate']:.0f}%",
+        f"Netto P&L: {day_s['total_pnl']:+.2f} USDT",
+        f"Bester: {day_s['best']:+.2f} USDT  |  Schlechtester: {day_s['worst']:+.2f} USDT",
     ]
 
-    if today_trades:
-        lines += [
-            f"Trades heute:  {len(today_trades)}  ({day_wins}✅ / {day_losses}❌)",
-            f"Netto P&L:     <b>{day_pnl_str} USDT</b>",
-            f"Win-Rate:      {day_wr:.1f}%",
-        ]
-        if best_trade:
-            lines.append(
-                f"Bester Trade:  {best_trade['symbol']} {best_trade['net_pnl']:+.2f} USDT"
-            )
-        if worst_trade and worst_trade != best_trade:
-            lines.append(
-                f"Schwächster:   {worst_trade['symbol']} {worst_trade['net_pnl']:+.2f} USDT"
-            )
-    else:
-        lines.append("Keine abgeschlossenen Trades heute.")
-
-    # ── Abgeschlossene Trades (Detail) ────────────────────────────────────
-    lines += ["", "─────────────────"]
-    if today_trades:
-        lines.append(f"🏁 <b>Heute abgeschlossen ({len(today_trades)})</b>")
+    if day_trades:
         lines.append("")
-        for t in sorted(today_trades, key=lambda x: x.get("ts", 0)):
-            icon    = "🏆" if t.get("won") else "🔴"
-            drct    = dir_icon(t.get("direction", "long"))
-            lev     = t.get("leverage", "?")
-            sym     = t.get("symbol", "?")
-            entry_p = t.get("entry", 0)
-            close_p = t.get("close_price", 0)
-            pnl     = t.get("net_pnl", 0)
-            hold    = t.get("hold_str", "?")
-            trl_lvl = t.get("trailing_level", 0)
-            trl_tag = {1: " · SL=Entry", 2: " · Trail→TP1", 3: " · Trail→TP2"}.get(trl_lvl, "")
-            entry_s = f"{entry_p:.4f}" if entry_p else "?"
-            close_s = f"{close_p:.4f}" if close_p else "?"
-            lines += [
-                f"{icon} <b>{sym}</b> {drct} {lev}x{trl_tag}",
-                f"  Entry: {entry_s}  →  Close: {close_s}",
-                f"  Netto: <b>{pnl:+.2f} USDT</b>  |  Dauer: {hold}",
-                "",
-            ]
-    else:
-        lines += ["🏁 <b>Heute abgeschlossen</b>", "Keine Trades heute.", ""]
-
-    # ── Laufende Positionen ───────────────────────────────────────────────
-    lines.append("─────────────────")
-    positions = get_all_positions()
-    if positions:
-        lines.append(f"📍 <b>Laufende Positionen ({len(positions)})</b>")
-        lines.append("")
-        for pos in positions:
-            sym       = pos.get("symbol", "?")
-            avg       = float(pos.get("openPriceAvg", 0))
-            mark      = float(pos.get("markPrice", 0))
-            direction = pos.get("holdSide", "long")
-            leverage  = int(float(pos.get("leverage", 10)))
-            pnl_f     = float(pos.get("unrealizedPL", 0))
-            size_f    = float(pos.get("total", 0))
-            drct      = dir_icon(direction)
-            trl_lvl   = trailing_sl_level.get(sym, 0)
-            trl_tag   = {0: "", 1: " · SL=Entry", 2: " · Trail→TP1",
-                         3: " · Trail→TP2"}.get(trl_lvl, "")
-            lines += [
-                f"{drct} <b>{sym}</b> {direction.upper()} {leverage}x{trl_tag}",
-                f"  Entry: {avg:.4f}  |  Mark: {mark:.4f}",
-                f"  Unrealisiert: {pnl_f:+.2f} USDT  |  Qty: {size_f:.2f}",
-                "",
-            ]
-    else:
-        lines += ["📍 <b>Laufende Positionen</b>", "Keine offenen Positionen.", ""]
-
-    # ── Monatliche Kumulativ-Bilanz ───────────────────────────────────────
-    month_display = datetime.strptime(month_str + "-01", "%Y-%m-%d").strftime("%B %Y")
-    for en, de in de_months.items():
-        month_display = month_display.replace(en, de)
-
-    mon_wins   = sum(1 for t in month_trades if t.get("won", False))
-    mon_losses = len(month_trades) - mon_wins
-    mon_pnl    = sum(t.get("net_pnl", 0) for t in month_trades)
-    mon_fee    = sum(t.get("fee", 0) for t in month_trades)
-    mon_wr     = (mon_wins / len(month_trades) * 100) if month_trades else 0
+        lines.append("📋 <b>Trades heute:</b>")
+        for t in day_trades:
+            icon = "🏆" if t.get("won") else "🔴"
+            lines.append(
+                f"  {icon} {t['symbol']} {t.get('direction','?').upper()} "
+                f"| {float(t.get('net_pnl',0)):+.2f} USDT "
+                f"| {t.get('hold_str','?')}"
+            )
 
     lines += [
-        "─────────────────",
-        f"📅 <b>{month_display}</b>",
+        "",
+        f"📆 <b>Monat ({month_str}):</b>",
+        f"Trades: {month_s['count']}  |  🏆 {month_s['wins']} / 🔴 {month_s['losses']}",
+        f"Win-Rate: {month_s['win_rate']:.0f}%",
+        f"Netto P&L: {month_s['total_pnl']:+.2f} USDT",
     ]
-    if month_trades:
-        lines += [
-            f"Trades:    {len(month_trades)}  ({mon_wins}✅ / {mon_losses}❌)",
-            f"Netto P&L: <b>{mon_pnl:+.2f} USDT</b>",
-            f"Gebühren:  {mon_fee:.2f} USDT",
-            f"Win-Rate:  {mon_wr:.1f}%",
-        ]
-    else:
-        lines.append("Noch keine abgeschlossenen Trades diesen Monat.")
 
-    lines.append("")
-    lines.append(f"<i>Generiert: {now.strftime('%H:%M Uhr')}</i>")
+    if open_positions:
+        lines.append("")
+        lines.append(f"📈 <b>Offene Positionen ({len(open_positions)}):</b>")
+        for pos in open_positions:
+            sym  = pos.get("symbol", "?")
+            drct = pos.get("holdSide", "?").upper()
+            lev  = int(float(pos.get("leverage", 10)))
+            pnl  = float(pos.get("unrealizedPL", 0))
+            trl  = trailing_sl_level.get(sym, 0)
+            trl_tag = {0: "", 1: " SL=Entry", 2: " Trail→TP1", 3: " Trail→TP2"}.get(trl, "")
+            lines.append(f"  • {sym} {drct} {lev}x | PnL={pnl:+.2f}{trl_tag}")
+    else:
+        lines.append("")
+        lines.append("✅ Keine offenen Positionen")
 
     return "\n".join(lines)
 
 
 def cmd_report():
-    """Befehlshandler für /report — sendet sofort den Daily P&L Report."""
-    log("[/report] Daily P&L Report wird erstellt...")
-    report = build_daily_report()
-    telegram(report)
+    """Sendet den täglichen P&L Report auf Telegram-Anfrage."""
+    try:
+        report = build_daily_report()
+        telegram(report)
+    except Exception as e:
+        reply(f"❌ Report Fehler: {e}")
 
 
 def poll_telegram_commands():
@@ -2255,10 +2010,6 @@ def poll_telegram_commands():
 
     updates = get_telegram_updates()
     for update in updates:
-        # Nur originale Nachrichten verarbeiten — edited_message ignorieren.
-        # Telegram sendet für dieselbe Nachricht manchmal ein zweites Update
-        # als edited_message (z.B. Link-Preview-Laden), was sonst zu doppelten
-        # Antworten führt.
         msg = update.get("message")
         if not msg:
             continue
@@ -2414,33 +2165,21 @@ def start_webhook_server():
             entry = get_mark_price(symbol)
 
         signal_type = data.get("signal", "").upper()
-        log(f"📡 Alert: {symbol} {direction.upper()} @ {entry} [{timeframe}] signal={signal_type}")
+        log(f"\U0001f4e1 Alert: {symbol} {direction.upper()} @ {entry} [{timeframe}]")
 
-        # ── HARSI_EXIT: Ausstiegslinie als neuen SL setzen ───────────────
         if signal_type == "HARSI_EXIT":
             harsi_price = float(data.get("price", 0) or data.get("sl", 0) or 0)
             if harsi_price == 0:
-                log(f"  ⚠ HARSI_EXIT ohne Preis — ignoriert")
                 return jsonify({"status": "ignored", "reason": "no price"}), 200
-
-            log(f"  Harsi-Ausstiegslinie: {symbol} {direction.upper()} "
-                f"SL → {harsi_price}")
-
-            # Position suchen — cur_size für Telegram-Notification
             cur_size = 0
             for pos in get_all_positions():
                 if pos.get("symbol") == symbol and pos.get("holdSide") == direction:
                     cur_size = float(pos.get("total", 0))
                     break
-
             if cur_size == 0:
-                log(f"  ⚠ Keine offene {direction.upper()}-Position für {symbol} gefunden")
-                return jsonify({"status": "ignored",
-                                "reason": "no open position"}), 200
-
+                return jsonify({"status": "ignored", "reason": "no open position"}), 200
             set_sl_harsi(symbol, direction, harsi_price, cur_size=cur_size)
-            return jsonify({"status": "ok", "symbol": symbol,
-                            "harsi_sl": harsi_price}), 200
+            return jsonify({"status": "ok", "symbol": symbol, "harsi_sl": harsi_price}), 200
 
         # H4 Trigger → gepuffert, nach 5 Min gebündelt senden
         if timeframe == "H4" or signal_type == "H4_TRIGGER":
@@ -2459,63 +2198,99 @@ def start_webhook_server():
 
         # H2 Signal → H4 Puffer flushen dann sofort senden
         flush_h4_buffer()
-        balance     = get_futures_balance()
-        kelly       = kelly_recommendation(balance, WINRATE)
-        per_order   = balance * 0.10 / 3
-        icon        = dir_icon(direction)
-
-        # Statuswerte aus JSON (von DOM-ORC Plots)
-        harsi_warn  = int(data.get("harsi_warn",  0) or 0)
-        btc_t2_warn = int(data.get("btc_t2_warn", 0) or 0)
-        premium     = int(data.get("premium",     0) or 0)
-
-        harsi_line  = "⚠️ HARSI in Extremzone — warten" if harsi_warn  else "✅ HARSI OK"
-        btc_t2_line = "⚠️ BTC/Total2 keine Übereinstimmung" if btc_t2_warn else "✅ BTC + Total2 OK"
-        prem_line   = "⭐ Premium Setup" if premium else "— Kein Premium"
-
-        # /trade-Befehl vorausfüllen: SL = Entry ±25% (anpassbar nach Kerzenschluss)
-        decimals  = len(str(entry).rstrip('0').split('.')[-1]) if '.' in str(entry) else 2
-        sl_factor = 0.75 if direction == "long" else 1.25
-        sl_default = round(entry * sl_factor, decimals)
-        trade_cmd = f"/trade {symbol} {direction.upper()} 10 {entry:.{decimals}f} {sl_default:.{decimals}f}"
-
+        balance   = get_futures_balance()
+        kelly     = kelly_recommendation(balance, WINRATE)
+        links     = tv_chart_links(symbol)
+        per_order = balance * 0.10 / 3
+        chk_dir   = "gr\u00fcner" if direction == "long" else "roter"
+        icon      = dir_icon(direction)
         msg_parts = [
-            f"{icon} <b>H2 Signal — {symbol} {direction.upper()}</b>",
-            "━" * 14,
-            f"Kurs: <b>{entry}</b>",
+            f"{icon} <b>H2 Signal \u2014 {symbol} {direction.upper()}</b>",
+            "\u2501" * 12,
+            f"Kurs: {entry}",
             "",
-            "📋 <b>Status:</b>",
-            harsi_line,
-            btc_t2_line,
-            prem_line,
+            "\U0001f4cb <b>DOMINUS Checkliste:</b>",
+            "\u2610 DOMINUS Impuls Extremzone erreicht?",
+            "\u2610 H4 Trigger best\u00e4tigt?",
+            "\u2610 HARSI nicht in Extremzone?",
+            "\u2610 BTC + Total2 gleiche Richtung?",
+            f"\u2610 Premium Setup? (Impuls dunkel{chk_dir})",
             "",
-            f"💰 {balance:.0f} USDT  |  Pro Order: {per_order:.0f} USDT",
-            f"📊 Kelly: {kelly['kelly_pct']}%",
+            f"\U0001f4b0 {balance:.0f} USDT  |  Pro Order: {per_order:.0f} USDT",
+            f"\U0001f4ca Kelly: {kelly['kelly_pct']}%",
             "",
-            "⏱ <b>30-Min-Fenster läuft!</b>",
-            f"<code>{trade_cmd}</code>",
+            "\u23f1 <b>30-Min-Fenster l\u00e4uft!</b>",
+            f"/trade {symbol} {direction.upper()} [HEBEL] {entry:.5f} [SL]",
+            "",
+            "\U0001f4c8 Charts:",
+            f"H2 {symbol}: {links['coin_h2']}",
+            f"H4 {symbol}: {links['coin_h4']}",
+            f"BTC H2: {links['btc_h2']}",
+            f"Total2: {links['total2']}",
         ]
-
-        # Keyboard: Chart-Buttons + /trade kopieren
-        kb = chart_kb(symbol)
-        kb.append([{"text": "📋 /trade kopieren", "copy_text": {"text": trade_cmd}}])
-        telegram_kb("\n".join(msg_parts), kb)
+        telegram("\n".join(msg_parts))
         return jsonify({"status": "ok", "symbol": symbol,
                         "direction": direction}), 200
 
     @app.route("/", methods=["GET"])
     @app.route("/health", methods=["GET"])
     def health():
-        # Railway Healthcheck sendet GET / — muss 200 zurückgeben
-        # sonst markiert Railway den Service als unhealthy und startet neu
-        return jsonify({"status": "running",
-                        "version": "v4.31"}), 200
+        return jsonify({"status": "running", "version": "v4.32"}), 200
 
     port = int(os.environ.get("PORT", 8080))
     log(f"Webhook-Server gestartet auf Port {port}")
     log(f"Endpoint: /webhook?token={WEBHOOK_SECRET}")
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
+
+
+# ═══════════════════════════════════════════════════════════════
+# STATE PERSISTENZ (speichern / laden)
+# ═══════════════════════════════════════════════════════════════
+
+STATE_FILE = os.environ.get("STATE_FILE", "/tmp/dominus_state.json")
+
+
+def save_state():
+    """Speichert den aktuellen In-Memory-State in eine JSON-Datei."""
+    try:
+        state = {
+            "last_known_avg":          last_known_avg,
+            "last_known_size":         last_known_size,
+            "sl_at_entry":             sl_at_entry,
+            "new_trade_done":          new_trade_done,
+            "trade_data":              trade_data,
+            "trailing_sl_level":       trailing_sl_level,
+            "closed_trades":           [t for t in closed_trades if t.get("ts", 0) >= time.time() - 90*86400],
+            "daily_report_sent_date":  daily_report_sent_date,
+            "harsi_sl":                harsi_sl,
+        }
+        with open(STATE_FILE, "w") as f:
+            json.dump(state, f)
+    except Exception as e:
+        log(f"[save_state] Fehler: {e}")
+
+
+def load_state():
+    """Lädt den gespeicherten State aus der JSON-Datei beim Start."""
+    global daily_report_sent_date
+    if not os.path.exists(STATE_FILE):
+        return
+    try:
+        with open(STATE_FILE, "r") as f:
+            s = json.load(f)
+        last_known_avg.update(s.get("last_known_avg", {}))
+        last_known_size.update(s.get("last_known_size", {}))
+        sl_at_entry.update(s.get("sl_at_entry", {}))
+        new_trade_done.update(s.get("new_trade_done", {}))
+        trade_data.update(s.get("trade_data", {}))
+        trailing_sl_level.update(s.get("trailing_sl_level", {}))
+        closed_trades.extend(s.get("closed_trades", []))
+        daily_report_sent_date = s.get("daily_report_sent_date", "")
+        harsi_sl.update(s.get("harsi_sl", {}))
+        log(f"[load_state] State geladen: {len(last_known_avg)} Position(en)")
+    except Exception as e:
+        log(f"[load_state] Fehler: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -2705,8 +2480,6 @@ def check_and_repair_position(pos: dict):
     close_fills  = get_symbol_close_fills(symbol, since_hours=48)
     filled_tps   = detect_filled_tps(close_fills, avg, leverage, direction)
     fill_tp1_hit = any(t["roi"] == TP1_ROI for t in filled_tps)
-    fill_tp2_hit = any(t["roi"] == TP2_ROI for t in filled_tps)
-    fill_tp3_hit = any(t["roi"] == TP3_ROI for t in filled_tps)
 
     if filled_tps:
         fill_labels = ", ".join(t["label"] for t in filled_tps)
@@ -2735,13 +2508,6 @@ def check_and_repair_position(pos: dict):
             log(f"  SL gelesen: @ {sl_price} ({sl_dist_pct_read:.2f}% Abstand)")
     else:
         log(f"  SL gelesen: keiner gefunden auf Bitget")
-        # Schutzfenster: SL kürzlich gesetzt → skip Re-Set
-        if sl_set_ts.get(symbol, 0) > time.time() - SL_TP_GRACE:
-            known_sl_val = trade_data.get(symbol, {}).get("sl", 0)
-            if known_sl_val > 0:
-                sl_price    = known_sl_val
-                sl_is_entry = sl_at_entry.get(symbol, False)
-                log(f"  SL: API gibt 0 → Speicher: {sl_price} (skip Re-Set)")
 
     # 1c. Kombinierte TP1-Erkennung (preislich ODER fill-basiert ODER SL-on-Entry)
     tp1_done = state["tp1_price_hit"] or fill_tp1_hit or sl_is_entry
@@ -2842,11 +2608,7 @@ def check_and_repair_position(pos: dict):
 
     else:
         # Kein SL gefunden auf Bitget
-        _sl_skip = sl_set_ts.get(symbol, 0) > time.time() - SL_TP_GRACE
-        if _sl_skip:
-            log(f"  SL: kürzlich gesetzt → skip Re-Set (Bitget gibt 0 zurück)")
-
-        if not _sl_skip and tp1_done:
+        if tp1_done:
             # TP1 bereits ausgelöst → SL muss auf Entry
             sl_str   = round_price(avg, decimals)
             sl_valid = (direction == "long" and avg <= mark) or \
@@ -2854,18 +2616,31 @@ def check_and_repair_position(pos: dict):
             if sl_valid:
                 reason = ("fill-basiert" if fill_tp1_hit and not state["tp1_price_hit"]
                           else "preislich passiert")
-                log(f"  TP1 ausgelöst ({reason}), kein SL → set_sl_at_entry()")
-                # Trailing Level vorab setzen (Level 1 = SL auf Entry)
-                trailing_sl_level[symbol] = 1
-                set_sl_at_entry(symbol, direction, avg, cur_size=size)
-                if sl_at_entry.get(symbol, False):
+                log(f"  TP1 ausgelöst ({reason}), kein SL → setze SL auf Entry @ {sl_str}")
+                res = api_post("/api/v2/mix/order/place-pos-tpsl", {
+                    "symbol":               symbol,
+                    "productType":          PRODUCT_TYPE,
+                    "marginCoin":           MARGIN_COIN,
+                    "holdSide":             direction,
+                    "stopLossTriggerPrice": sl_str,
+                    "stopLossTriggerType":  "mark_price",
+                })
+                if res.get("code") == "00000":
                     sl_price    = avg
                     sl_is_entry = True
+                    log(f"  ✓ SL auf Entry gesetzt @ {sl_str}")
+                    telegram(
+                        f"🔒 <b>SL auf Entry gesetzt — {symbol}</b>\n"
+                        f"Script-Start: TP1 ausgelöst ({reason}), kein SL vorhanden\n"
+                        f"SL: {sl_str} USDT"
+                    )
+                else:
+                    log(f"  ✗ SL auf Entry fehlgeschlagen: {res.get('msg', res)}")
             else:
                 log(f"  ⚠ Mark {mark} bereits hinter Entry {avg} — SL auf Entry nicht setzbar")
                 telegram(f"⚠️ <b>{symbol}</b>: Position im Verlust, SL manuell setzen!")
 
-        elif not _sl_skip and pnl > 0:
+        elif pnl > 0:
             # Position im Gewinn, kein SL gefunden — SL MINDESTENS auf Entry setzen
             # (Floor-Regel: verhindert, dass ein Auto-SL in Verlustzone gesetzt wird
             #  wenn die Position bereits einen Gewinn aufgebaut hat)
@@ -2886,31 +2661,15 @@ def check_and_repair_position(pos: dict):
                 if res.get("code") == "00000":
                     sl_price    = avg
                     sl_is_entry = True
-                    # Trailing Level 1 setzen — SL auf Entry entspricht Level 1
+                    cancel_open_dca_orders(symbol, direction)
                     trailing_sl_level[symbol] = max(trailing_sl_level.get(symbol, 0), 1)
                     sl_set_ts[symbol] = time.time()
                     log(f"  ✓ SL auf Entry gesetzt (Gewinn-Floor) @ {sl_str}")
-                    # DCA-Orders stornieren — SL auf Entry macht Nachkäufe unterhalb
-                    # des Entries sinnlos (SL würde vor DCA-Fill schliessen)
-                    cancel_open_dca_orders(symbol, direction)
-                    td         = trade_data.get(symbol, {})
-                    leverage_f = int(td.get("leverage", 20))
-                    peak_size  = td.get("peak_size", 0)
-                    closed_qty = max(0, peak_size - size) if size > 0 and peak_size > 0 else 0
-                    tp1_price  = calc_tp_price(avg, TP1_ROI, direction, leverage_f)
-                    tp1_profit = closed_qty * abs(tp1_price - avg) if closed_qty > 0 else 0
-                    size_str   = f"{size:.2f}" if size > 0 else "—"
-                    profit_str = f"+{tp1_profit:.2f} USDT" if tp1_profit > 0 else "—"
                     telegram(
                         f"🔒 <b>SL auf Entry gesetzt — {symbol}</b>\n"
-                        f"Gewinn-Floor: Position im Gewinn ({pnl_sign}{pnl}% Margin), "
+                        f"Script-Start: Position im Gewinn ({pnl_sign}{pnl}% Margin), "
                         f"kein SL gefunden\n"
                         f"SL: {sl_str} USDT (Schutz: kein Rückfall in Verlust)\n"
-                        f"━━━━━━━━━━\n"
-                        f"💰 Realisiert:      {profit_str}\n"
-                        f"📦 Restposition:    {size_str} Kontrakte\n"
-                        f"🛡 Min. Gewinn Rest: 0 USDT (Break-even)\n"
-                        f"✓ DCA-Orders storniert\n"
                         f"⚠️ Mit Ausstiegslinie abgleichen!"
                     )
                 else:
@@ -2931,7 +2690,7 @@ def check_and_repair_position(pos: dict):
                 log(f"  ⚠ Mark {mark} hinter Entry {avg} — SL auf Entry nicht setzbar")
                 telegram(f"⚠️ <b>{symbol}</b>: Position im Verlust, SL manuell setzen!")
 
-        elif not _sl_skip:
+        else:
             # Kein TP passiert, kein Gewinn → Auto-SL auf -25% Margin
             sl_str  = round_price(_sl_auto, decimals)
             sl_auto = float(sl_str)
@@ -2964,38 +2723,39 @@ def check_and_repair_position(pos: dict):
 
     sl_at_entry[symbol] = sl_is_entry
 
-    # ── 2b. Trailing SL prüfen (TP2 / TP3) ───────────────────────────────
-    # Wenn TP2 oder TP3 ausgelöst wurde, muss der SL auf das entsprechende
-    # Niveau nachgezogen sein. Falls nicht → hier reparieren.
+    # ── Phase 2b: Trailing SL prüfen (TP2 / TP3) ─────────────────────────
+    # Detects whether TP2 or TP3 were triggered using TWO complementary methods:
     #
-    # Erwartete SL-Preise:
-    #   TP2 ausgelöst → SL sollte auf TP1-Preis stehen
-    #   TP3 ausgelöst → SL sollte auf TP2-Preis stehen
+    # Method A — Fill-based (primary): detect_filled_tps() matches recent fills
+    #   to expected TP prices. Reliable but limited to 48h history.
     #
-    # Toleranz 0.15% — gleich wie bei Entry-Erkennung.
+    # Method B — Size-based (fallback): compares current size to peak_size.
+    #   TP2 hit: size < peak * 0.67  (35% closed: 15% TP1 + 20% TP2)
+    #   TP3 hit: size < peak * 0.37  (63% closed: 15+20+25% = 60%)
+    #   Catches cases where fills are older than 48h.
+    #
+    # Both methods must agree on at LEAST TP2 before acting, OR fills alone
+    # if they are present. Size-alone is used as fallback when no fills found.
 
-    def _sl_at_level(sl_val: float, expected: float) -> bool:
-        """True wenn SL-Preis innerhalb 0.15% des erwarteten Niveaus liegt."""
-        if expected == 0 or sl_val == 0:
-            return False
-        return abs(sl_val - expected) / expected * 100 <= 0.15
+    fill_tp2_hit = any(t["roi"] == TP2_ROI for t in filled_tps)
+    fill_tp3_hit = any(t["roi"] == TP3_ROI for t in filled_tps)
 
-    def _sl_better_than(sl_val: float, expected: float) -> bool:
-        """True wenn bestehender SL bereits besser (schützender) als erwartet."""
-        if sl_val == 0:
-            return False
-        if direction == "long":
-            return sl_val >= expected   # Long: höher = besser
-        else:
-            return sl_val <= expected   # Short: tiefer = besser
+    # Size-based detection (fallback)
+    _peak = trade_data.get(symbol, {}).get("peak_size", size)
+    _ref  = _peak if _peak > 0 else size
+    size_tp3_hit = (size < _ref * 0.37) if _ref > 0 else False
+    size_tp2_hit = (size < _ref * 0.67) if _ref > 0 else False
 
-    if fill_tp3_hit:
-        # TP3 ausgelöst → SL sollte auf TP2-Preis stehen
+    # Combine: fill takes priority; size is fallback when no fills at all
+    has_any_fills = len(close_fills) > 0
+    tp3_confirmed = fill_tp3_hit or (size_tp3_hit and not has_any_fills)
+    tp2_confirmed = fill_tp2_hit or (size_tp2_hit and not has_any_fills)
+
+    if tp3_confirmed:
         exp_trail_sl  = calc_tp_price(avg, TP2_ROI, direction, leverage)
         exp_trail_lvl = 3
         exp_tp_label  = "TP3"
-    elif fill_tp2_hit:
-        # TP2 ausgelöst → SL sollte auf TP1-Preis stehen
+    elif tp2_confirmed:
         exp_trail_sl  = calc_tp_price(avg, TP1_ROI, direction, leverage)
         exp_trail_lvl = 2
         exp_tp_label  = "TP2"
@@ -3006,56 +2766,40 @@ def check_and_repair_position(pos: dict):
 
     if exp_trail_lvl > 0:
         current_trail = trailing_sl_level.get(symbol, 0)
+
+        def _sl_at_level(sl_val: float, expected: float) -> bool:
+            if expected == 0 or sl_val == 0:
+                return False
+            return abs(sl_val - expected) / expected * 100 <= 0.15
+
+        def _sl_better_than(sl_val: float, expected: float) -> bool:
+            if sl_val == 0:
+                return False
+            return sl_val >= expected if direction == "long" else sl_val <= expected
+
         if _sl_at_level(sl_price, exp_trail_sl) or _sl_better_than(sl_price, exp_trail_sl):
-            # SL bereits korrekt oder besser → State aktualisieren, nichts setzen
             trailing_sl_level[symbol] = max(current_trail, exp_trail_lvl)
-            log(f"  Trailing SL Level {exp_trail_lvl}: SL @ {sl_price} "
-                f"bereits auf/über erwartetem Niveau ({exp_trail_sl:.5f}) ✓")
+            log(f"  {exp_tp_label} erkannt (fill/size), "
+                f"Trailing SL Level {exp_trail_lvl}: SL @ {sl_price} bereits korrekt ✓")
         elif current_trail < exp_trail_lvl:
-            # SL noch nicht auf erwartetem Niveau → nachziehen
-            log(f"  {exp_tp_label} ausgelöst (fill-basiert), "
-                f"SL noch nicht auf Trailing-Niveau → nachziehen auf {exp_trail_sl:.5f}")
+            log(f"  {exp_tp_label} erkannt (fill/size), "
+                f"SL noch nicht auf Trailing-Niveau — nachziehen auf {exp_trail_sl:.5f}")
             set_sl_trailing(symbol, direction, exp_trail_sl,
                             level=exp_trail_lvl, cur_size=size)
 
     # Trade-Daten für spätere Auswertung und als SL-Fallback in place_tp_orders
-    # Werte aus geladenem State erhalten wo sinnvoll:
-    #   peak_size  → max(bestehend, aktuell) — nie kleiner setzen als gespeichert
-    #   open_ts    → nicht überschreiben wenn Trade bereits läuft
-    #   tp_order_ids → für Direktstornierung erhalten
-    _prev          = trade_data.get(symbol, {})
-    _prev_peak     = _prev.get("peak_size", 0)
-    _prev_open_ts  = _prev.get("open_ts", int(time.time() * 1000))
-    _prev_tp_ids   = _prev.get("tp_order_ids", [])
     trade_data[symbol] = {
-        "entry":        avg,
-        "direction":    direction,
-        "leverage":     leverage,
-        "sl":           sl_price,
-        "peak_size":    max(_prev_peak, size),   # nie kleiner als gespeichertes Maximum
-        "open_ts":      _prev_open_ts,
-        "tp_order_ids": _prev_tp_ids,
+        "entry":     avg,
+        "direction": direction,
+        "leverage":  leverage,
+        "sl":        sl_price,
+        "peak_size": size,
+        "open_ts":   int(time.time() * 1000),
     }
 
     # ── 2. TPs prüfen ─────────────────────────────────────────────────────
-    # Avg-Änderung erkennen: DCA-Fill verändert den durchschnittlichen Entry.
-    # Wenn der Avg signifikant geändert hat, muss tp_set_ts gelöscht werden
-    # damit die TPs mit dem neuen Avg neuberechnet werden.
-    _prev_avg = last_known_avg.get(symbol, 0)
-    if _prev_avg > 0 and abs(avg - _prev_avg) / _prev_avg > 0.001:  # >0.1%
-        log(f"  Avg verändert ({_prev_avg:.6g} → {avg:.6g}) — DCA erkannt → TP-Neuberechnung")
-        tp_set_ts.pop(symbol, None)   # Grace-Period löschen → TPs werden geprüft
-
-    # SCHUTZFENSTER: TPs kürzlich korrekt gesetzt → API-Abfrage sparen.
-    # Wird automatisch gelöscht wenn avg sich ändert (DCA-Fill erkannt, s.o.).
-    if tp_set_ts.get(symbol, 0) > time.time() - SL_TP_GRACE:
-        log(f"  TPs: kürzlich gesetzt — skip TP-Prüfung")
-        sl_at_entry[symbol] = sl_is_entry
-        trade_data[symbol].update({"sl": sl_price if sl_price > 0 else trade_data.get(symbol, {}).get("sl", 0)})
-        existing_tps = []
-        tps_correct  = True
-    else:
-        existing_tps = get_existing_tps(symbol)
+    # Nur die TPs prüfen, die laut Preisvergleich noch offen sein sollten.
+    existing_tps = get_existing_tps(symbol)
     tp4_pos      = _get_pos_tp_price(symbol, direction)
 
     n_exp_pp   = state["n_expected_profit_plan"]   # erwartete profit_plan Orders
@@ -3067,14 +2811,12 @@ def check_and_repair_position(pos: dict):
     pp_count_ok  = (n_act_pp == n_exp_pp)
     pp_price_ok  = tps_are_correct(existing_tps, avg, size, direction,
                                    leverage, decimals, mark) if pp_count_ok else False
-    tps_correct  = True if tp_set_ts.get(symbol, 0) > time.time() - SL_TP_GRACE \
-                   else (pp_count_ok and pp_price_ok and tp4_ok)
+    tps_correct  = pp_count_ok and pp_price_ok and tp4_ok
 
-    if not (tp_set_ts.get(symbol, 0) > time.time() - SL_TP_GRACE):
-        log(f"  TPs: erwartet {n_exp_pp} profit_plan"
-            f" + {'TP4 Full-Close' if tp4_exp else 'kein TP4 (passiert)'}"
-            f" | vorhanden {n_act_pp} profit_plan"
-            f" + {'TP4 @ ' + str(tp4_pos) if tp4_pos > 0 else 'kein TP4'}")
+    log(f"  TPs: erwartet {n_exp_pp} profit_plan"
+        f" + {'TP4 Full-Close' if tp4_exp else 'kein TP4 (passiert)'}"
+        f" | vorhanden {n_act_pp} profit_plan"
+        f" + {'TP4 @ ' + str(tp4_pos) if tp4_pos > 0 else 'kein TP4'}")
 
     if not tps_correct:
         reasons = []
@@ -3086,17 +2828,14 @@ def check_and_repair_position(pos: dict):
             reasons.append("TP4 Full-Close fehlt")
         log(f"  ⚠ TPs inkorrekt ({'; '.join(reasons)}) → neu setzen")
 
-        if True:  # kein Mindestgrößen-Block: TP4 immer setzen, TP1-3 intern übersprungen wenn qty=0
-            cancel_all_tp_orders(symbol, trade_data.get(symbol, {}).get("tp_order_ids"))
+        if size < 4:
+            log(f"  ⚠ Position zu klein (Qty={size}, min. 4) — TPs manuell setzen")
+        else:
+            cancel_all_tp_orders(symbol)
             time.sleep(1)
-            triggered_rois = {t["roi"] for t in state.get("tps_hit", [])}
-            triggered_rois |= {t["roi"] for t in filled_tps}
-            count, tp_prices, _tp_ids = place_tp_orders(
-                symbol, avg, size, direction, leverage, mark, known_sl=sl_price,
-                skip_rois=triggered_rois
+            count, tp_prices = place_tp_orders(
+                symbol, avg, size, direction, leverage, mark, known_sl=sl_price
             )
-            if symbol in trade_data:
-                trade_data[symbol]["tp_order_ids"] = _tp_ids
             status = "✓ Alle" if count == len(state["tps_remaining"]) else f"⚠ {count}"
             log(f"  {status} TPs gesetzt")
             if count > 0:
@@ -3121,22 +2860,7 @@ def check_and_repair_position(pos: dict):
     existing_dcas = get_existing_dca_orders(symbol, direction)
     n_dca         = len(existing_dcas)
 
-    if n_dca > 2:
-        # Zu viele DCAs (Duplikate) — Alle stornieren und neu setzen
-        log(f"  ⚠ {n_dca} DCA-Orders gefunden (erwartet: 2) → Duplikate bereinigen")
-        telegram(
-            f"🧹 <b>DCA-Duplikate bereinigt — {symbol}</b>\n"
-            f"{n_dca} DCA-Orders gefunden, nur 2 erwartet.\n"
-            f"Alle storniert und neu gesetzt."
-        )
-        cancel_open_dca_orders(symbol, direction)
-        time.sleep(1)
-        if sl_price and sl_price > 0:
-            place_dca_orders(symbol, avg, sl_price, direction, size,
-                             balance=get_futures_balance(), leverage=leverage)
-        else:
-            log("  Kein SL-Preis — DCA nach Bereinigung nicht neu gesetzt")
-    elif n_dca == 2:
+    if n_dca >= 2:
         dca_info = " | ".join(
             f"{o.get('price','?')} × {o.get('size','?')}" for o in existing_dcas[:2]
         )
@@ -3203,9 +2927,9 @@ def report_position_startup(pos: dict):
 
     issues   = []   # Gesammelte Probleme → Telegram-Alert
 
-    # ── 1. Daten von Bitget lesen ─────────────────────────────────────────
-    # Startup-Check ist bewusst leichtgewichtig: prüft nur kritische Probleme.
-    # Vollständige TP/SL-Prüfung erfolgt im ersten regulären Polling-Zyklus.
+    # ── 1. Zuverlässig lesbare Daten von Bitget holen ─────────────────────
+    # SL/TP-Plan-Orders sind via API nicht lesbar (alle Endpoints schlagen fehl).
+    # Verlässliche Quellen: Fill-Historie, offene DCA-Orders, Positionsdaten.
     close_fills   = get_symbol_close_fills(symbol, since_hours=48)
     filled_tps    = detect_filled_tps(close_fills, avg, leverage, direction)
     fill_tp1      = any(t["roi"] == TP1_ROI for t in filled_tps)
@@ -3226,24 +2950,13 @@ def report_position_startup(pos: dict):
     tp1_done = state["tp1_price_hit"] or fill_tp1
 
     # Trade-Daten für Polling-Loop speichern
-    # Bestehende State-Werte erhalten:
-    #   sl         → aus geladenem State (nicht mit 0 überschreiben)
-    #   peak_size  → max(bestehend, aktuell) — nie kleiner setzen
-    #   open_ts    → nicht überschreiben wenn Trade bereits läuft
-    #   tp_order_ids → für Direktstornierung erhalten
-    _prev2         = trade_data.get(symbol, {})
-    _prev2_sl      = _prev2.get("sl", 0)
-    _prev2_peak    = _prev2.get("peak_size", 0)
-    _prev2_open_ts = _prev2.get("open_ts", int(time.time() * 1000))
-    _prev2_tp_ids  = _prev2.get("tp_order_ids", [])
     trade_data[symbol] = {
-        "entry":        avg,
-        "direction":    direction,
-        "leverage":     leverage,
-        "sl":           _prev2_sl,             # aus State erhalten
-        "peak_size":    max(_prev2_peak, size), # nie kleiner als gespeichertes Maximum
-        "open_ts":      _prev2_open_ts,
-        "tp_order_ids": _prev2_tp_ids,
+        "entry":     avg,
+        "direction": direction,
+        "leverage":  leverage,
+        "sl":        0,   # nicht lesbar via API
+        "peak_size": size,
+        "open_ts":   int(time.time() * 1000),
     }
     if tp1_done:
         sl_at_entry[symbol] = False   # unklar, da SL nicht lesbar
@@ -3286,90 +2999,18 @@ def report_position_startup(pos: dict):
         log(f"  ✓ Kein Handlungsbedarf erkannt")
 
 
-# ─────────────────────────────────────────────────────────────────────────
-# STATE PERSISTENZ — überlebt Railway-Neustart
-# ─────────────────────────────────────────────────────────────────────────
-STATE_FILE = os.environ.get("STATE_FILE", "/tmp/dominus_state.json")
-
-def save_state():
-    """Persistiert volatile State-Dicts auf Disk."""
-    try:
-        # Alte Einträge in closed_trades bereinigen — älter als 90 Tage
-        cutoff_90d = time.time() - 90 * 86400
-        clean_trades = [t for t in closed_trades if t.get("ts", 0) >= cutoff_90d]
-        state = {
-            "sl_set_ts":               sl_set_ts,
-            "tp_set_ts":               tp_set_ts,
-            "sl_at_entry":             sl_at_entry,
-            "trailing_sl_level":       trailing_sl_level,
-            "new_trade_done":          new_trade_done,
-            "last_known_avg":          last_known_avg,
-            "last_known_size":         last_known_size,
-            "trade_data":              trade_data,
-            "closed_trades":           clean_trades,
-            "daily_report_sent_date":  daily_report_sent_date,
-            "harsi_sl":                harsi_sl,
-            "saved_at":                time.time(),
-        }
-        with open(STATE_FILE, "w") as f:
-            json.dump(state, f)
-    except Exception as e:
-        log(f"  [WARN] State konnte nicht gespeichert werden: {e}")
-
-def load_state():
-    """
-    Lädt persistierten State. Ältere Timestamps (>12h) werden verworfen.
-
-    tp_set_ts wird NICHT geladen — nach jedem Neustart werden TPs einmalig
-    geprüft und ggf. korrigiert. Das verhindert, dass falsche TPs (z.B. nach
-    einem DCA-Fill in der vorigen Session) unbemerkt bestehen bleiben.
-
-    sl_set_ts wird geladen — verhindert unerwünschtes SL-Überschreiben wenn
-    Bitget SL=0 zurückliefert (kurz nach dem Setzen).
-    """
-    if not os.path.exists(STATE_FILE):
-        return
-    try:
-        with open(STATE_FILE) as f:
-            s = json.load(f)
-        age = time.time() - s.get("saved_at", 0)
-        if age > 43200:
-            log(f"  State-Datei veraltet ({age/3600:.1f}h) — wird ignoriert")
-            return
-        global daily_report_sent_date
-        sl_set_ts.update(s.get("sl_set_ts", {}))
-        # tp_set_ts wird NICHT geladen → erzwingt TP-Prüfung nach jedem Neustart
-        sl_at_entry.update(s.get("sl_at_entry", {}))
-        trailing_sl_level.update(s.get("trailing_sl_level", {}))
-        new_trade_done.update(s.get("new_trade_done", {}))
-        last_known_avg.update(s.get("last_known_avg", {}))
-        last_known_size.update(s.get("last_known_size", {}))
-        trade_data.update(s.get("trade_data", {}))
-        # closed_trades ohne Alters-Filter laden — bereits auf 90 Tage begrenzt beim Speichern
-        loaded_trades = s.get("closed_trades", [])
-        closed_trades.extend(loaded_trades)
-        daily_report_sent_date = s.get("daily_report_sent_date", "")
-        harsi_sl.update(s.get("harsi_sl", {}))
-        log(f"  ✓ State geladen: {len(trade_data)} Trade(s) | "
-            f"SL-ts: {len(sl_set_ts)} | TP-Prüfung erzwungen nach Neustart | "
-            f"Alter: {age/60:.0f} Min")
-    except Exception as e:
-        log(f"  [WARN] State konnte nicht geladen werden: {e}")
-
-
 def main():
     if not API_KEY or not SECRET_KEY or not PASSPHRASE:
         log("FEHLER: API_KEY, SECRET_KEY oder PASSPHRASE fehlen!")
         log("In Railway → Variables eintragen.")
         return
 
-    log("DOMINUS Trade-Automatisierung v4.31 gestartet — mit finanzmathematischen Optimierungen")
+    log("DOMINUS Trade-Automatisierung v4.32 gestartet — mit finanzmathematischen Optimierungen")
     log(f"Intervall: {POLL_INTERVAL}s")
     log("Warte auf neue Trades...")
     log("─" * 55)
 
-    # Persistierten State laden
-    log("Lade persistierten State...")
+    # Gespeicherten State laden
     load_state()
 
     # Webhook-Server in separatem Thread starten
@@ -3401,16 +3042,14 @@ def main():
             # ── 0. Telegram-Befehle prüfen ─────────────────
             poll_telegram_commands()
 
-            # ── 0a. Daily P&L Report um 23:59 automatisch senden ──────────
-            # Prüft einmal pro Minute — dank POLL_INTERVAL ≤ 60s kein Versand-Fenster verpassen.
+            # ── 0a. Auto Daily Report um 23:59 ─────────────
             global daily_report_sent_date
             _now   = datetime.now()
             _today = _now.strftime("%Y-%m-%d")
             if _now.hour == 23 and _now.minute == 59 and daily_report_sent_date != _today:
                 log("[Auto-Report] Täglicher P&L Report wird gesendet (23:59)...")
                 try:
-                    report_text = build_daily_report(_today)
-                    telegram(report_text)
+                    telegram(build_daily_report(_today))
                     daily_report_sent_date = _today
                     save_state()
                     log("[Auto-Report] ✓ Report gesendet")
@@ -3466,16 +3105,6 @@ def main():
                             log(f"Neuer Trade erkannt: {sym}")
                             setup_new_trade(pos)
 
-                    # TP-Step Trailing: Grössenreduktion erkennen und SL nachziehen
-                    #
-                    # Thresholds relativ zu peak_size (Original-Positionsgrösse):
-                    #   TP1 (15% geschlossen): verbleibend 85% → Threshold 87%
-                    #   TP2 (weitere 20%):     verbleibend 65% → Threshold 67%
-                    #   TP3 (weitere 30%):     verbleibend 35% → Threshold 37%
-                    #
-                    # peak_size statt kno_size: bei DCA wird kno_size grösser,
-                    # TP1 schliesst aber nur % der Original-Grösse → Reduktion
-                    # relativ zu kno_size zu klein, wird nie erkannt.
                     elif kno_size > 0:
                         _peak = trade_data.get(sym, {}).get("peak_size", kno_size)
                         _ref  = _peak if _peak > 0 else kno_size
@@ -3486,38 +3115,28 @@ def main():
                         _dir  = _td.get("direction", direction)
 
                         if cur_size < _ref * 0.87 and not sl_at_entry.get(sym, False):
-                            # TP1 ausgelöst → SL auf Entry
                             red = (_ref - cur_size) / _ref * 100
-                            log(f"TP1 erkannt ({sym}): "
-                                f"peak={_ref:.2f} → jetzt={cur_size:.2f} "
-                                f"(-{red:.0f}%) → SL auf Entry")
+                            log(f"TP1 erkannt ({sym}): peak={_ref:.2f} → jetzt={cur_size:.2f} (-{red:.0f}%) → SL auf Entry")
                             trailing_sl_level[sym] = 1
                             set_sl_at_entry(sym, _dir, _avg, cur_size=cur_size)
                             last_known_size[sym] = cur_size
 
                         elif cur_size < _ref * 0.67 and _trl < 2:
-                            # TP2 ausgelöst → SL auf TP1-Preis
                             red = (_ref - cur_size) / _ref * 100
                             tp1_price = calc_tp_price(_avg, TP1_ROI, _dir, _lev)
-                            log(f"TP2 erkannt ({sym}): "
-                                f"peak={_ref:.2f} → jetzt={cur_size:.2f} "
-                                f"(-{red:.0f}%) → Trailing SL auf TP1 @ {tp1_price:.5f}")
+                            log(f"TP2 erkannt ({sym}): peak={_ref:.2f} → jetzt={cur_size:.2f} (-{red:.0f}%) → Trailing SL auf TP1 @ {tp1_price:.5f}")
                             set_sl_trailing(sym, _dir, tp1_price, level=2, cur_size=cur_size)
                             last_known_size[sym] = cur_size
 
                         elif cur_size < _ref * 0.37 and _trl < 3:
-                            # TP3 ausgelöst → SL auf TP2-Preis
                             red = (_ref - cur_size) / _ref * 100
                             tp2_price = calc_tp_price(_avg, TP2_ROI, _dir, _lev)
-                            log(f"TP3 erkannt ({sym}): "
-                                f"peak={_ref:.2f} → jetzt={cur_size:.2f} "
-                                f"(-{red:.0f}%) → Trailing SL auf TP2 @ {tp2_price:.5f}")
+                            log(f"TP3 erkannt ({sym}): peak={_ref:.2f} → jetzt={cur_size:.2f} (-{red:.0f}%) → Trailing SL auf TP2 @ {tp2_price:.5f}")
                             set_sl_trailing(sym, _dir, tp2_price, level=3, cur_size=cur_size)
                             last_known_size[sym] = cur_size
 
-                    # Grösse aktualisieren (Position teilweise geschlossen)
-                    elif kno_size > 0 and cur_size != kno_size:
-                        last_known_size[sym] = cur_size
+                        elif cur_size != kno_size:
+                            last_known_size[sym] = cur_size
 
                 # Geschlossene Positionen erkennen
                 # (Position war bekannt, ist jetzt nicht mehr in get_all_positions)
@@ -3525,9 +3144,6 @@ def main():
                 for sym in list(last_known_avg.keys()):
                     if sym not in active_symbols and last_known_avg.get(sym, 0) > 0:
                         handle_position_closed(sym, "SL oder TP4 ausgelöst")
-
-            # State nach jedem Polling-Zyklus sichern
-            save_state()
 
         except requests.exceptions.ConnectionError:
             log("Verbindungsfehler. Retry in 30s...")
