@@ -126,6 +126,12 @@ h4_buffer:     list = []
 h4_buffer_lock = __import__("threading").Lock()
 H4_BUFFER_SEC  = int(os.environ.get("H4_BUFFER_SEC", "300"))  # 5 Min
 
+# Daily P&L Report — Aufzeichnung abgeschlossener Trades
+# [{symbol, direction, leverage, entry, close_price, net_pnl, realized_pnl,
+#   fee, peak_size, hold_str, ts (Unix-Sek.), trailing_level, won}]
+closed_trades: list = []
+daily_report_sent_date: str = ""   # "2026-04-17" — verhindert Doppelversand pro Tag
+
 
 # ═══════════════════════════════════════════════════════════════
 # BASIS-FUNKTIONEN
@@ -980,6 +986,24 @@ def handle_position_closed(symbol: str, reason: str = ""):
     ]
 
     telegram("\n".join(msg_lines))
+
+    # ── Trade für Daily Report aufzeichnen ────────────────────────────────
+    closed_trades.append({
+        "symbol":       symbol,
+        "direction":    direction,
+        "leverage":     leverage,
+        "entry":        entry,
+        "close_price":  close_px,
+        "net_pnl":      net_pnl,
+        "realized_pnl": realized,
+        "fee":          fee,
+        "peak_size":    peak_size,
+        "hold_str":     hold_str,
+        "ts":           int(time.time()),
+        "trailing_level": trailing_sl_level.get(symbol, 0),
+        "won":          won,
+    })
+    save_state()
 
     # Internen Status zurücksetzen
     last_known_avg.pop(symbol, None)
@@ -1872,6 +1896,8 @@ def cmd_hilfe():
         "/status — Kurzstatus aller Positionen\n"
         "/refresh [SYMBOL] — SL/TP/DCA sofort prüfen & reparieren\n"
         "   Beispiel: /refresh BTCUSDT  (oder /refresh für alle)\n"
+        "/report — Daily P&L Report sofort abrufen\n"
+        "   (automatisch täglich um 23:59 Uhr)\n"
         "/hilfe — diese Übersicht\n"
         "\n"
         "🎯 <b>Premium Setup (DOMINUS):</b>\n"
@@ -1979,6 +2005,158 @@ def cmd_refresh(parts: list):
     reply("\n".join(lines))
 
 
+def build_daily_report(date_str: str = None) -> str:
+    """
+    Erstellt den Daily P&L Report für ein bestimmtes Datum (Standard: heute).
+    Enthält: Tages-Zusammenfassung, abgeschlossene Trades, offene Positionen,
+             kumulative Monats-Bilanz.
+    """
+    now         = datetime.now()
+    today_str   = date_str or now.strftime("%Y-%m-%d")
+    month_str   = today_str[:7]   # "2026-04"
+    day_display = datetime.strptime(today_str, "%Y-%m-%d").strftime("%a., %d. %b %Y")
+
+    # Wochentag auf Deutsch
+    de_days = {"Mon": "Mo", "Tue": "Di", "Wed": "Mi", "Thu": "Do",
+               "Fri": "Fr", "Sat": "Sa", "Sun": "So"}
+    de_months = {"Jan": "Jan", "Feb": "Feb", "Mar": "Mär", "Apr": "Apr",
+                 "May": "Mai", "Jun": "Jun", "Jul": "Jul", "Aug": "Aug",
+                 "Sep": "Sep", "Oct": "Okt", "Nov": "Nov", "Dec": "Dez"}
+    for en, de in {**de_days, **de_months}.items():
+        day_display = day_display.replace(en, de)
+
+    # ── Trades für heute und diesen Monat filtern ─────────────────────────
+    today_trades = [t for t in closed_trades
+                    if datetime.fromtimestamp(t.get("ts", 0)).strftime("%Y-%m-%d") == today_str]
+    month_trades = [t for t in closed_trades
+                    if datetime.fromtimestamp(t.get("ts", 0)).strftime("%Y-%m")   == month_str]
+
+    # ── Tages-Zusammenfassung ─────────────────────────────────────────────
+    day_wins    = sum(1 for t in today_trades if t.get("won", False))
+    day_losses  = len(today_trades) - day_wins
+    day_pnl     = sum(t.get("net_pnl", 0) for t in today_trades)
+    day_wr      = (day_wins / len(today_trades) * 100) if today_trades else 0
+    day_pnl_str = f"{day_pnl:+.2f}" if today_trades else "—"
+
+    best_trade  = max(today_trades, key=lambda t: t.get("net_pnl", 0), default=None)
+    worst_trade = min(today_trades, key=lambda t: t.get("net_pnl", 0), default=None)
+
+    lines = [
+        f"📊 <b>Daily P&L Report — {day_display}</b>",
+        f"━━━━━━━━━━━━━━━━",
+        f"",
+        f"📈 <b>Tages-Zusammenfassung</b>",
+    ]
+
+    if today_trades:
+        lines += [
+            f"Trades heute:  {len(today_trades)}  ({day_wins}✅ / {day_losses}❌)",
+            f"Netto P&L:     <b>{day_pnl_str} USDT</b>",
+            f"Win-Rate:      {day_wr:.1f}%",
+        ]
+        if best_trade:
+            lines.append(
+                f"Bester Trade:  {best_trade['symbol']} {best_trade['net_pnl']:+.2f} USDT"
+            )
+        if worst_trade and worst_trade != best_trade:
+            lines.append(
+                f"Schwächster:   {worst_trade['symbol']} {worst_trade['net_pnl']:+.2f} USDT"
+            )
+    else:
+        lines.append("Keine abgeschlossenen Trades heute.")
+
+    # ── Abgeschlossene Trades (Detail) ────────────────────────────────────
+    lines += ["", "─────────────────"]
+    if today_trades:
+        lines.append(f"🏁 <b>Heute abgeschlossen ({len(today_trades)})</b>")
+        lines.append("")
+        for t in sorted(today_trades, key=lambda x: x.get("ts", 0)):
+            icon    = "🏆" if t.get("won") else "🔴"
+            drct    = dir_icon(t.get("direction", "long"))
+            lev     = t.get("leverage", "?")
+            sym     = t.get("symbol", "?")
+            entry_p = t.get("entry", 0)
+            close_p = t.get("close_price", 0)
+            pnl     = t.get("net_pnl", 0)
+            hold    = t.get("hold_str", "?")
+            trl_lvl = t.get("trailing_level", 0)
+            trl_tag = {1: " · SL=Entry", 2: " · Trail→TP1", 3: " · Trail→TP2"}.get(trl_lvl, "")
+            entry_s = f"{entry_p:.4f}" if entry_p else "?"
+            close_s = f"{close_p:.4f}" if close_p else "?"
+            lines += [
+                f"{icon} <b>{sym}</b> {drct} {lev}x{trl_tag}",
+                f"  Entry: {entry_s}  →  Close: {close_s}",
+                f"  Netto: <b>{pnl:+.2f} USDT</b>  |  Dauer: {hold}",
+                "",
+            ]
+    else:
+        lines += ["🏁 <b>Heute abgeschlossen</b>", "Keine Trades heute.", ""]
+
+    # ── Laufende Positionen ───────────────────────────────────────────────
+    lines.append("─────────────────")
+    positions = get_all_positions()
+    if positions:
+        lines.append(f"📍 <b>Laufende Positionen ({len(positions)})</b>")
+        lines.append("")
+        for pos in positions:
+            sym       = pos.get("symbol", "?")
+            avg       = float(pos.get("openPriceAvg", 0))
+            mark      = float(pos.get("markPrice", 0))
+            direction = pos.get("holdSide", "long")
+            leverage  = int(float(pos.get("leverage", 10)))
+            pnl_f     = float(pos.get("unrealizedPL", 0))
+            size_f    = float(pos.get("total", 0))
+            drct      = dir_icon(direction)
+            trl_lvl   = trailing_sl_level.get(sym, 0)
+            trl_tag   = {0: "", 1: " · SL=Entry", 2: " · Trail→TP1",
+                         3: " · Trail→TP2"}.get(trl_lvl, "")
+            lines += [
+                f"{drct} <b>{sym}</b> {direction.upper()} {leverage}x{trl_tag}",
+                f"  Entry: {avg:.4f}  |  Mark: {mark:.4f}",
+                f"  Unrealisiert: {pnl_f:+.2f} USDT  |  Qty: {size_f:.2f}",
+                "",
+            ]
+    else:
+        lines += ["📍 <b>Laufende Positionen</b>", "Keine offenen Positionen.", ""]
+
+    # ── Monatliche Kumulativ-Bilanz ───────────────────────────────────────
+    month_display = datetime.strptime(month_str + "-01", "%Y-%m-%d").strftime("%B %Y")
+    for en, de in de_months.items():
+        month_display = month_display.replace(en, de)
+
+    mon_wins   = sum(1 for t in month_trades if t.get("won", False))
+    mon_losses = len(month_trades) - mon_wins
+    mon_pnl    = sum(t.get("net_pnl", 0) for t in month_trades)
+    mon_fee    = sum(t.get("fee", 0) for t in month_trades)
+    mon_wr     = (mon_wins / len(month_trades) * 100) if month_trades else 0
+
+    lines += [
+        "─────────────────",
+        f"📅 <b>{month_display}</b>",
+    ]
+    if month_trades:
+        lines += [
+            f"Trades:    {len(month_trades)}  ({mon_wins}✅ / {mon_losses}❌)",
+            f"Netto P&L: <b>{mon_pnl:+.2f} USDT</b>",
+            f"Gebühren:  {mon_fee:.2f} USDT",
+            f"Win-Rate:  {mon_wr:.1f}%",
+        ]
+    else:
+        lines.append("Noch keine abgeschlossenen Trades diesen Monat.")
+
+    lines.append("")
+    lines.append(f"<i>Generiert: {now.strftime('%H:%M Uhr')}</i>")
+
+    return "\n".join(lines)
+
+
+def cmd_report():
+    """Befehlshandler für /report — sendet sofort den Daily P&L Report."""
+    log("[/report] Daily P&L Report wird erstellt...")
+    report = build_daily_report()
+    telegram(report)
+
+
 def poll_telegram_commands():
     """
     Prüft auf neue Telegram-Nachrichten und führt Befehle aus.
@@ -2020,6 +2198,8 @@ def poll_telegram_commands():
             cmd_status()
         elif cmd == "/refresh":
             cmd_refresh(parts)
+        elif cmd == "/report":
+            cmd_report()
         elif cmd == "/hilfe" or cmd == "/start" or cmd == "/help":
             cmd_hilfe()
         else:
@@ -3001,16 +3181,21 @@ STATE_FILE = os.environ.get("STATE_FILE", "/tmp/dominus_state.json")
 def save_state():
     """Persistiert volatile State-Dicts auf Disk."""
     try:
+        # Alte Einträge in closed_trades bereinigen — älter als 90 Tage
+        cutoff_90d = time.time() - 90 * 86400
+        clean_trades = [t for t in closed_trades if t.get("ts", 0) >= cutoff_90d]
         state = {
-            "sl_set_ts":          sl_set_ts,
-            "tp_set_ts":          tp_set_ts,
-            "sl_at_entry":        sl_at_entry,
-            "trailing_sl_level":  trailing_sl_level,
-            "new_trade_done":     new_trade_done,
-            "last_known_avg":     last_known_avg,
-            "last_known_size":    last_known_size,
-            "trade_data":         trade_data,
-            "saved_at":           time.time(),
+            "sl_set_ts":               sl_set_ts,
+            "tp_set_ts":               tp_set_ts,
+            "sl_at_entry":             sl_at_entry,
+            "trailing_sl_level":       trailing_sl_level,
+            "new_trade_done":          new_trade_done,
+            "last_known_avg":          last_known_avg,
+            "last_known_size":         last_known_size,
+            "trade_data":              trade_data,
+            "closed_trades":           clean_trades,
+            "daily_report_sent_date":  daily_report_sent_date,
+            "saved_at":                time.time(),
         }
         with open(STATE_FILE, "w") as f:
             json.dump(state, f)
@@ -3037,6 +3222,7 @@ def load_state():
         if age > 43200:
             log(f"  State-Datei veraltet ({age/3600:.1f}h) — wird ignoriert")
             return
+        global daily_report_sent_date
         sl_set_ts.update(s.get("sl_set_ts", {}))
         # tp_set_ts wird NICHT geladen → erzwingt TP-Prüfung nach jedem Neustart
         sl_at_entry.update(s.get("sl_at_entry", {}))
@@ -3045,6 +3231,10 @@ def load_state():
         last_known_avg.update(s.get("last_known_avg", {}))
         last_known_size.update(s.get("last_known_size", {}))
         trade_data.update(s.get("trade_data", {}))
+        # closed_trades ohne Alters-Filter laden — bereits auf 90 Tage begrenzt beim Speichern
+        loaded_trades = s.get("closed_trades", [])
+        closed_trades.extend(loaded_trades)
+        daily_report_sent_date = s.get("daily_report_sent_date", "")
         log(f"  ✓ State geladen: {len(trade_data)} Trade(s) | "
             f"SL-ts: {len(sl_set_ts)} | TP-Prüfung erzwungen nach Neustart | "
             f"Alter: {age/60:.0f} Min")
@@ -3095,6 +3285,22 @@ def main():
         try:
             # ── 0. Telegram-Befehle prüfen ─────────────────
             poll_telegram_commands()
+
+            # ── 0a. Daily P&L Report um 23:59 automatisch senden ──────────
+            # Prüft einmal pro Minute — dank POLL_INTERVAL ≤ 60s kein Versand-Fenster verpassen.
+            global daily_report_sent_date
+            _now   = datetime.now()
+            _today = _now.strftime("%Y-%m-%d")
+            if _now.hour == 23 and _now.minute == 59 and daily_report_sent_date != _today:
+                log("[Auto-Report] Täglicher P&L Report wird gesendet (23:59)...")
+                try:
+                    report_text = build_daily_report(_today)
+                    telegram(report_text)
+                    daily_report_sent_date = _today
+                    save_state()
+                    log("[Auto-Report] ✓ Report gesendet")
+                except Exception as _re:
+                    log(f"[Auto-Report] ✗ Fehler: {_re}")
 
             # ── 0b. H4 Puffer flushen wenn Zeitfenster abgelaufen ──
             if h4_buffer:
