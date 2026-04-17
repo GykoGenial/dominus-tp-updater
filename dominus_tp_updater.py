@@ -2117,8 +2117,11 @@ def start_webhook_server():
         return jsonify({"status": "ok", "symbol": symbol,
                         "direction": direction}), 200
 
+    @app.route("/", methods=["GET"])
     @app.route("/health", methods=["GET"])
     def health():
+        # Railway Healthcheck sendet GET / — muss 200 zurückgeben
+        # sonst markiert Railway den Service als unhealthy und startet neu
         return jsonify({"status": "running",
                         "version": "v4.31"}), 200
 
