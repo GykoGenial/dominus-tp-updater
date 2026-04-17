@@ -991,9 +991,16 @@ def handle_position_closed(symbol: str, reason: str = ""):
 
 def _get_pos_tp_price(symbol: str, direction: str) -> float:
     """
-    Liest den Positions-Level TP4-Preis (takeProfitPrice) direkt
-    aus den Positionsdaten — nicht aus den pending TPSL-Orders.
+    Liest den TP4-Preis für eine Position — zwei Wege:
+
+    Methode 1: takeProfitPrice aus Positionsdaten
+               (gesetzt via place-pos-tpsl, z.B. durch das Script).
+    Methode 2: pos_profit aus orders-plan-pending
+               (gesetzt via Bitget-UI "SL/TP"-Button der Positionszeile).
+
+    Beide Varianten werden als gültiger TP4 anerkannt.
     """
+    # Methode 1: TP aus Positionsdaten (position-level via place-pos-tpsl)
     result = api_get("/api/v2/mix/position/single-position", {
         "symbol":      symbol,
         "productType": PRODUCT_TYPE,
@@ -1006,7 +1013,22 @@ def _get_pos_tp_price(symbol: str, direction: str) -> float:
                               "takeProfitTriggerPrice"):
                     tp = float(pos.get(field, 0) or 0)
                     if tp > 0:
+                        log(f"  TP4 aus Position.{field}: {tp}")
                         return tp
+
+    # Methode 2: pos_profit aus Plan-Orders (Bitget-UI "SL/TP"-Button)
+    orders = _get_plan_orders(symbol)
+    for o in orders:
+        if o.get("planType") == "pos_profit":
+            # Richtungsfilter: holdSide prüfen falls vorhanden
+            hold = o.get("holdSide", direction)
+            if hold != direction:
+                continue
+            price = float(o.get("triggerPrice", 0) or 0)
+            if price > 0:
+                log(f"  TP4 aus plan-orders (pos_profit): {price}")
+                return price
+
     return 0.0
 
 
