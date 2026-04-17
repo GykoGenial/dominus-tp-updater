@@ -1897,7 +1897,11 @@ def poll_telegram_commands():
 
     updates = get_telegram_updates()
     for update in updates:
-        msg = update.get("message") or update.get("edited_message")
+        # Nur originale Nachrichten verarbeiten — edited_message ignorieren.
+        # Telegram sendet für dieselbe Nachricht manchmal ein zweites Update
+        # als edited_message (z.B. Link-Preview-Laden), was sonst zu doppelten
+        # Antworten führt.
+        msg = update.get("message")
         if not msg:
             continue
 
