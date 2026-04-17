@@ -556,13 +556,19 @@ def place_tp_orders(symbol: str, avg: float, size: float,
         tp_str = round_price(tp_raw, decimals)
         tp_val = float(tp_str)
 
-        # Qty-Berechnung: 2 Dezimalstellen für Futures-Kontrakte >= 1.0
-        # (z.B. COMP 1.76 × 0.15 = 0.264 → floor=0 [falsch!], round=0.26 [korrekt])
-        # Für Kleinkontrakts-Symbole (BTC 0.001 etc.) mehr Präzision
-        if size >= 1.0:
-            qty = round(size * pct, 2)  # 2 Dezimalstellen — deckt Bitget-Mindestschritt ab
+        # Qty-Berechnung: Präzision von der tatsächlichen Positionsgrösse ableiten.
+        # Bitget checkScale=0 bedeutet: nur Ganzzahlen erlaubt (z.B. BANUSDT, TRXUSDT).
+        # Wenn size eine Ganzzahl ist (z.B. 2017.5 gerundet auf 2018), muss qty ebenfalls
+        # eine Ganzzahl sein. Wir leiten die Lot-Dezimalstellen direkt aus size ab.
+        size_str = str(size).rstrip('0')
+        if '.' in size_str and size_str.split('.')[1]:
+            size_lot_decimals = len(size_str.split('.')[1])
         else:
-            qty = round(size * pct, 4)
+            size_lot_decimals = 0
+        raw_qty = size * pct
+        qty = round(raw_qty, size_lot_decimals)
+        if size_lot_decimals == 0:
+            qty = int(qty)
 
         if qty <= 0:
             log(f"    ⏭ {label}: qty=0 (size={size}, pct={pct}) — übersprungen")
