@@ -447,9 +447,29 @@ def kelly_recommendation(balance: float, winrate: float) -> dict:
 def cancel_all_tp_orders(symbol: str):
     """
     Storniert alle TP-Orders (profit_plan) für ein Symbol.
-    Liest via orders-plan-pending, storniert via cancel-plan-order.
+
+    Strategie (zwei Stufen):
+      1. Batch-Cancel via cancel-all-plan-order (kein vorheriges Lesen nötig).
+         Funktioniert auch wenn _get_plan_orders fehlschlägt (z.B. DENT, sehr
+         kleine Preise) — direkt nach planType=profit_plan filtern.
+      2. Fallback: Lesen + Einzelstornierung (bisheriges Verhalten).
     SL-Typen (loss_plan, pos_loss) werden nie angefasst.
     """
+    # ── Stufe 1: Batch-Cancel (kein Read nötig) ──────────────
+    batch_res = api_post("/api/v2/mix/order/cancel-all-plan-order", {
+        "symbol":      symbol,
+        "productType": PRODUCT_TYPE,
+        "marginCoin":  MARGIN_COIN,
+        "planType":    "profit_plan",
+    })
+    if batch_res.get("code") == "00000":
+        log(f"  ✓ Alle profit_plan TPs via Batch-Cancel storniert ({symbol})")
+        return
+
+    log(f"  Batch-Cancel nicht verfügbar ({batch_res.get('msg','?')}) — "
+        f"versuche Einzelstornierung...")
+
+    # ── Stufe 2: Lesen + Einzelstornierung (Fallback) ────────
     orders = _get_plan_orders(symbol)
     tp_orders = [o for o in orders if o.get("planType") == "profit_plan"]
 
@@ -1707,21 +1727,36 @@ def cmd_berechnen():
             lev  = int(float(pos.get("leverage", 10)))
             drct = pos.get("holdSide", "?").upper()
             pnl  = float(pos.get("unrealizedPL", 0))
-            secured = sl_at_entry.get(sym, False)
-            if not secured:
+
+            trl  = trailing_sl_level.get(sym, 0)
+            sec  = sl_at_entry.get(sym, False) or trl >= 1
+
+            if trl >= 3:
+                icon     = "🏆"
+                sl_label = "SL@TP2 — Gewinn gesichert"
+            elif trl >= 2:
+                icon     = "✅"
+                sl_label = "SL@TP1 — Auf Sicher"
+            elif trl >= 1 or sec:
+                icon     = "🔒"
+                sl_label = "SL@Entry — Break-even"
+            else:
+                icon     = "⚠️"
+                sl_label = "SL unter Entry — Risiko"
                 all_secured = False
-            icon = "🔒" if secured else "⚠️"
+
             lines.append(
-                f"{icon} {sym} {drct} {lev}x | "
-                f"Qty={qty} | Avg={avg:.4f} | PnL={pnl:+.2f}"
+                f"{icon} <b>{sym}</b> {drct} {lev}x | "
+                f"Avg={avg:.5g} | PnL={pnl:+.2f} USDT\n"
+                f"   └ {sl_label}"
             )
 
         if all_secured:
-            lines += ["", "✅ Alle Positionen gesichert → neuer Trade möglich"]
+            lines += ["", "✅ Alle Positionen auf Sicher → neuer Trade möglich"]
         else:
             lines += [
                 "",
-                "⚠️ Noch nicht alle Positionen auf SL=Entry",
+                "⚠️ Noch nicht alle Positionen gesichert",
                 "→ Kein neuer Trade empfohlen (DOMINUS-Regel)"
             ]
     else:
