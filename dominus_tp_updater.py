@@ -903,8 +903,14 @@ def handle_position_closed(symbol: str, reason: str = ""):
     trailing_sl_level.pop(symbol, None)
     trade_data.pop(symbol, None)
 
-    # Noch offene TP-Orders aufräumen (Sicherheit)
+    # Noch offene TP-Orders aufräumen
     cancel_all_tp_orders(symbol)
+
+    # DCA Limit-Orders stornieren — wichtig bei manuellem Close VOR TP1.
+    # Ohne diesen Aufruf bleiben DCA-Limit-Orders auf Bitget aktiv und würden
+    # bei einem Kursrücklauf füllen → Ghost-Position, die der Server nicht kennt.
+    if direction and direction != "?":
+        cancel_open_dca_orders(symbol, direction)
 
 
 def _get_pos_tp_price(symbol: str, direction: str) -> float:
@@ -3322,10 +3328,20 @@ def main():
 
                 # Geschlossene Positionen erkennen
                 # (Position war bekannt, ist jetzt nicht mehr in get_all_positions)
+                # Ursache: SL/TP4 automatisch ODER manuell geschlossen.
+                # In beiden Fällen: TP-Orders + DCA-Orders stornieren → handle_position_closed.
                 active_symbols = {p.get("symbol") for p in get_all_positions()}
                 for sym in list(last_known_avg.keys()):
                     if sym not in active_symbols and last_known_avg.get(sym, 0) > 0:
-                        handle_position_closed(sym, "SL oder TP4 ausgelöst")
+                        # Trailing-Level bestimmt Ursache: 0 = vor TP1 → wahrscheinlich manuell
+                        trl = trailing_sl_level.get(sym, 0)
+                        if trl == 0:
+                            reason = "Manuell geschlossen (vor TP1)"
+                        elif trl >= 3:
+                            reason = "TP3/TP4 oder Trailing SL ausgelöst"
+                        else:
+                            reason = "SL oder TP ausgelöst"
+                        handle_position_closed(sym, reason)
 
         except requests.exceptions.ConnectionError:
             log("Verbindungsfehler. Retry in 30s...")
