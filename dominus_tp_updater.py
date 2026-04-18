@@ -1,5 +1,5 @@
 """
-DOMINUS Trade-Automatisierung v4
+DOMINUS Trade-Automatisierung v4.4
 ══════════════════════════════════════════════════════════════
 Vollautomatisches Setup nach DOMINUS-Strategie (Handbuch März 2026)
 Finanzmathematische Optimierungen:
@@ -8,6 +8,19 @@ Finanzmathematische Optimierungen:
   ③ Kelly-Kriterium   — optimale Positionsgrösse
   ④ Asymm. TPs        — 15/20/25/40% statt 25/25/25/25%
   ⑤ Telegram Polling  — /berechnen /trade /status /hilfe
+
+Changelog v4.4 — Logik-Audit & Fixes:
+  K1: TP3-Grössen-Schwellwert 0.37→0.42, TP2 0.67→0.69 (war zu tief für asym. TPs)
+  K2: DCA-Fehler via Telegram gemeldet statt still ignoriert
+  K3: TP-Kaskade sequentiell (statt elif) — TP1+TP2 werden im selben Tick erkannt
+  H3: API retry (3×) bei 5xx / Timeout mit exp. Backoff
+  H5: TP4 known_sl Fallback aus Trailing-Level (TP1/TP2-Preis) statt altem Entry-SL
+  M1: h4_buffer Lock konsistent im Main-Loop
+  M2: last_h2_signal_time Cleanup direkt beim Schreiben (kein Memory-Leak)
+  M3: TP2-Schwellwert 0.67→0.69 (+4% Puffer gegen Slippage)
+  M4: übersprungene TP-Qty (Position zu klein) wird auf nächsten TP addiert
+  M6: STATE_FILE-Warnung beim Start wenn nicht als Railway-Variable gesetzt
+  N3: sl_is_entry Toleranz preis-skaliert statt fix 0.15%
 
 WAS PASSIERT AUTOMATISCH:
   1. Neuer Trade erkannt → Hebel-Check + R:R-Check
@@ -187,25 +200,47 @@ def api_get(path: str, params: dict = None) -> dict:
     if params:
         query = "?" + "&".join(f"{k}={v}" for k, v in params.items())
     full_path = path + query
-    try:
-        r = requests.get(BASE_URL + full_path,
-                         headers=make_headers("GET", full_path), timeout=10)
-        return r.json()
-    except Exception as e:
-        log(f"GET Fehler ({path}): {e}")
-        return {}
+    # Retry bei transienten Fehlern (Timeout, Connection Error, 5xx)
+    for attempt in range(3):
+        try:
+            r = requests.get(BASE_URL + full_path,
+                             headers=make_headers("GET", full_path), timeout=10)
+            data = r.json()
+            # 5xx = transient Bitget-Fehler → retry
+            if r.status_code >= 500 and attempt < 2:
+                time.sleep(1.5 ** attempt)
+                continue
+            return data
+        except Exception as e:
+            if attempt < 2:
+                time.sleep(1.5 ** attempt)
+                continue
+            log(f"GET Fehler ({path}): {e}")
+            return {}
+    return {}
 
 
 def api_post(path: str, body: dict) -> dict:
     body_str = json.dumps(body)
-    try:
-        r = requests.post(BASE_URL + path,
-                          headers=make_headers("POST", path, body_str),
-                          data=body_str, timeout=10)
-        return r.json()
-    except Exception as e:
-        log(f"POST Fehler ({path}): {e}")
-        return {}
+    # Retry bei transienten Fehlern (Timeout, Connection Error, 5xx)
+    for attempt in range(3):
+        try:
+            r = requests.post(BASE_URL + path,
+                              headers=make_headers("POST", path, body_str),
+                              data=body_str, timeout=10)
+            data = r.json()
+            # 5xx = transient Bitget-Fehler → retry
+            if r.status_code >= 500 and attempt < 2:
+                time.sleep(1.5 ** attempt)
+                continue
+            return data
+        except Exception as e:
+            if attempt < 2:
+                time.sleep(1.5 ** attempt)
+                continue
+            log(f"POST Fehler ({path}): {e}")
+            return {}
+    return {}
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -349,8 +384,18 @@ def _get_plan_orders(symbol: str) -> list:
     if r3.get("code") == "00000":
         return _parse(r3.get("data"))
 
+    # Versuch 4: orders-plan-pending mit GROSS-productType (manche Bitget-Endpoints
+    # benötigen "USDT-FUTURES" statt "usdt-futures")
+    r4 = api_get("/api/v2/mix/order/orders-plan-pending", {
+        "productType": PRODUCT_TYPE.upper(),
+    })
+    if r4.get("code") == "00000":
+        all_orders = _parse(r4.get("data"))
+        return [o for o in all_orders if o.get("symbol") == symbol]
+
     log(f"  [WARN] Alle Plan-Order Endpoints für {symbol} fehlgeschlagen: "
-        f"1={r.get('msg','?')} | 2={r2.get('msg','?')} | 3={r3.get('msg','?')}")
+        f"1={r.get('msg','?')} | 2={r2.get('msg','?')} | "
+        f"3={r3.get('msg','?')} | 4={r4.get('msg','?')}")
     return []
 
 
@@ -529,6 +574,7 @@ def place_tp_orders(symbol: str, avg: float, size: float,
     ]
 
     partial_tps_skipped = 0  # zählt übersprungene Teilschliessungen (Position zu klein)
+    carry_qty = 0.0          # übersprungene Qty wird auf nächsten TP aufaddiert
 
     for roi, label, pct in partial_tps:
         tp_raw = calc_tp_price(avg, roi, direction, leverage)
@@ -537,15 +583,19 @@ def place_tp_orders(symbol: str, avg: float, size: float,
 
         # Qty-Berechnung: ganzzahlige Kontrakte (>= 1.0) vs. Dezimal-Kontrakte (< 1.0)
         # max(1, floor()) war falsch für BTC: floor(0.0013 × 0.15)=0 → "1 BTC schliessen"
+        base_qty = size * pct
         if size >= 1.0:
-            qty = math.floor(size * pct)
+            qty = math.floor(base_qty + carry_qty)
         else:
-            qty = round(size * pct, 4)
+            qty = round(base_qty + carry_qty, 4)
 
         if qty <= 0:
-            log(f"    ⏭ {label}: Position zu klein für Teilschliessung (size={size}, pct={pct}) — übersprungen")
+            log(f"    ⏭ {label}: Position zu klein für Teilschliessung (size={size}, pct={pct}) — "
+                f"Qty {base_qty:.4f} wird auf nächsten TP übertragen")
+            carry_qty += base_qty   # Menge für nächsten TP merken
             partial_tps_skipped += 1
             continue
+        carry_qty = 0.0  # reset wenn erfolgreich verwendet
 
         if mark_price > 0:
             if direction == "long"  and tp_val <= mark_price:
@@ -617,11 +667,27 @@ def place_tp_orders(symbol: str, avg: float, size: float,
         log(f"    ⏭ TP4 (40%) @ {tp4_str} bereits überschritten — übersprungen")
     else:
         # Aktuellen SL-Preis lesen um ihn mitzuschicken.
-        # Fallback-Kette: API → übergebener known_sl → trade_data
+        # Fallback-Kette: API → übergebener known_sl → Trailing-Level → trade_data (Original-SL)
         current_sl = get_sl_price(symbol, direction)
         if current_sl == 0 and known_sl > 0:
             current_sl = known_sl
             log(f"    SL aus Trade-Setup als Fallback: {current_sl}")
+        # Trailing-Level-Fallback: genauer als Original-SL aus trade_data
+        if current_sl == 0:
+            _trl = trailing_sl_level.get(symbol, 0)
+            _td  = trade_data.get(symbol, {})
+            _e   = float(_td.get("entry", 0))
+            _lev = int(_td.get("leverage", 10))
+            _dir = _td.get("direction", direction)
+            if _trl >= 3 and _e > 0:
+                current_sl = calc_tp_price(_e, TP2_ROI, _dir, _lev)
+                log(f"    SL aus Trailing Level 3 (TP2-Preis): {current_sl:.5f}")
+            elif _trl == 2 and _e > 0:
+                current_sl = calc_tp_price(_e, TP1_ROI, _dir, _lev)
+                log(f"    SL aus Trailing Level 2 (TP1-Preis): {current_sl:.5f}")
+            elif _trl == 1 and _e > 0:
+                current_sl = _e
+                log(f"    SL aus Trailing Level 1 (Entry): {current_sl:.5f}")
         if current_sl == 0 and symbol in trade_data:
             current_sl = trade_data[symbol].get("sl", 0)
             if current_sl > 0:
@@ -1467,7 +1533,16 @@ def setup_new_trade(pos: dict):
     # ── 5. Status speichern ─────────────────────────────────
     last_known_avg[symbol]  = entry
     last_known_size[symbol] = size
-    new_trade_done[symbol]  = True
+    # new_trade_done IMMER setzen damit der Loop diesen Trade nicht nochmals
+    # als Neu-Trade behandelt. Bei DCA-Fehler: Telegram-Warnung + /refresh empfehlen.
+    new_trade_done[symbol] = True
+    if not dca_results:
+        log(f"  ⚠ DCA-Platzierung komplett fehlgeschlagen — /refresh {symbol} zum Nachholen")
+        telegram(
+            f"⚠️ <b>DCA fehlgeschlagen — {symbol}</b>\n"
+            f"Beide DCA-Orders konnten nicht gesetzt werden.\n"
+            f"Bitte <b>/refresh {symbol}</b> ausführen um sie nachzuholen."
+        )
     sl_at_entry[symbol]     = False
     trailing_sl_level[symbol] = 0
     harsi_sl.pop(symbol, None)
@@ -1622,7 +1697,22 @@ def update_tp_for_position(pos: dict, reason: str):
         return
 
     # SL-Preis vor dem TP-Löschen lesen — wird beim TP4 zwingend mitgeführt
+    # Fallback-Kette: API → Trailing-Level (genau) → trade_data (Original-SL)
     known_sl = get_sl_price(symbol, direction)
+    if known_sl == 0:
+        _trl = trailing_sl_level.get(symbol, 0)
+        _td  = trade_data.get(symbol, {})
+        _e   = float(_td.get("entry", 0))
+        _lev = int(_td.get("leverage", 10))
+        if _trl >= 3 and _e > 0:
+            known_sl = calc_tp_price(_e, TP2_ROI, direction, _lev)
+            log(f"  SL aus Trailing Level 3 (TP2-Preis): {known_sl:.5f}")
+        elif _trl == 2 and _e > 0:
+            known_sl = calc_tp_price(_e, TP1_ROI, direction, _lev)
+            log(f"  SL aus Trailing Level 2 (TP1-Preis): {known_sl:.5f}")
+        elif _trl == 1 and _e > 0:
+            known_sl = _e
+            log(f"  SL aus Trailing Level 1 (Entry): {known_sl:.5f}")
     if known_sl == 0 and symbol in trade_data:
         known_sl = trade_data[symbol].get("sl", 0)
     if known_sl > 0:
@@ -2504,6 +2594,11 @@ def start_webhook_server():
         # H2 Signal → H4 Puffer flushen dann sofort senden
         # 30-Min-Fenster starten: Zeitstempel für HARSI_EXIT-Prüfung speichern
         last_h2_signal_time[f"{symbol}_{direction}"] = datetime.utcnow()
+        # Altes Einträge aufräumen (Memory-Leak verhindern): nur letzte 30 Min behalten
+        _cutoff = datetime.utcnow() - __import__("datetime").timedelta(minutes=35)
+        for _k in list(last_h2_signal_time.keys()):
+            if last_h2_signal_time[_k] < _cutoff:
+                del last_h2_signal_time[_k]
 
         # Makro-Kontext aus Webhook auslesen (vom DOM-ORC Plot-Werten)
         harsi_warn_val  = int(float(data.get("harsi_warn",  0) or 0))
@@ -2576,6 +2671,11 @@ def start_webhook_server():
 # ═══════════════════════════════════════════════════════════════
 
 STATE_FILE = os.environ.get("STATE_FILE", "/tmp/dominus_state.json")
+# WARNUNG: /tmp/ ist auf Railway flüchtig (wird bei Restart geleert).
+# Persistenter State: STATE_FILE als Railway-Variable auf /app/dominus_state.json setzen.
+if not os.environ.get("STATE_FILE"):
+    print("[WARN] STATE_FILE nicht gesetzt — State liegt in /tmp/ und geht bei Restart verloren!")
+    print("[WARN] → Railway Variable STATE_FILE=/app/dominus_state.json setzen.")
 
 
 def save_state():
@@ -2821,7 +2921,17 @@ def check_and_repair_position(pos: dict):
     # Alle Daten werden ZUERST geladen, bevor irgendwas verändert wird.
     # Reihenfolge: Positionsdaten → SL → TPs → Fill-Historie
 
-    sl_price    = get_sl_price(symbol, direction)
+    # SL: erst direkt aus pos-Daten (all-position enthält stopLossPrice wenn
+    # via place-pos-tpsl gesetzt), dann via Plan-Order-Endpoints
+    sl_price = 0.0
+    for _f in ("stopLossPrice", "stopLoss", "stopLossTriggerPrice", "slPrice", "sl"):
+        _v = float(pos.get(_f, 0) or 0)
+        if _v > 0:
+            sl_price = _v
+            log(f"  SL aus pos-Feld '{_f}': {_v}")
+            break
+    if sl_price == 0:
+        sl_price = get_sl_price(symbol, direction)
     sl_is_entry = False
 
     # Fill-Historie (letzte 48h) → fill-basierte TP-Erkennung
@@ -2847,9 +2957,12 @@ def check_and_repair_position(pos: dict):
     log(f"  Unrealisierter ROI: {pnl_sign}{pnl}% auf Margin")
 
     # 1b. SL-basiert: SL nahe Entry = TP1 war schon ausgelöst
+    # Toleranz: max(0.05%, 2× Preise-Dezimalstellen) — skaliert mit Preis damit
+    # Pennystocks (PEPE, SHIB) und grosse Kurse (BTC) beide korrekt erkannt werden.
     if sl_price > 0:
         sl_dist_pct_read = abs(avg - sl_price) / avg * 100
-        sl_is_entry      = sl_dist_pct_read <= 0.15
+        _sl_entry_tol    = max(0.05, 2 * (10 ** -get_price_decimals(symbol)) / avg * 100)
+        sl_is_entry      = sl_dist_pct_read <= _sl_entry_tol
         if sl_is_entry:
             log(f"  SL gelesen: @ {sl_price} → auf Entry (TP1 bereits ausgelöst)")
         else:
@@ -2909,8 +3022,9 @@ def check_and_repair_position(pos: dict):
 
     if sl_price > 0:
         # SL vorhanden — respektieren wenn besser als Auto-SL
-        sl_dist_pct = abs(avg - sl_price) / avg * 100
-        sl_is_entry = sl_dist_pct <= 0.15
+        sl_dist_pct     = abs(avg - sl_price) / avg * 100
+        _sl_entry_tol   = max(0.05, 2 * (10 ** -get_price_decimals(symbol)) / avg * 100)
+        sl_is_entry     = sl_dist_pct <= _sl_entry_tol
 
         if sl_is_entry:
             log(f"  ✓ SL auf Entry @ {sl_price} (bestätigt — wird beibehalten)")
@@ -2956,7 +3070,14 @@ def check_and_repair_position(pos: dict):
 
     else:
         # Kein SL gefunden auf Bitget
-        if tp1_done:
+        # Spezialfall: SL nicht lesbar (plan-order Endpoints defekt), aber
+        # lokaler trailing_sl_level zeigt dass SL bereits gesetzt wurde.
+        # → State vertrauen statt unnötig überschreiben.
+        if trailing_sl_level.get(symbol, 0) >= 1:
+            sl_is_entry = True
+            log(f"  SL nicht lesbar via API, aber Trailing Level "
+                f"{trailing_sl_level.get(symbol,0)} bekannt → als gesichert gewertet")
+        elif tp1_done:
             # TP1 bereits ausgelöst → SL muss auf Entry
             sl_str   = round_price(avg, decimals)
             sl_valid = (direction == "long" and avg <= mark) or \
@@ -3081,8 +3202,8 @@ def check_and_repair_position(pos: dict):
     # Methode B — Grössen-basiert (immer aktiv als Ergänzung):
     #   peak_size wird rekonstruiert aus: aktuelle Grösse + Summe aller Close-Fill-Grössen.
     #   Damit ist peak_size auch nach Neustart korrekt ohne gespeicherten State.
-    #   TP2 ausgelöst: size < peak * 0.67  (35% geschlossen: TP1 15% + TP2 20%)
-    #   TP3 ausgelöst: size < peak * 0.37  (63% geschlossen: TP1+TP2+TP3 = 60%)
+    #   TP2 ausgelöst: size < peak * 0.69  (35% geschlossen: TP1 15% + TP2 20% → 65% rest + 4% Puffer)
+    #   TP3 ausgelöst: size < peak * 0.42  (60% geschlossen: TP1+TP2+TP3 = 60% → 40% rest + 2% Puffer)
     #
     # Kombination: Fill UND/ODER Grösse können TP2/TP3 bestätigen.
     # Grössen-Methode deaktiviert nur wenn peak_size = aktuelle size (kein Rückschluss möglich).
@@ -3104,8 +3225,10 @@ def check_and_repair_position(pos: dict):
     # Grössen-basierte Erkennung (unabhängig von Fill-Alter)
     # Nur aktiv wenn _ref echt grösser als aktuelle size (belastbare Info)
     _size_ratio    = size / _ref if _ref > size else 1.0
-    size_tp3_hit   = _size_ratio < 0.37
-    size_tp2_hit   = _size_ratio < 0.67
+    # Schwellwerte: nach TP3 verbleiben 40% (TP_CLOSE_PCTS 15+20+25=60%), +2% Puffer → 0.42
+    #               nach TP2 verbleiben 65% (TP_CLOSE_PCTS 15+20=35%),     +4% Puffer → 0.69
+    size_tp3_hit   = _size_ratio < 0.42
+    size_tp2_hit   = _size_ratio < 0.69
 
     # Kombination: Fill ODER Grösse bestätigen TP-Level
     tp3_confirmed = fill_tp3_hit or size_tp3_hit
@@ -3340,7 +3463,11 @@ def report_position_startup(pos: dict):
         "peak_size": size,
         "open_ts":   int(time.time() * 1000),
     }
-    if tp1_done:
+    # sl_at_entry nur zurücksetzen wenn trailing_sl_level NOCH NICHT gesetzt
+    # (d.h. Script hat SL noch nie selbst gesetzt). Wenn trailing Level >= 1
+    # bekannt ist, vertrauen wir dem lokalen State — SL wurde bereits korrekt
+    # platziert, auch wenn er via API nicht lesbar ist.
+    if tp1_done and trailing_sl_level.get(symbol, 0) == 0:
         sl_at_entry[symbol] = False   # unklar, da SL nicht lesbar
 
     # ── 3. Nur prüfen was wirklich erkennbar ist ──────────────────────────
@@ -3439,11 +3566,11 @@ def main():
                     log(f"[Auto-Report] ✗ Fehler: {_re}")
 
             # ── 0b. H4 Puffer flushen wenn Zeitfenster abgelaufen ──
-            if h4_buffer:
-                with h4_buffer_lock:
-                    oldest = min((i["ts"] for i in h4_buffer), default=0)
-                if oldest and __import__("time").time() - oldest >= H4_BUFFER_SEC:
-                    flush_h4_buffer()
+            # Lock für den ganzen Check — verhindert Race mit Webhook-Thread
+            with h4_buffer_lock:
+                oldest = min((i["ts"] for i in h4_buffer), default=0)
+            if oldest and __import__("time").time() - oldest >= H4_BUFFER_SEC:
+                flush_h4_buffer()
 
             # ── 1. Neue Fills (Nachkäufe / Einstiege) ──────
             fills      = get_recent_fills_all(last_check_ms)
@@ -3496,28 +3623,56 @@ def main():
                         _lev  = _td.get("leverage", 10)
                         _dir  = _td.get("direction", direction)
 
+                        # ── Passive SL-Erkennung aus Position-Daten ──────────────
+                        # Liest stopLossPrice direkt aus den Positionsdaten
+                        # (funktioniert auch wenn plan-order Endpoints fehlschlagen).
+                        # Aktualisiert sl_at_entry/trailing_sl_level wenn SL ≥ Entry.
+                        if not sl_at_entry.get(sym, False):
+                            _sl_pos = 0.0
+                            for _sf in ("stopLossPrice", "stopLoss",
+                                        "stopLossTriggerPrice", "slPrice", "sl"):
+                                _sv = float(pos.get(_sf, 0) or 0)
+                                if _sv > 0:
+                                    _sl_pos = _sv
+                                    break
+                            if _sl_pos > 0:
+                                _secured = ((_dir == "long"  and _sl_pos >= _avg) or
+                                            (_dir == "short" and _sl_pos <= _avg))
+                                if _secured:
+                                    log(f"{sym}: SL {_sl_pos} aus Position-Daten "
+                                        f"≥ Entry {_avg} → sl_at_entry = True")
+                                    sl_at_entry[sym] = True
+                                    trailing_sl_level[sym] = max(_trl, 1)
+                                    save_state()
+
+                        # ── TP-Kaskade: ALLE Levels in einem Tick prüfen ─────────
+                        # Sequentielle ifs statt elif — damit TP1+TP2 (oder TP2+TP3)
+                        # die gleichzeitig zwischen zwei Ticks auslösen in einem
+                        # einzigen Check korrekt eskaliert werden.
+                        _size_changed = False
+
                         if cur_size < _ref * 0.87 and not sl_at_entry.get(sym, False):
                             red = (_ref - cur_size) / _ref * 100
                             log(f"TP1 erkannt ({sym}): peak={_ref:.2f} → jetzt={cur_size:.2f} (-{red:.0f}%) → SL auf Entry")
-                            trailing_sl_level[sym] = 1
+                            trailing_sl_level[sym] = max(trailing_sl_level.get(sym, 0), 1)
                             set_sl_at_entry(sym, _dir, _avg, cur_size=cur_size)
-                            last_known_size[sym] = cur_size
+                            _size_changed = True
 
-                        elif cur_size < _ref * 0.67 and _trl < 2:
+                        if cur_size < _ref * 0.69 and trailing_sl_level.get(sym, 0) < 2:
                             red = (_ref - cur_size) / _ref * 100
                             tp1_price = calc_tp_price(_avg, TP1_ROI, _dir, _lev)
                             log(f"TP2 erkannt ({sym}): peak={_ref:.2f} → jetzt={cur_size:.2f} (-{red:.0f}%) → Trailing SL auf TP1 @ {tp1_price:.5f}")
                             set_sl_trailing(sym, _dir, tp1_price, level=2, cur_size=cur_size)
-                            last_known_size[sym] = cur_size
+                            _size_changed = True
 
-                        elif cur_size < _ref * 0.37 and _trl < 3:
+                        if cur_size < _ref * 0.42 and trailing_sl_level.get(sym, 0) < 3:
                             red = (_ref - cur_size) / _ref * 100
                             tp2_price = calc_tp_price(_avg, TP2_ROI, _dir, _lev)
                             log(f"TP3 erkannt ({sym}): peak={_ref:.2f} → jetzt={cur_size:.2f} (-{red:.0f}%) → Trailing SL auf TP2 @ {tp2_price:.5f}")
                             set_sl_trailing(sym, _dir, tp2_price, level=3, cur_size=cur_size)
-                            last_known_size[sym] = cur_size
+                            _size_changed = True
 
-                        elif cur_size != kno_size:
+                        if _size_changed or cur_size != kno_size:
                             last_known_size[sym] = cur_size
 
                 # Geschlossene Positionen erkennen
