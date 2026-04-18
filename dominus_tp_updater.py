@@ -130,6 +130,12 @@ harsi_sl: dict = {}
 # Value: datetime (UTC) des letzten H2_SIGNAL-Eingangs
 last_h2_signal_time: dict = {}   # {symbol_dir: datetime}
 
+# Makro-Kontext: BTC & Total2 DOM-DIR Impuls-Richtung
+# Gesetzt via Webhook signal="BTC_DIR" / "T2_DIR" oder beim H2_SIGNAL-Empfang
+# Werte: "long" (grün), "short" (rot), "" (unbekannt)
+btc_dir:  str = ""   # aktuelle BTC Impuls-Richtung
+t2_dir:   str = ""   # aktuelle Total2 Impuls-Richtung
+
 
 # ═══════════════════════════════════════════════════════════════
 # BASIS-FUNKTIONEN
@@ -1705,6 +1711,14 @@ def cmd_berechnen():
     kelly    = kelly_recommendation(balance, WINRATE)
     positions = get_all_positions()
 
+    # Makro-Kontext: BTC & Total2 Impuls-Richtung
+    btc_icon = "🟢" if btc_dir == "long" else ("🔴" if btc_dir == "short" else "⬜")
+    t2_icon  = "🟢" if t2_dir  == "long" else ("🔴" if t2_dir  == "short" else "⬜")
+    btc_lbl  = btc_dir.upper() if btc_dir else "unbekannt"
+    t2_lbl   = t2_dir.upper()  if t2_dir  else "unbekannt"
+    macro_ok = (btc_dir == t2_dir) and btc_dir != ""
+    macro_icon = "✅" if macro_ok else ("⚠️" if (btc_dir and t2_dir) else "❓")
+
     lines = [
         "💰 <b>Kontostand & Status</b>",
         f"━━━━━━━━━━━━",
@@ -1715,6 +1729,11 @@ def cmd_berechnen():
         f"📊 Kelly ({WINRATE*100:.0f}% Winrate):",
         f"  Empfohlen:  {kelly['kelly_pct']}% = {kelly['kelly_usdt']:.2f} USDT",
         f"  Half-Kelly: {kelly['half_kelly_pct']}% = {kelly['half_kelly_usdt']:.2f} USDT",
+        f"",
+        f"📡 <b>Makro-Kontext (DOM-DIR):</b>",
+        f"  {btc_icon} BTC:    {btc_lbl}",
+        f"  {t2_icon} Total2: {t2_lbl}",
+        f"  {macro_icon} {'Beide gleiche Richtung' if macro_ok else 'Abweichung — kein neuer Trade!' if (btc_dir and t2_dir) else 'Noch kein DOM-DIR Webhook empfangen'}",
     ]
 
     if positions:
@@ -2256,6 +2275,7 @@ def start_webhook_server():
 
     @app.route("/webhook", methods=["POST"])
     def webhook():
+        global btc_dir, t2_dir
         # ── Token-Prüfung ─────────────────────────────────────
         # Token aus URL-Parameter ODER aus JSON-Body akzeptieren.
         # WICHTIG: Wir geben bei ungültigem Token TROTZDEM 200 zurück —
@@ -2338,6 +2358,49 @@ def start_webhook_server():
 
         signal_type = data.get("signal", "").upper()
         log(f"\U0001f4e1 Alert: {symbol} {direction.upper()} @ {entry} [{timeframe}]")
+
+        # ─────────────────────────────────────────────────────────────
+        # BTC_DIR / T2_DIR — Makro-Kontext: DOM-DIR Impuls-Richtung geändert
+        # Webhook von BTC H2 Chart (signal=BTC_DIR) oder Total2 (signal=T2_DIR)
+        # direction="long" = grüner Balken, direction="short" = roter Balken
+        # ─────────────────────────────────────────────────────────────
+        if signal_type in ("BTC_DIR", "T2_DIR"):
+            label = "BTC" if signal_type == "BTC_DIR" else "Total2"
+            prev  = btc_dir if signal_type == "BTC_DIR" else t2_dir
+            if signal_type == "BTC_DIR":
+                btc_dir = direction
+            else:
+                t2_dir = direction
+            save_state()
+
+            dir_label = "🟢 Grün (Bullish)" if direction == "long" else "🔴 Rot (Bearish)"
+            log(f"📡 {label} DOM-DIR geändert → {direction.upper()} (vorher: {prev or '?'})")
+
+            # Offene Positionen prüfen: Positionen GEGEN neuen Impuls warnen
+            positions   = get_all_positions()
+            warn_trades = []
+            for pos in positions:
+                sym  = pos.get("symbol", "")
+                side = pos.get("holdSide", "").lower()
+                if side and side != direction:
+                    pnl = float(pos.get("unrealizedPL", 0))
+                    warn_trades.append(f"  ⚠️ {sym} {side.upper()} | PnL={pnl:+.2f} USDT")
+
+            msg = (
+                f"{'🟢' if direction == 'long' else '🔴'} <b>{label} Impuls → {dir_label}</b>\n"
+                f"━━━━━━━━━━━━\n"
+                f"DOM-DIR H2 hat die Richtung gewechselt."
+            )
+            if warn_trades:
+                msg += (
+                    f"\n\n⚠️ <b>Offene Gegenpositionen:</b>\n"
+                    + "\n".join(warn_trades)
+                    + "\n\n🔔 SL & Exit-Strategie prüfen!"
+                )
+            else:
+                msg += "\n✅ Keine offenen Gegenpositionen."
+            telegram(msg)
+            return jsonify({"status": "ok", "dir": direction, "label": label}), 200
 
         if signal_type == "HARSI_SL":
             # HARSI_SL: SL auf Harsi-Ausstiegslinie setzen (für offene Positionen)
@@ -2441,32 +2504,52 @@ def start_webhook_server():
         # H2 Signal → H4 Puffer flushen dann sofort senden
         # 30-Min-Fenster starten: Zeitstempel für HARSI_EXIT-Prüfung speichern
         last_h2_signal_time[f"{symbol}_{direction}"] = datetime.utcnow()
+
+        # Makro-Kontext aus Webhook auslesen (vom DOM-ORC Plot-Werten)
+        harsi_warn_val  = int(float(data.get("harsi_warn",  0) or 0))
+        btc_t2_warn_val = int(float(data.get("btc_t2_warn", 0) or 0))
+        premium_val     = int(float(data.get("premium",     0) or 0))
+
+        # Makro-Richtung des Signals speichern (BTC/Total2 als letzten bekannten Stand)
+        # btc_t2_warn=0 bedeutet: BTC & Total2 passten zur Signal-Richtung
+        if btc_t2_warn_val == 0:
+            btc_dir = direction
+            t2_dir  = direction
+
         flush_h4_buffer()
         balance   = get_futures_balance()
         kelly     = kelly_recommendation(balance, WINRATE)
         links     = tv_chart_links(symbol)
         per_order = balance * 0.10 / 3
-        chk_dir   = "gr\u00fcner" if direction == "long" else "roter"
         icon      = dir_icon(direction)
+
+        # Checkliste: automatisch ausgefüllt wo möglich
+        harsi_icon   = "✅" if harsi_warn_val  == 0 else "⚠️"
+        btc_t2_icon  = "✅" if btc_t2_warn_val == 0 else "⚠️"
+        premium_icon = "⭐" if premium_val     == 1 else "☐"
+        harsi_txt    = "HARSI OK — Einstieg möglich"       if harsi_warn_val  == 0 else "HARSI Warnung — warten auf Alarm 3"
+        btc_t2_txt   = "BTC + Total2 gleiche Richtung ✓"  if btc_t2_warn_val == 0 else "BTC/Total2 Abweichung — Trade prüfen!"
+        premium_txt  = "Premium-Setup (dunkelgrün/-rot)"   if premium_val     == 1 else "Kein Premium (höheres Risiko)"
+
         msg_parts = [
-            f"{icon} <b>H2 Signal \u2014 {symbol} {direction.upper()}</b>",
-            "\u2501" * 12,
+            f"{icon} <b>H2 Signal — {symbol} {direction.upper()}</b>",
+            "━" * 12,
             f"Kurs: {entry}",
             "",
-            "\U0001f4cb <b>DOMINUS Checkliste:</b>",
-            "\u2610 DOMINUS Impuls Extremzone erreicht?",
-            "\u2610 H4 Trigger best\u00e4tigt?",
-            "\u2610 HARSI nicht in Extremzone?",
-            "\u2610 BTC + Total2 gleiche Richtung?",
-            f"\u2610 Premium Setup? (Impuls dunkel{chk_dir})",
+            "📋 <b>DOMINUS Checkliste:</b>",
+            "☐ DOMINUS Impuls Extremzone erreicht?",
+            "☐ H4 Trigger bestätigt?",
+            f"{harsi_icon} {harsi_txt}",
+            f"{btc_t2_icon} {btc_t2_txt}",
+            f"{premium_icon} {premium_txt}",
             "",
-            f"\U0001f4b0 {balance:.0f} USDT  |  Pro Order: {per_order:.0f} USDT",
-            f"\U0001f4ca Kelly: {kelly['kelly_pct']}%",
+            f"💰 {balance:.0f} USDT  |  Pro Order: {per_order:.0f} USDT",
+            f"📊 Kelly: {kelly['kelly_pct']}%",
             "",
-            "\u23f1 <b>30-Min-Fenster l\u00e4uft!</b>",
+            "⏱ <b>30-Min-Fenster läuft!</b>",
             f"/trade {symbol} {direction.upper()} [HEBEL] {entry:.5f} [SL]",
             "",
-            "\U0001f4c8 Charts:",
+            "📈 Charts:",
             f"H2 {symbol}: {links['coin_h2']}",
             f"H4 {symbol}: {links['coin_h4']}",
             f"BTC H2: {links['btc_h2']}",
@@ -2513,6 +2596,8 @@ def save_state():
             "daily_report_sent_date":  daily_report_sent_date,
             "harsi_sl":                harsi_sl,
             "last_h2_signal_time":     h2_ts_serialized,
+            "btc_dir":                 btc_dir,
+            "t2_dir":                  t2_dir,
         }
         with open(STATE_FILE, "w") as f:
             json.dump(state, f)
@@ -2546,7 +2631,12 @@ def load_state():
                     last_h2_signal_time[k] = ts  # nur noch gültige Fenster laden
             except Exception:
                 pass
-        log(f"[load_state] State geladen: {len(last_known_avg)} Position(en)")
+        # Makro-Kontext laden (bleibt auch nach Neustart erhalten)
+        global btc_dir, t2_dir
+        btc_dir = s.get("btc_dir", "")
+        t2_dir  = s.get("t2_dir",  "")
+        log(f"[load_state] State geladen: {len(last_known_avg)} Position(en) | "
+            f"BTC={btc_dir or '?'} Total2={t2_dir or '?'}")
     except Exception as e:
         log(f"[load_state] Fehler: {e}")
 
