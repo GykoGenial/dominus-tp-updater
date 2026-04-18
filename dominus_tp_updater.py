@@ -1244,6 +1244,63 @@ def tv_chart_links(symbol: str) -> dict:
     }
 
 
+def send_deviation_warnings(
+    symbol: str, direction: str,
+    leverage: int, optimal_lev: int,
+    rr: float,
+    order_margin: float, kelly: dict,
+    sl_dist_pct: float,
+):
+    """
+    Sendet eine konsolidierte Telegram-Warnung wenn Hebel, Kelly-Grösse oder R:R
+    von den empfohlenen Einstellungen abweichen.
+    Wird nach der Haupt-Trade-Nachricht aufgerufen.
+    """
+    warnings = []
+
+    # ── 1. Hebel-Abweichung ──────────────────────────────────
+    lev_diff = leverage - optimal_lev
+    if abs(lev_diff) > 2:
+        if lev_diff > 0:
+            lev_hint = f"zu hoch ↑ (+{lev_diff}x) — mehr Risiko als empfohlen"
+        else:
+            lev_hint = f"zu niedrig ↓ ({lev_diff}x) — Kapital wird nicht optimal genutzt"
+        warnings.append(
+            f"⚡ <b>Hebel:</b> {leverage}x gesetzt — {optimal_lev}x empfohlen\n"
+            f"   {lev_hint}\n"
+            f"   Formel: 25 / {sl_dist_pct:.2f}% SL-Abstand = {optimal_lev}x"
+        )
+
+    # ── 2. Positionsgrösse vs. Kelly ─────────────────────────
+    half_k = kelly.get("half_kelly_usdt", 0)
+    full_k = kelly.get("kelly_usdt", 0)
+    if half_k > 0 and order_margin > half_k:
+        pct_of_full = (order_margin / full_k * 100) if full_k > 0 else 0
+        warnings.append(
+            f"📊 <b>Positionsgrösse:</b> Initial-Margin {order_margin:.2f} USDT\n"
+            f"   überschreitet Half-Kelly ({half_k:.2f} USDT)\n"
+            f"   Full-Kelly: {full_k:.2f} USDT "
+            f"→ Initial-Order = {pct_of_full:.0f}% des Kelly-Optimums\n"
+            f"   Total mit DCA ca. {order_margin * 5:.2f} USDT"
+        )
+
+    # ── 3. R:R Ratio ─────────────────────────────────────────
+    if rr < MIN_RR:
+        warnings.append(
+            f"📉 <b>R:R Ratio:</b> {rr} unter Minimum {MIN_RR}\n"
+            f"   Trade ist statistisch nicht optimal — ggf. SL oder Hebel anpassen"
+        )
+
+    if warnings:
+        icon = dir_icon(direction)
+        header = (
+            f"⚠️ {icon} <b>Abweichungen erkannt — {symbol}</b>\n"
+            f"━━━━━━━━━━━━\n"
+        )
+        telegram(header + "\n\n".join(warnings))
+        log(f"  ⚠ Abweichungs-Warnung gesendet ({len(warnings)} Punkt(e))")
+
+
 def setup_new_trade(pos: dict):
     """
     Vollständiges Setup für einen neuen Trade:
@@ -1356,11 +1413,7 @@ def setup_new_trade(pos: dict):
 
     if rr_warn:
         log(f"  ⚠ R:R {rr} < Minimum {MIN_RR} — Trade gemäss Filter nicht empfohlen!")
-        telegram(
-            "\u26a0\ufe0f <b>R:R-Warnung \u2014 " + symbol + "</b>\n"
-            "R:R = " + str(rr) + " liegt unter dem Minimum von " + str(MIN_RR) + "\n"
-            "Setup wird trotzdem aufgebaut \u2014 bitte manuell pr\u00fcfen."
-        )
+        # Separate Warnung folgt gebündelt via send_deviation_warnings (nach Haupt-Nachricht)
 
     # Validierung: SL auf richtiger Seite
     if direction == "long" and sl_price >= entry:
@@ -1435,6 +1488,18 @@ def setup_new_trade(pos: dict):
         if balance > 0 else ""
     )
     telegram(msg)
+
+    # Abweichungs-Warnung (Hebel / Kelly / R:R) — separate Nachricht nach Haupt-Report
+    send_deviation_warnings(
+        symbol      = symbol,
+        direction   = direction,
+        leverage    = leverage,
+        optimal_lev = optimal_lev,
+        rr          = rr,
+        order_margin= order_margin,
+        kelly       = kelly,
+        sl_dist_pct = sl_dist_pct,
+    )
 
     status = "✓ Alle 4" if count == 4 else f"⚠ {count}/4"
     log(f"  {status} TPs gesetzt | "
