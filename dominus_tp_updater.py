@@ -2154,12 +2154,19 @@ def start_webhook_server():
         # Payload zuerst roh lesen (vor JSON-Parse, damit wir token aus body lesen können)
         raw_body   = flask_request.get_data(as_text=True) or ""
 
-        # ── NaN/Infinity fix ──────────────────────────────────
-        # Pine Script gibt bei uninitialisierten Plots 'na' zurück,
-        # TradingView schreibt das als NaN in den JSON-Body.
-        # NaN ist kein valides JSON → muss VOR dem Parse bereinigt werden.
+        # ── Body-Bereinigung vor JSON-Parse ───────────────────
         import re as _re
-        raw_clean = _re.sub(r'\bNaN\b',       'null', raw_body)
+
+        # Fix 1: Unaufgelöste TradingView-Platzhalter → 0
+        # Bei Watchlist-Alarmen ersetzt TradingView {{plot(...)}} NICHT —
+        # der Literal-Text landet im JSON und macht es ungültig.
+        # Betrifft: harsi_warn, btc_t2_warn, premium bei Watchlist-Alarmen.
+        # Defaultwert 0 = "kein Problem erkannt" (sicherster Fallback).
+        raw_clean = _re.sub(r'\{\{[^}]+\}\}', '0', raw_body)
+
+        # Fix 2: NaN / Infinity (Pine Script 'na' → TradingView NaN)
+        # NaN ist kein valides JSON → null ersetzen.
+        raw_clean = _re.sub(r'\bNaN\b',       'null', raw_clean)
         raw_clean = _re.sub(r'\bInfinity\b',  'null', raw_clean)
         raw_clean = _re.sub(r'\b-Infinity\b', 'null', raw_clean)
 
@@ -2288,7 +2295,7 @@ def start_webhook_server():
     @app.route("/", methods=["GET"])
     @app.route("/health", methods=["GET"])
     def health():
-        return jsonify({"status": "running", "version": "v4.34"}), 200
+        return jsonify({"status": "running", "version": "v4.35"}), 200
 
     port = int(os.environ.get("PORT", 8080))
     log(f"Webhook-Server gestartet auf Port {port}")
@@ -3092,7 +3099,7 @@ def main():
         log("In Railway → Variables eintragen.")
         return
 
-    log("DOMINUS Trade-Automatisierung v4.34 gestartet — mit finanzmathematischen Optimierungen")
+    log("DOMINUS Trade-Automatisierung v4.35 gestartet — mit finanzmathematischen Optimierungen")
     log(f"Intervall: {POLL_INTERVAL}s")
     log("Warte auf neue Trades...")
     log("─" * 55)
