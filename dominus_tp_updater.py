@@ -125,6 +125,11 @@ daily_report_sent_date: str = ""   # "2026-04-17" — verhindert Doppelversand p
 # Harsi-Ausstiegslinie
 harsi_sl: dict = {}
 
+# DOMINUS 30-Min-Fenster: Zeitstempel letzter H2_SIGNAL pro Symbol+Richtung
+# Key: "{SYMBOL}_{direction}"  z.B. "ETHUSDT_long"
+# Value: datetime (UTC) des letzten H2_SIGNAL-Eingangs
+last_h2_signal_time: dict = {}   # {symbol_dir: datetime}
+
 
 # ═══════════════════════════════════════════════════════════════
 # BASIS-FUNKTIONEN
@@ -2241,6 +2246,73 @@ def start_webhook_server():
             set_sl_harsi(symbol, direction, harsi_price, cur_size=cur_size)
             return jsonify({"status": "ok", "symbol": symbol, "harsi_sl": harsi_price}), 200
 
+        if signal_type == "HARSI_EXIT":
+            # ─────────────────────────────────────────────────────────────
+            # HARSI_EXIT — Alarm 3/3b: HARSI verlässt Extremzone → Einstieg prüfen
+            # Hier wird geprüft ob das 30-Min-Fenster nach dem letzten H2_SIGNAL
+            # noch offen ist. Falls abgelaufen oder unbekannt → Warnung in Telegram.
+            # ─────────────────────────────────────────────────────────────
+            sig_key = f"{symbol}_{direction}"
+            h2_ts   = last_h2_signal_time.get(sig_key)
+            icon    = dir_icon(direction)
+
+            if h2_ts is None:
+                # Kein H2_SIGNAL für dieses Symbol/Richtung bekannt
+                warn_line = (
+                    "⚠️ <b>Kein H2-Signal gespeichert</b> — Timing unbekannt.\n"
+                    "Bitte manuell prüfen ob ein H2-Signal vorlag!"
+                )
+                timing_ok = False
+                elapsed_min = None
+            else:
+                elapsed_sec = (datetime.utcnow() - h2_ts).total_seconds()
+                elapsed_min = int(elapsed_sec // 60)
+                if elapsed_sec > 1800:   # > 30 Minuten
+                    warn_line = (
+                        f"⛔ <b>30-Min-Fenster abgelaufen!</b>\n"
+                        f"H2-Signal vor {elapsed_min} Min empfangen — "
+                        f"Signal nicht mehr gültig laut DOMINUS-Regel."
+                    )
+                    timing_ok = False
+                else:
+                    remaining = 30 - elapsed_min
+                    warn_line = f"✅ Fenster offen — noch ca. {remaining} Min gültig"
+                    timing_ok = True
+
+            log(f"  HARSI_EXIT {symbol} {direction} | {warn_line[:60]}")
+
+            msg_parts = [
+                f"{icon} <b>HARSI EXIT — {symbol} {direction.upper()}</b>",
+                "━" * 12,
+                f"Kurs: {entry}",
+                "",
+                warn_line,
+                "",
+            ]
+            if timing_ok:
+                msg_parts += [
+                    "📋 <b>Einstieg jetzt möglich:</b>",
+                    f"/trade {symbol} {direction.upper()} [HEBEL] {entry:.5f} [SL]",
+                ]
+            else:
+                msg_parts += [
+                    "🚫 Kein Einstieg — Signal abgelaufen oder unbekannt.",
+                    "Warte auf nächsten H2-Signal-Alarm.",
+                ]
+
+            telegram("\n".join(msg_parts))
+
+            # Nach Eintritt: Zeitstempel löschen (verhindert Doppel-Warnungen)
+            if sig_key in last_h2_signal_time:
+                del last_h2_signal_time[sig_key]
+
+            return jsonify({
+                "status": "ok",
+                "symbol": symbol,
+                "timing_ok": timing_ok,
+                "elapsed_min": elapsed_min,
+            }), 200
+
         # H4 Trigger → gepuffert, nach 5 Min gebündelt senden
         if timeframe == "H4" or signal_type == "H4_TRIGGER":
             with h4_buffer_lock:
@@ -2257,6 +2329,8 @@ def start_webhook_server():
             return jsonify({"status": "buffered", "symbol": symbol}), 200
 
         # H2 Signal → H4 Puffer flushen dann sofort senden
+        # 30-Min-Fenster starten: Zeitstempel für HARSI_EXIT-Prüfung speichern
+        last_h2_signal_time[f"{symbol}_{direction}"] = datetime.utcnow()
         flush_h4_buffer()
         balance   = get_futures_balance()
         kelly     = kelly_recommendation(balance, WINRATE)
@@ -2314,6 +2388,10 @@ STATE_FILE = os.environ.get("STATE_FILE", "/tmp/dominus_state.json")
 def save_state():
     """Speichert den aktuellen In-Memory-State in eine JSON-Datei."""
     try:
+        # last_h2_signal_time: datetime → ISO-String für JSON-Serialisierung
+        h2_ts_serialized = {
+            k: v.isoformat() for k, v in last_h2_signal_time.items()
+        }
         state = {
             "last_known_avg":          last_known_avg,
             "last_known_size":         last_known_size,
@@ -2324,6 +2402,7 @@ def save_state():
             "closed_trades":           [t for t in closed_trades if t.get("ts", 0) >= time.time() - 90*86400],
             "daily_report_sent_date":  daily_report_sent_date,
             "harsi_sl":                harsi_sl,
+            "last_h2_signal_time":     h2_ts_serialized,
         }
         with open(STATE_FILE, "w") as f:
             json.dump(state, f)
@@ -2348,6 +2427,15 @@ def load_state():
         closed_trades.extend(s.get("closed_trades", []))
         daily_report_sent_date = s.get("daily_report_sent_date", "")
         harsi_sl.update(s.get("harsi_sl", {}))
+        # last_h2_signal_time: ISO-Strings → datetime (nur Einträge < 30 Min laden)
+        now_utc = datetime.utcnow()
+        for k, v in s.get("last_h2_signal_time", {}).items():
+            try:
+                ts = datetime.fromisoformat(v)
+                if (now_utc - ts).total_seconds() < 1800:
+                    last_h2_signal_time[k] = ts  # nur noch gültige Fenster laden
+            except Exception:
+                pass
         log(f"[load_state] State geladen: {len(last_known_avg)} Position(en)")
     except Exception as e:
         log(f"[load_state] Fehler: {e}")
