@@ -2302,8 +2302,11 @@ def start_webhook_server():
         entry      = float(data.get("entry", 0) or 0)
         timeframe  = data.get("timeframe", "H2").upper()
 
-        # Richtung: explizit ODER aus Buy/Sell Plot-Werten
+        # Richtung: "direction" ODER "side" (beide Feldnamen akzeptieren)
+        # Alarm-Templates senden "side":"long"/"short" — Script liest beide.
         direction = data.get("direction", "").lower()
+        if direction not in ("long", "short"):
+            direction = data.get("side", "").lower()
         if direction not in ("long", "short"):
             buy_val  = float(data.get("buy",  0) or 0)
             sell_val = float(data.get("sell", 0) or 0)
@@ -2323,7 +2326,8 @@ def start_webhook_server():
         if not symbol or direction not in ("long", "short"):
             log(f"⚠ Webhook ignoriert: kein Signal "
                 f"(buy={data.get('buy',0)} sell={data.get('sell',0)} "
-                f"dir={data.get('direction','')})")
+                f"dir={data.get('direction','')} side={data.get('side','')} "
+                f"sym={raw_symbol})")
             return jsonify({"status": "ignored", "reason": "no signal"}), 200
 
         log(f"📡 TradingView Alert: {symbol} {direction.upper()} "
