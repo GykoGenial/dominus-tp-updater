@@ -46,6 +46,7 @@ RAILWAY VARIABLES:
   MIN_RR            → Mindest-R:R Ratio (Standard: 1.5)
   TELEGRAM_TOKEN    → optional
   TELEGRAM_CHAT_ID  → optional
+  DOCS_URL          → optional — URL zu Dominus_Alarm_Templates.html (z.B. https://dein-server/Dominus_Alarm_Templates.html)
 ══════════════════════════════════════════════════════════════
 """
 
@@ -58,7 +59,7 @@ import os
 import threading
 import requests
 import math
-from datetime import datetime
+from datetime import datetime, timedelta
 try:
     from flask import Flask, request as flask_request, jsonify
     FLASK_AVAILABLE = True
@@ -102,6 +103,7 @@ POLL_INTERVAL = 20    # Sekunden zwischen Checks
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 WEBHOOK_SECRET   = os.environ.get("WEBHOOK_SECRET", "dominus")  # Token für TradingView
+DOCS_URL         = os.environ.get("DOCS_URL", "")               # URL zu Dominus_Alarm_Templates.html (ohne Trailing-Slash)
 
 # Finanzmathematische Parameter
 WINRATE = float(os.environ.get("WINRATE", "0.55"))  # eigene Winrate (historisch)
@@ -2052,6 +2054,56 @@ def cmd_trade(parts: list):
     reply("\n".join(lines))
 
 
+def cmd_makro():
+    """BTC & Total2 DOMINUS Impuls Richtungsstatus."""
+    def _icon(d: str) -> str:
+        return ("🟢" if d == "long"
+                else "🟡" if d == "recovering"
+                else "🟠" if d == "recovering_short"
+                else "🔴" if d == "short"
+                else "⬜")
+    def _lbl(d: str) -> str:
+        return ("LONG — bestätigt (≥ 0)"                  if d == "long"
+                else "LONG RECOVERY — nur Premium (−10→0)" if d == "recovering"
+                else "SHORT RECOVERY — nur Premium (0→+10)"if d == "recovering_short"
+                else "SHORT — bestätigt (≤ 0)"             if d == "short"
+                else "unbekannt — noch kein Webhook")
+
+    btc_icon = _icon(btc_dir)
+    t2_icon  = _icon(t2_dir)
+    btc_lbl  = _lbl(btc_dir)
+    t2_lbl   = _lbl(t2_dir)
+
+    # Gesamtstatus
+    if btc_dir == "long" and t2_dir == "long":
+        overall = "✅ Beide bestätigt — alle Long-Setups erlaubt"
+    elif btc_dir == "short" and t2_dir == "short":
+        overall = "✅ Beide bestätigt — alle Short-Setups erlaubt"
+    elif btc_dir in ("long","recovering") and t2_dir in ("long","recovering"):
+        overall = "🟡 Long-Recovery aktiv — nur Premium-Longs"
+    elif btc_dir in ("short","recovering_short") and t2_dir in ("short","recovering_short"):
+        overall = "🟠 Short-Recovery aktiv — nur Premium-Shorts"
+    elif btc_dir and t2_dir:
+        overall = "⚠️ Abweichung BTC vs. Total2 — kein neuer Trade"
+    else:
+        overall = "❓ Noch kein Makro-Webhook empfangen"
+
+    from datetime import datetime as _dt
+    ts = _dt.utcnow().strftime("%d.%m.%Y %H:%M UTC")
+
+    reply(
+        f"📡 <b>Makro-Kontext — BTC &amp; Total2</b>\n"
+        f"━━━━━━━━━━━━\n"
+        f"{btc_icon} <b>BTC:</b>    {btc_lbl}\n"
+        f"{t2_icon} <b>Total2:</b> {t2_lbl}\n"
+        f"━━━━━━━━━━━━\n"
+        f"{overall}\n"
+        f"\n"
+        f"<i>Stand: {ts}</i>\n"
+        f"<i>Aktualisiert durch Alarm 5/5b/5c/5d/5e/5f Webhooks</i>"
+    )
+
+
 def cmd_hilfe():
     reply(
         "🤖 <b>DOMINUS Bot — Befehle</b>\n"
@@ -2061,7 +2113,8 @@ def cmd_hilfe():
         "   → Setup berechnen + alle Chart-Links\n"
         "   Beispiel: /trade ETHUSDT LONG 10 2850 2700\n"
         "/status — Kurzstatus aller Positionen\n"
-        "/refresh [SYMBOL] — SL/TP/DCA sofort prüfen & reparieren\n"
+        "/makro — BTC &amp; Total2 Impuls-Richtung + Trade-Erlaubnis\n"
+        "/refresh [SYMBOL] — SL/TP/DCA sofort prüfen &amp; reparieren\n"
         "   Beispiel: /refresh BTCUSDT  (oder /refresh für alle)\n"
         "/hilfe — diese Übersicht\n"
         "\n"
@@ -2308,6 +2361,8 @@ def poll_telegram_commands():
             cmd_trade(parts)
         elif cmd == "/status":
             cmd_status()
+        elif cmd == "/makro":
+            cmd_makro()
         elif cmd == "/refresh":
             cmd_refresh(parts)
         elif cmd == "/report":
@@ -2646,7 +2701,7 @@ def start_webhook_server():
         # 30-Min-Fenster starten: Zeitstempel für HARSI_EXIT-Prüfung speichern
         last_h2_signal_time[f"{symbol}_{direction}"] = datetime.utcnow()
         # Altes Einträge aufräumen (Memory-Leak verhindern): nur letzte 30 Min behalten
-        _cutoff = datetime.utcnow() - __import__("datetime").timedelta(minutes=35)
+        _cutoff = datetime.utcnow() - timedelta(minutes=35)
         for _k in list(last_h2_signal_time.keys()):
             if last_h2_signal_time[_k] < _cutoff:
                 del last_h2_signal_time[_k]
@@ -2713,7 +2768,22 @@ def start_webhook_server():
 
         # Timer-Zeile abhängig von harsi_warn und recovering-Zustand
         if harsi_warn_val != 0:
-            timer_line = "⏱ <b>Alarm 3 erstellen + Timer starten!</b>"
+            # Ablaufzeitpunkt: H2-Zeitstempel + 30 Min (oder "jetzt + 30 Min" als Fallback)
+            _h2_ts      = last_h2_signal_time.get(f"{symbol}_{direction}", datetime.utcnow())
+            _expiry_utc = _h2_ts + timedelta(minutes=30)
+            _expiry_str = _expiry_utc.strftime("%d.%m.%Y %H:%M UTC")
+            # Richtungsabhängiger HTML-Anker
+            _anker  = "sec-alarm3" if direction == "long" else "sec-alarm3b"
+            _anchor_label = "Alarm 3 Long HARSI Exit" if direction == "long" else "Alarm 3b Short HARSI Exit"
+            if DOCS_URL:
+                _docs_link = f'\n🔗 <a href="{DOCS_URL}#{_anker}">{_anchor_label} — Anleitung</a>'
+            else:
+                _docs_link = f"\n🔗 Anker: #{_anker} in Dominus_Alarm_Templates.html"
+            timer_line = (
+                f"⚠️ <b>HARSI in Extremzone — jetzt Alarm 3 erstellen!</b>\n"
+                f"⏰ Signal läuft ab: <b>{_expiry_str}</b>"
+                f"{_docs_link}"
+            )
         elif _recovering_long and premium_val != 1:
             timer_line = "🟡 <b>Long-Recovery — nur bei Premium-Long einsteigen!</b>"
         elif _recovering_short_trade and premium_val != 1:
