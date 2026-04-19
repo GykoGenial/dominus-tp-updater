@@ -145,7 +145,11 @@ last_h2_signal_time: dict = {}   # {symbol_dir: datetime}
 
 # Makro-Kontext: BTC & Total2 DOM-DIR Impuls-Richtung
 # Gesetzt via Webhook signal="BTC_DIR" / "T2_DIR" oder beim H2_SIGNAL-Empfang
-# Werte: "long" (grün), "short" (rot), "" (unbekannt)
+# Werte: "long"       → Impuls ≥ 0, bestätigt bullish   (Alarm: 0 aufwärts)
+#        "recovering" → Impuls −10→0, Exit Oversold       (Alarm: −10 aufwärts, nur Premium-Trades)
+#        "short"      → Impuls ≤ 0, bestätigt bearish    (Alarm: 0 abwärts)
+#        ""           → unbekannt (noch kein Webhook)
+# Permission-Logik:  long+long → voll  |  long+recovering → nur premium=1  |  recovering+recovering → kein Trade
 btc_dir:  str = ""   # aktuelle BTC Impuls-Richtung
 t2_dir:   str = ""   # aktuelle Total2 Impuls-Richtung
 
@@ -1802,12 +1806,18 @@ def cmd_berechnen():
     positions = get_all_positions()
 
     # Makro-Kontext: BTC & Total2 Impuls-Richtung
-    btc_icon = "🟢" if btc_dir == "long" else ("🔴" if btc_dir == "short" else "⬜")
-    t2_icon  = "🟢" if t2_dir  == "long" else ("🔴" if t2_dir  == "short" else "⬜")
-    btc_lbl  = btc_dir.upper() if btc_dir else "unbekannt"
-    t2_lbl   = t2_dir.upper()  if t2_dir  else "unbekannt"
-    macro_ok = (btc_dir == t2_dir) and btc_dir != ""
-    macro_icon = "✅" if macro_ok else ("⚠️" if (btc_dir and t2_dir) else "❓")
+    def _dir_icon(d: str) -> str:
+        return "🟢" if d == "long" else ("🟡" if d == "recovering" else ("🔴" if d == "short" else "⬜"))
+    def _dir_lbl(d: str) -> str:
+        return "LONG (bestätigt)" if d == "long" else ("RECOVERING (−10→0, nur Premium)" if d == "recovering" else (d.upper() if d else "unbekannt"))
+    btc_icon = _dir_icon(btc_dir)
+    t2_icon  = _dir_icon(t2_dir)
+    btc_lbl  = _dir_lbl(btc_dir)
+    t2_lbl   = _dir_lbl(t2_dir)
+    _macro_full    = btc_dir == "long"       and t2_dir == "long"
+    _macro_partial = btc_dir in ("long", "recovering") and t2_dir in ("long", "recovering") and not _macro_full
+    macro_ok   = _macro_full or _macro_partial
+    macro_icon = "✅" if _macro_full else ("🟡" if _macro_partial else ("⚠️" if (btc_dir and t2_dir) else "❓"))
 
     lines = [
         "💰 <b>Kontostand & Status</b>",
@@ -1823,7 +1833,7 @@ def cmd_berechnen():
         f"📡 <b>Makro-Kontext (DOM-DIR):</b>",
         f"  {btc_icon} BTC:    {btc_lbl}",
         f"  {t2_icon} Total2: {t2_lbl}",
-        f"  {macro_icon} {'Beide gleiche Richtung' if macro_ok else 'Abweichung — kein neuer Trade!' if (btc_dir and t2_dir) else 'Noch kein DOM-DIR Webhook empfangen'}",
+        f"  {macro_icon} {'Beide bestätigt ✓' if _macro_full else 'Recovery aktiv — nur Premium-Setups!' if _macro_partial else 'Abweichung — kein neuer Trade!' if (btc_dir and t2_dir) else 'Noch kein DOM-DIR Webhook empfangen'}",
     ]
 
     if positions:
@@ -2452,19 +2462,34 @@ def start_webhook_server():
         # ─────────────────────────────────────────────────────────────
         # BTC_DIR / T2_DIR — Makro-Kontext: DOM-DIR Impuls-Richtung geändert
         # Webhook von BTC H2 Chart (signal=BTC_DIR) oder Total2 (signal=T2_DIR)
-        # direction="long" = grüner Balken, direction="short" = roter Balken
+        # zone="neutral"    → direction long/short ab Nulllinie (bestätigt)
+        # zone="recovering" → direction long, Impuls verlässt Oversold (−10 aufwärts)
+        #                      → nur Premium-Setups erlaubt bis Bestätigung bei 0
         # ─────────────────────────────────────────────────────────────
         if signal_type in ("BTC_DIR", "T2_DIR"):
-            label = "BTC" if signal_type == "BTC_DIR" else "Total2"
-            prev  = btc_dir if signal_type == "BTC_DIR" else t2_dir
+            label    = "BTC" if signal_type == "BTC_DIR" else "Total2"
+            prev     = btc_dir if signal_type == "BTC_DIR" else t2_dir
+            zone_val = data.get("zone", "").lower()
+
+            # "recovering" = long-seitig aber noch zwischen −10 und 0
+            new_dir = "recovering" if (direction == "long" and zone_val == "recovering") else direction
+
             if signal_type == "BTC_DIR":
-                btc_dir = direction
+                btc_dir = new_dir
             else:
-                t2_dir = direction
+                t2_dir = new_dir
             save_state()
 
-            dir_label = "🟢 Grün (Bullish)" if direction == "long" else "🔴 Rot (Bearish)"
-            log(f"📡 {label} DOM-DIR geändert → {direction.upper()} (vorher: {prev or '?'})")
+            if new_dir == "recovering":
+                dir_label = "🟡 Recovering (−10→0)"
+                dir_info  = "Impuls verlässt Oversold-Zone.\n🟡 <b>Nur Premium-Setups</b> erlaubt bis Bestätigung bei 0."
+            elif direction == "long":
+                dir_label = "🟢 Grün (Bullish bestätigt)"
+                dir_info  = "Impuls über Nulllinie bestätigt."
+            else:
+                dir_label = "🔴 Rot (Bearish)"
+                dir_info  = "Impuls unter Nulllinie."
+            log(f"📡 {label} DOM-DIR geändert → {new_dir.upper()} (vorher: {prev or '?'})")
 
             # Offene Positionen prüfen: Positionen GEGEN neuen Impuls warnen
             positions   = get_all_positions()
@@ -2476,10 +2501,11 @@ def start_webhook_server():
                     pnl = float(pos.get("unrealizedPL", 0))
                     warn_trades.append(f"  ⚠️ {sym} {side.upper()} | PnL={pnl:+.2f} USDT")
 
+            icon = "🟡" if new_dir == "recovering" else ("🟢" if direction == "long" else "🔴")
             msg = (
-                f"{'🟢' if direction == 'long' else '🔴'} <b>{label} Impuls → {dir_label}</b>\n"
+                f"{icon} <b>{label} Impuls → {dir_label}</b>\n"
                 f"━━━━━━━━━━━━\n"
-                f"DOM-DIR H2 hat die Richtung gewechselt."
+                f"{dir_info}"
             )
             if warn_trades:
                 msg += (
@@ -2490,7 +2516,7 @@ def start_webhook_server():
             else:
                 msg += "\n✅ Keine offenen Gegenpositionen."
             telegram(msg)
-            return jsonify({"status": "ok", "dir": direction, "label": label}), 200
+            return jsonify({"status": "ok", "dir": new_dir, "label": label}), 200
 
         if signal_type == "HARSI_SL":
             # HARSI_SL: SL auf Harsi-Ausstiegslinie setzen (für offene Positionen)
@@ -2607,9 +2633,12 @@ def start_webhook_server():
 
         # Makro-Richtung des Signals speichern (BTC/Total2 als letzten bekannten Stand)
         # btc_t2_warn=0 bedeutet: BTC & Total2 passten zur Signal-Richtung
+        # WICHTIG: "recovering" Zustand NICHT überschreiben — bleibt bis BTC_DIR 0-Kreuzung kommt
         if btc_t2_warn_val == 0:
-            btc_dir = direction
-            t2_dir  = direction
+            if btc_dir != "recovering":
+                btc_dir = direction
+            if t2_dir  != "recovering":
+                t2_dir  = direction
 
         flush_h4_buffer()
         balance   = get_futures_balance()
@@ -2618,13 +2647,40 @@ def start_webhook_server():
         per_order = balance * 0.10 / 3
         icon      = dir_icon(direction)
 
+        # Recovering-Prüfung: BTC oder Total2 noch zwischen −10 und 0
+        # → Nur Premium-Setups durchlassen; zeige Warnung in Telegram
+        _rec_btc = (btc_dir == "recovering")
+        _rec_t2  = (t2_dir  == "recovering")
+        _recovering_active = _rec_btc or _rec_t2
+
         # Checkliste: automatisch ausgefüllt wo möglich
         harsi_icon   = "✅" if harsi_warn_val  == 0 else "⚠️"
-        btc_t2_icon  = "✅" if btc_t2_warn_val == 0 else "⚠️"
+        if btc_t2_warn_val != 0:
+            btc_t2_icon = "⚠️"
+        elif _recovering_active:
+            btc_t2_icon = "🟡"
+        else:
+            btc_t2_icon = "✅"
         premium_icon = "⭐" if premium_val     == 1 else "☐"
         harsi_txt    = "HARSI OK — Einstieg möglich"       if harsi_warn_val  == 0 else "HARSI Warnung — warten auf Alarm 3"
-        btc_t2_txt   = "BTC + Total2 gleiche Richtung ✓"  if btc_t2_warn_val == 0 else "BTC/Total2 Abweichung — Trade prüfen!"
+        if btc_t2_warn_val != 0:
+            btc_t2_txt = "BTC/Total2 Abweichung — Trade prüfen!"
+        elif _recovering_active:
+            _rec_who = "BTC" if _rec_btc else "Total2"
+            if _rec_btc and _rec_t2:
+                _rec_who = "BTC + Total2"
+            btc_t2_txt = f"{_rec_who} Recovery (−10→0) — nur Premium-Setup!"
+        else:
+            btc_t2_txt = "BTC + Total2 gleiche Richtung ✓"
         premium_txt  = "Premium-Setup (dunkelgrün/-rot)"   if premium_val     == 1 else "Kein Premium (höheres Risiko)"
+
+        # Timer-Zeile abhängig von harsi_warn und recovering-Zustand
+        if harsi_warn_val != 0:
+            timer_line = "⏱ <b>Alarm 3 erstellen + Timer starten!</b>"
+        elif _recovering_active and premium_val != 1:
+            timer_line = "🟡 <b>Recovery aktiv — nur bei Premium-Setup einsteigen!</b>"
+        else:
+            timer_line = "⏱ <b>30 Min zum Einsteigen — jetzt /trade!</b>"
 
         msg_parts = [
             f"{icon} <b>H2 Signal — {symbol} {direction.upper()}</b>",
@@ -2641,7 +2697,7 @@ def start_webhook_server():
             f"💰 {balance:.0f} USDT  |  Pro Order: {per_order:.0f} USDT",
             f"📊 Kelly: {kelly['kelly_pct']}%",
             "",
-            "⏱ <b>30-Min-Fenster läuft!</b>",
+            timer_line,
             f"/trade {symbol} {direction.upper()} [HEBEL] {entry:.5f} [SL]",
             "",
             "📈 Charts:",
