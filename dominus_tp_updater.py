@@ -1976,11 +1976,8 @@ def cmd_berechnen():
         f"<a href=\"https://www.tradingview.com/chart/?symbol=BITGET:BTCUSDT.P&interval=120\">BTC H2</a>  |  "
         f"<a href=\"https://www.tradingview.com/chart/?symbol=CRYPTOCAP:TOTAL2&interval=120\">Total2 H2</a>",
         "",
-        "📋 <b>Befehle:</b>",
-        "/berechnen — dieser Status",
-        "/trade SYMBOL LONG|SHORT HEBEL ENTRY SL",
-        "   Beispiel: /trade ETHUSDT LONG 10 2850 2700",
-        "/hilfe — alle Befehle"
+        "📋 /trade ETHUSDT LONG 10 2850 2700",
+        "/status | /makro | /report | /hilfe"
     ]
     reply("\n".join(lines))
 
@@ -2170,7 +2167,9 @@ def cmd_makro():
         f"{overall}\n"
         f"\n"
         f"<i>Stand: {ts}</i>\n"
-        f"<i>Aktualisiert durch Alarm 5/5b/5c/5d/5e/5f Webhooks</i>"
+        f"<i>Aktualisiert durch Alarm 5/5b/5c/5d/5e/5f Webhooks</i>\n"
+        f"\n"
+        f"📋 /status | /berechnen | /report"
     )
 
 
@@ -2178,27 +2177,30 @@ def cmd_hilfe():
     reply(
         "🤖 <b>DOMINUS Bot — Befehle</b>\n"
         "━━━━━━━━━━━━\n"
-        "/berechnen — Kontostand + Positionen + BTC/Total2 Links\n"
+        "\n"
+        "📊 <b>Info &amp; Überblick:</b>\n"
+        "/status — Kurzstatus aller offenen Positionen\n"
+        "/berechnen — Kontostand + Money-Management + Chart-Links\n"
+        "/makro — BTC &amp; Total2 Impuls-Richtung + Trade-Erlaubnis\n"
+        "/report — Tages- &amp; Monats-P&amp;L Report\n"
+        "\n"
+        "⚙️ <b>Aktionen:</b>\n"
         "/trade SYMBOL LONG|SHORT HEBEL ENTRY SL\n"
         "   → Setup berechnen + alle Chart-Links\n"
         "   Beispiel: /trade ETHUSDT LONG 10 2850 2700\n"
-        "/status — Kurzstatus aller Positionen\n"
-        "/makro — BTC &amp; Total2 Impuls-Richtung + Trade-Erlaubnis\n"
         "/refresh [SYMBOL] — SL/TP/DCA sofort prüfen &amp; reparieren\n"
         "   Beispiel: /refresh BTCUSDT  (oder /refresh für alle)\n"
-        "/hilfe — diese Übersicht\n"
         "\n"
         "🎯 <b>Premium Setup (DOMINUS):</b>\n"
-        "Long: DOMINUS Impuls in dunkelgrüner Zone\n"
-        "   (zwischen überverkauft und Mittellinie)\n"
-        "Short: DOMINUS Impuls in dunkelroter Zone\n"
-        "   (zwischen überkauft und Mittellinie)\n"
-        "→ Kein Premium = Trade möglich, aber höheres Risiko\n"
+        "✅ Long+Long: beide Impulse ≥ 0 → voller Trade\n"
+        "🟡 Long+Recovering: einer im Oversold-Exit → nur Premium\n"
+        "🔴 Short+Short: beide Impulse ≤ 0 → voller Short-Trade\n"
+        "🟠 Short+Recovering: einer im Overbought-Exit → nur Premium\n"
         "\n"
-        "⚙️ <b>Automatisch nach Einstieg:</b>\n"
-        "• DCA1 + DCA2 Limit-Orders\n"
-        "• TP1–TP4 (15/20/25/40%)\n"
-        "• SL auf Entry nach TP1"
+        "⚡ <b>Automatisch nach /trade:</b>\n"
+        "• DCA1 + DCA2 Limit-Orders (20/30/50% Sizing)\n"
+        "• TP1–TP4 (15/20/25/40% ROI)\n"
+        "• SL → Entry nach TP1 | Trailing SL nach TP2/TP3"
     )
 
 
@@ -2206,24 +2208,37 @@ def cmd_status():
     """Kurzer Positionsstatus."""
     positions = get_all_positions()
     if not positions:
-        reply("✅ Keine offenen Positionen.")
+        reply(
+            "✅ Keine offenen Positionen.\n"
+            "\n"
+            "📋 /berechnen | /makro | /report"
+        )
         return
     lines = [f"📊 <b>{len(positions)} offene Position(en):</b>"]
     for pos in positions:
-        sym  = pos.get("symbol", "?")
-        qty  = float(pos.get("total", 0))
-        drct = pos.get("holdSide", "?").upper()
-        lev  = int(float(pos.get("leverage", 10)))
-        pnl  = float(pos.get("unrealizedPL", 0))
-        mark = get_mark_price(sym)
-        secured = sl_at_entry.get(sym, False)
-        trl_lvl = trailing_sl_level.get(sym, 0)
-        trl_tag = {0: "", 1: " · SL=Entry", 2: " · Trail→TP1", 3: " · Trail→TP2"}.get(trl_lvl, "")
-        icon = "🔒" if secured else "📈"
+        sym      = pos.get("symbol", "?")
+        qty      = float(pos.get("total", 0))
+        drct     = pos.get("holdSide", "?").upper()
+        lev      = int(float(pos.get("leverage", 10)))
+        pnl      = float(pos.get("unrealizedPL", 0))
+        mark     = get_mark_price(sym)
+        secured  = sl_at_entry.get(sym, False)
+        trl_lvl  = trailing_sl_level.get(sym, 0)
+        trl_tag  = {0: "", 1: " · SL=Entry", 2: " · Trail→TP1", 3: " · Trail→TP2"}.get(trl_lvl, "")
+        icon     = "🔒" if secured else "📈"
+        base     = get_base_coin(sym)
+        qty_dec  = get_qty_decimals(sym)
+        pos_usdt = qty * mark if mark > 0 else 0
+        qty_str  = f"{qty:.{qty_dec}f} {base} (≈ {pos_usdt:.2f} USDT)" if pos_usdt > 0 else f"{qty:.{qty_dec}f} {base}"
         lines.append(
-            f"{icon} {sym} {drct} {lev}x | "
-            f"Qty={qty:.2f} | Mark={mark} | PnL={pnl:+.2f} USDT{trl_tag}"
+            f"{icon} <b>{sym}</b> {drct} {lev}x\n"
+            f"   Qty: {qty_str}\n"
+            f"   Mark: {mark} | PnL: {pnl:+.2f} USDT{trl_tag}"
         )
+    lines += [
+        "",
+        "📋 /berechnen | /makro | /report | /refresh",
+    ]
     reply("\n".join(lines))
 
 
@@ -2275,21 +2290,28 @@ def cmd_refresh(parts: list):
     # Abschlussbericht
     lines = [f"✅ <b>Refresh abgeschlossen</b> — {symbols_str}"]
     for pos in positions_to_check:
-        sym  = pos.get("symbol", "?")
-        drct = pos.get("holdSide", "?").upper()
-        lev  = int(float(pos.get("leverage", 10)))
-        avg  = float(pos.get("openPriceAvg", 0))
-        mark = get_mark_price(sym)
-        sl   = get_sl_price(sym, pos.get("holdSide", "long"))
-        tps  = get_existing_tps(sym)
-        n_tp = len(tps)
-        secured = sl_at_entry.get(sym, False)
-        lock = "🔒 SL=Entry" if secured else (f"🛡 SL={sl:.4f}" if sl > 0 else "⚠️ Kein SL!")
+        sym      = pos.get("symbol", "?")
+        drct     = pos.get("holdSide", "?").upper()
+        lev      = int(float(pos.get("leverage", 10)))
+        avg      = float(pos.get("openPriceAvg", 0))
+        qty      = float(pos.get("total", 0))
+        mark     = get_mark_price(sym)
+        sl       = get_sl_price(sym, pos.get("holdSide", "long"))
+        tps      = get_existing_tps(sym)
+        n_tp     = len(tps)
+        secured  = sl_at_entry.get(sym, False)
+        base     = get_base_coin(sym)
+        qty_dec  = get_qty_decimals(sym)
+        pos_usdt = qty * mark if mark > 0 else qty * avg
+        qty_str  = f"{qty:.{qty_dec}f} {base} (≈ {pos_usdt:.2f} USDT)"
+        lock     = "🔒 SL=Entry" if secured else (f"🛡 SL={sl:.4f}" if sl > 0 else "⚠️ Kein SL!")
         lines.append(
             f"\n📍 <b>{sym}</b> {drct} {lev}x\n"
+            f"   Qty: {qty_str}\n"
             f"   Entry={avg:.4f} | Mark={mark}\n"
             f"   {lock} | TPs gesetzt: {n_tp}"
         )
+    lines += ["", "📋 /status | /makro | /report"]
     reply("\n".join(lines))
 
 
@@ -2391,6 +2413,7 @@ def cmd_report():
     """Sendet den täglichen P&L Report auf Telegram-Anfrage."""
     try:
         report = build_daily_report()
+        report += "\n\n📋 /status | /makro | /berechnen"
         telegram(report)
     except Exception as e:
         reply(f"❌ Report Fehler: {e}")
