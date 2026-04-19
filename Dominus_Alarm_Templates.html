@@ -1,0 +1,1622 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DOMINUS Alarm-Templates</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:system-ui,-apple-system,sans-serif;background:#111114;color:#deded8;padding:1.5rem}
+.wrap{max-width:900px;margin:0 auto}
+.page-title{font-size:22px;font-weight:500;margin-bottom:.25rem;color:#deded8}
+.page-sub{font-size:13px;color:#888;margin-bottom:1.5rem}
+.card{background:#1c1c20;border:0.5px solid rgba(255,255,255,0.09);border-radius:12px;padding:1rem 1.25rem;margin-bottom:14px}
+.card-head{display:flex;align-items:center;gap:10px;margin-bottom:1rem}
+.step-badge{width:28px;height:28px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:600;flex-shrink:0}
+.h2{font-size:15px;font-weight:500;color:#deded8}
+.sub{font-size:12px;color:#888;margin-top:2px}
+.field{margin-bottom:11px}
+.field-label{font-size:11px;color:#888;letter-spacing:.04em;text-transform:uppercase;margin-bottom:5px;display:flex;justify-content:space-between;align-items:center}
+.field-value{background:#252528;border:0.5px solid rgba(255,255,255,0.07);border-radius:8px;padding:9px 12px;font-size:13px;color:#deded8;line-height:1.55}
+.field-value.mono{font-family:'SF Mono','Fira Mono','Courier New',monospace;font-size:12px;white-space:pre-wrap;line-height:1.6}
+.copy-btn{background:transparent;border:0.5px solid rgba(255,255,255,0.15);border-radius:6px;padding:3px 10px;font-size:11px;cursor:pointer;color:#888;font-family:inherit;transition:.15s;white-space:nowrap}
+.copy-btn:hover{background:#252528;color:#deded8}
+.copy-btn.copied{background:#0e2010;border-color:#4ECBA0;color:#4ECBA0}
+.cond-block{border:0.5px solid rgba(255,255,255,0.07);border-radius:8px;padding:10px 12px;margin-bottom:8px}
+.cond-row{display:flex;align-items:flex-start;gap:8px}
+.cond-num{width:20px;height:20px;border-radius:50%;background:#0e1f33;color:#7BB8F5;font-size:11px;font-weight:500;text-align:center;line-height:20px;flex-shrink:0}
+.cond-text{font-size:13px;color:#deded8;line-height:1.5}
+.cond-detail{font-size:12px;color:#888;margin-top:3px}
+.pill{display:inline-block;font-size:11px;padding:2px 7px;border-radius:4px;font-weight:500;margin-right:3px}
+.p-blue{background:#0e1f33;color:#7BB8F5}
+.p-green{background:#162a16;color:#5EC45E}
+.p-red{background:#2e1616;color:#F07070}
+.p-purple{background:#22203e;color:#A89FF5}
+.p-teal{background:#0d2820;color:#4ECBA0}
+.p-orange{background:#2a1c08;color:#E09040}
+.hint{background:#2a1c08;border-radius:8px;padding:8px 12px;font-size:12px;color:#E09040;margin-top:8px;line-height:1.55}
+.info{background:#0e1f33;border-radius:8px;padding:8px 12px;font-size:12px;color:#7BB8F5;margin-top:8px;line-height:1.55}
+.success{background:#0e2010;border-radius:8px;padding:8px 12px;font-size:12px;color:#5EC45E;margin-top:8px;line-height:1.55}
+.warn{background:#2a1c08;border-radius:8px;padding:8px 12px;font-size:12px;color:#E09040;margin-top:8px;line-height:1.55}
+.danger{background:#2e1616;border-radius:8px;padding:8px 12px;font-size:12px;color:#F07070;margin-top:8px;line-height:1.55}
+.notif-row{display:grid;grid-template-columns:repeat(4,1fr);gap:7px;margin-top:10px}
+.notif-card{background:#252528;border-radius:7px;padding:7px 10px}
+.notif-label{font-size:10px;color:#888;margin-bottom:2px;text-transform:uppercase;letter-spacing:.03em}
+.notif-val{font-size:12px;font-weight:500;color:#deded8}
+.sep-label{font-size:11px;color:#909090;letter-spacing:.05em;text-transform:uppercase;padding:10px 0 5px;border-top:0.5px solid rgba(255,255,255,0.06);margin-top:6px}
+.steps-list{display:flex;flex-direction:column;gap:7px;margin-top:8px}
+.step-row{display:flex;gap:10px;align-items:flex-start}
+.step-n{width:20px;height:20px;border-radius:50%;background:#252528;font-size:11px;font-weight:500;display:flex;align-items:center;justify-content:center;flex-shrink:0;color:#888;margin-top:1px}
+.step-t{font-size:13px;color:#deded8;line-height:1.5}
+.new-badge{display:inline-block;background:#0d2820;color:#4ECBA0;font-size:10px;font-weight:600;padding:1px 6px;border-radius:4px;letter-spacing:.03em;margin-left:6px;vertical-align:middle}
+.upd-badge{display:inline-block;background:#2a1c08;color:#E09040;font-size:10px;font-weight:600;padding:1px 6px;border-radius:4px;letter-spacing:.03em;margin-left:6px;vertical-align:middle}
+.webhook-url{background:#0a0a0c;color:#5DCAA5;font-family:'SF Mono','Fira Mono',monospace;font-size:12px;border-radius:8px;padding:10px 14px;word-break:break-all;line-height:1.6}
+.two-col{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.harsi-flow{display:grid;grid-template-columns:1fr auto 1fr auto 1fr;gap:6px;align-items:center;margin-top:10px}
+.harsi-box{background:#252528;border-radius:8px;padding:8px 10px;font-size:12px;text-align:center;line-height:1.4;color:#deded8}
+.harsi-box.ok{background:#162a16;color:#5EC45E}
+.harsi-box.warn{background:#2a1c08;color:#E09040}
+.harsi-box.exit{background:#0e1f33;color:#7BB8F5}
+.harsi-arrow{font-size:16px;color:#b0b0a8;text-align:center}
+.trailing-flow{display:grid;grid-template-columns:1fr auto 1fr auto 1fr;gap:6px;align-items:center;margin-top:10px}
+.trailing-box{background:#252528;border-radius:8px;padding:8px 10px;font-size:12px;text-align:center;line-height:1.4;color:#deded8}
+.trailing-box.t1{background:#162a16;color:#5EC45E}
+.trailing-box.t2{background:#0d2820;color:#4ECBA0}
+.trailing-box.t3{background:#0e1f33;color:#7BB8F5}
+.trailing-arrow{font-size:16px;color:#b0b0a8;text-align:center}
+@media(max-width:600px){.notif-row{grid-template-columns:1fr 1fr}.two-col{grid-template-columns:1fr}.harsi-flow{grid-template-columns:1fr;gap:4px}.harsi-arrow{display:none}.trailing-flow{grid-template-columns:1fr;gap:4px}.trailing-arrow{display:none}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<div class="page-title">DOMINUS Alarm-Templates</div>
+<div class="page-sub">TradingView &rarr; Railway Webhook &rarr; Telegram &middot; DOM-ORC v2.1 &middot; Railway v4.35 &mdash; Dark Mode &mdash; Stand April 2026</div>
+
+<!-- INHALTSVERZEICHNIS / TIMELINE -->
+<div class="card" id="sec-toc">
+  <div class="card-head">
+    <div class="step-badge" style="background:#252528;color:#909090">&#9776;</div>
+    <div>
+      <div class="h2">Ablauf &amp; Inhaltsverzeichnis</div>
+      <div class="sub">Zeitlicher Workflow &mdash; Alarm 2/2b dauerhaft aktiv, kein H4-Alarm n&ouml;tig</div>
+    </div>
+  </div>
+
+  <!-- TIMELINE -->
+  <div style="position:relative;padding-left:32px;margin-bottom:14px">
+    <div style="position:absolute;left:9px;top:6px;bottom:6px;width:2px;background:#2a2a2e;border-radius:2px"></div>
+
+    <!-- Schritt A -->
+    <div style="position:relative;margin-bottom:12px">
+      <div style="position:absolute;left:-32px;width:20px;height:20px;border-radius:50%;background:#162a16;color:#5EC45E;font-size:11px;font-weight:600;display:flex;align-items:center;justify-content:center">A</div>
+      <div style="font-size:13px;font-weight:500;color:#deded8">DOM-ORC feuert &mdash; H2 Entry</div>
+      <div style="font-size:12px;color:#888;margin-top:2px">Alarm 2 / 2b ist permanent aktiv f&uuml;r alle Watchlist-Coins &mdash; <strong style="color:#F07070">max. 30 Min Reaktionszeit!</strong></div>
+      <div style="margin-top:5px;display:flex;gap:6px;flex-wrap:wrap">
+        <a href="#sec-alarm2" style="font-size:11px;padding:2px 8px;border-radius:4px;background:#162a16;color:#5EC45E;text-decoration:none">&#x2192; Alarm 2 Long</a>
+        <a href="#sec-alarm2b" style="font-size:11px;padding:2px 8px;border-radius:4px;background:#2e1616;color:#F07070;text-decoration:none">&#x2192; Alarm 2b Short</a>
+        <a href="#sec-harsi" style="font-size:11px;padding:2px 8px;border-radius:4px;background:#2a1c08;color:#E09040;text-decoration:none">&#x2192; HARSI-Konzept</a>
+      </div>
+    </div>
+
+    <!-- Schritt B1 -->
+    <div style="position:relative;margin-bottom:12px">
+      <div style="position:absolute;left:-32px;width:20px;height:20px;border-radius:50%;background:#162a16;color:#5EC45E;font-size:10px;font-weight:600;display:flex;align-items:center;justify-content:center">B1</div>
+      <div style="font-size:13px;font-weight:500;color:#5EC45E">harsi_warn: 0 &mdash; sofort einsteigen</div>
+      <div style="font-size:12px;color:#888;margin-top:2px">BTC &amp; Total2 Impuls-Farbe manuell pr&uuml;fen &rarr; Trade er&ouml;ffnen</div>
+      <div style="margin-top:5px">
+        <a href="#sec-telegram" style="font-size:11px;padding:2px 8px;border-radius:4px;background:#0d2820;color:#4ECBA0;text-decoration:none">&#x2192; /trade Befehl</a>
+      </div>
+    </div>
+
+    <!-- Schritt B2 -->
+    <div style="position:relative;margin-bottom:12px">
+      <div style="position:absolute;left:-32px;width:20px;height:20px;border-radius:50%;background:#2a1c08;color:#E09040;font-size:10px;font-weight:600;display:flex;align-items:center;justify-content:center">B2</div>
+      <div style="font-size:13px;font-weight:500;color:#E09040">harsi_warn: 1 &mdash; warten</div>
+      <div style="font-size:12px;color:#888;margin-top:2px">Sofort Alarm 3 / 3b auf H2-Chart erstellen &mdash; <strong style="color:#F07070">Zeitfenster: 30 Minuten!</strong></div>
+      <div style="margin-top:5px;display:flex;gap:6px;flex-wrap:wrap">
+        <a href="#sec-alarm3" style="font-size:11px;padding:2px 8px;border-radius:4px;background:#0d2820;color:#4ECBA0;text-decoration:none">&#x2192; Alarm 3 Long HARSI Exit</a>
+        <a href="#sec-alarm3b" style="font-size:11px;padding:2px 8px;border-radius:4px;background:#2e1616;color:#F07070;text-decoration:none">&#x2192; Alarm 3b Short HARSI Exit</a>
+      </div>
+    </div>
+
+    <!-- Schritt C -->
+    <div style="position:relative;margin-bottom:12px">
+      <div style="position:absolute;left:-32px;width:20px;height:20px;border-radius:50%;background:#0e1f33;color:#7BB8F5;font-size:11px;font-weight:600;display:flex;align-items:center;justify-content:center">C</div>
+      <div style="font-size:13px;font-weight:500;color:#deded8">HARSI frei &mdash; Trade er&ouml;ffnen</div>
+      <div style="font-size:12px;color:#888;margin-top:2px">BTC &amp; Total2 pr&uuml;fen &rarr; /trade &rarr; Market Order + SL auf Bitget</div>
+      <div style="margin-top:5px">
+        <a href="#sec-telegram" style="font-size:11px;padding:2px 8px;border-radius:4px;background:#0d2820;color:#4ECBA0;text-decoration:none">&#x2192; /trade Befehl</a>
+      </div>
+    </div>
+
+    <!-- Schritt D -->
+    <div style="position:relative">
+      <div style="position:absolute;left:-32px;width:20px;height:20px;border-radius:50%;background:#e0e0d8;color:#111114;font-size:11px;font-weight:600;display:flex;align-items:center;justify-content:center">D</div>
+      <div style="font-size:13px;font-weight:500;color:#deded8">Railway &mdash; vollautomatisch</div>
+      <div style="font-size:12px;color:#888;margin-top:2px">DCA1+2 &middot; TP1&ndash;TP4 &middot; SL-Nachzug nach TP1 &middot; Telegram-Best&auml;tigung</div>
+    </div>
+  </div>
+
+  <!-- INHALTSVERZEICHNIS LINKS -->
+  <div style="border-top:0.5px solid rgba(255,255,255,0.06);padding-top:10px;margin-top:4px">
+    <div style="font-size:11px;color:#555;letter-spacing:.05em;text-transform:uppercase;margin-bottom:7px">Sektionen</div>
+    <div style="display:flex;flex-wrap:wrap;gap:6px">
+      <a href="#sec-webhook"  style="font-size:12px;padding:4px 10px;border-radius:6px;background:#252528;color:#909090;text-decoration:none;border:0.5px solid rgba(0,0,0,0.09)">&#x26A1; Webhook-URL</a>
+      <a href="#sec-harsi"    style="font-size:12px;padding:4px 10px;border-radius:6px;background:#252528;color:#909090;text-decoration:none;border:0.5px solid rgba(0,0,0,0.09)">&#x26A0; HARSI-Konzept</a>
+      <a href="#sec-alarm2"   style="font-size:12px;padding:4px 10px;border-radius:6px;background:#162a16;color:#5EC45E;text-decoration:none;border:0.5px solid rgba(0,0,0,0.06)">2 Long Entry</a>
+      <a href="#sec-alarm2b"  style="font-size:12px;padding:4px 10px;border-radius:6px;background:#2e1616;color:#F07070;text-decoration:none;border:0.5px solid rgba(0,0,0,0.06)">2b Short Entry</a>
+      <a href="#sec-alarm3"   style="font-size:12px;padding:4px 10px;border-radius:6px;background:#0d2820;color:#4ECBA0;text-decoration:none;border:0.5px solid rgba(0,0,0,0.06)">3 HARSI Exit Long</a>
+      <a href="#sec-alarm3b"  style="font-size:12px;padding:4px 10px;border-radius:6px;background:#2e1616;color:#F07070;text-decoration:none;border:0.5px solid rgba(0,0,0,0.06)">3b HARSI Exit Short</a>
+      <a href="#sec-alarm4"   style="font-size:12px;padding:4px 10px;border-radius:6px;background:#0d2820;color:#4ECBA0;text-decoration:none;border:0.5px solid rgba(0,0,0,0.06)">4 HARSI SL Long</a>
+      <a href="#sec-alarm4b"  style="font-size:12px;padding:4px 10px;border-radius:6px;background:#2e1616;color:#F07070;text-decoration:none;border:0.5px solid rgba(0,0,0,0.06)">4b HARSI SL Short</a>
+      <a href="#sec-alarm1"   style="font-size:12px;padding:4px 10px;border-radius:6px;background:#252528;color:#888;text-decoration:none;border:0.5px solid rgba(0,0,0,0.09)">1 H4 Long (optional)</a>
+      <a href="#sec-alarm1b"  style="font-size:12px;padding:4px 10px;border-radius:6px;background:#252528;color:#888;text-decoration:none;border:0.5px solid rgba(0,0,0,0.09)">1b H4 Short (optional)</a>
+      <a href="#sec-alarm5"   style="font-size:12px;padding:4px 10px;border-radius:6px;background:#0e1f33;color:#7BB8F5;text-decoration:none;border:0.5px solid rgba(0,0,0,0.06)">5 BTC Makro</a>
+      <a href="#sec-alarm5b"  style="font-size:12px;padding:4px 10px;border-radius:6px;background:#0e1f33;color:#7BB8F5;text-decoration:none;border:0.5px solid rgba(0,0,0,0.06)">5b Total2 Makro</a>
+      <a href="#sec-alarm5c"  style="font-size:12px;padding:4px 10px;border-radius:6px;background:#1a1200;color:#E09040;text-decoration:none;border:0.5px solid rgba(255,165,0,0.15)">5c BTC Long Recovery &minus;10</a>
+      <a href="#sec-alarm5d"  style="font-size:12px;padding:4px 10px;border-radius:6px;background:#1a1200;color:#E09040;text-decoration:none;border:0.5px solid rgba(255,165,0,0.15)">5d Total2 Long Recovery &minus;10</a>
+      <a href="#sec-alarm5e"  style="font-size:12px;padding:4px 10px;border-radius:6px;background:#1a0808;color:#F07070;text-decoration:none;border:0.5px solid rgba(255,100,100,0.15)">5e BTC Short Recovery +10</a>
+      <a href="#sec-alarm5f"  style="font-size:12px;padding:4px 10px;border-radius:6px;background:#1a0808;color:#F07070;text-decoration:none;border:0.5px solid rgba(255,100,100,0.15)">5f Total2 Short Recovery +10</a>
+      <a href="#sec-trailing" style="font-size:12px;padding:4px 10px;border-radius:6px;background:#0d2820;color:#4ECBA0;text-decoration:none;border:0.5px solid rgba(0,0,0,0.06)">&#x1F4C8; Trailing SL</a>
+      <a href="#sec-deviation" style="font-size:12px;padding:4px 10px;border-radius:6px;background:#2a1c08;color:#E09040;text-decoration:none;border:0.5px solid rgba(0,0,0,0.06)">&#x26A0;&#xFE0F; Abweichungswarnungen</a>
+      <a href="#sec-telegram" style="font-size:12px;padding:4px 10px;border-radius:6px;background:#252528;color:#909090;text-decoration:none;border:0.5px solid rgba(0,0,0,0.09)">&#x2709; Telegram Befehle</a>
+      <a href="#sec-telegram-preview" style="font-size:12px;padding:4px 10px;border-radius:6px;background:#0e1f33;color:#7BB8F5;text-decoration:none;border:0.5px solid rgba(0,0,0,0.06)">&#x1F4F1; Telegram Vorschau</a>
+      <a href="#sec-workflow" style="font-size:12px;padding:4px 10px;border-radius:6px;background:#252528;color:#909090;text-decoration:none;border:0.5px solid rgba(0,0,0,0.09)">&#x2630; Vollst. Workflow</a>
+    </div>
+  </div>
+</div>
+
+<!-- WEBHOOK INFO -->
+<div class="card" id="sec-webhook">
+  <div class="card-head">
+    <div class="step-badge" style="background:#0d2820;color:#4ECBA0">&#x26A1;</div>
+    <div>
+      <div class="h2">Railway Webhook-URL</div>
+      <div class="sub">Alle Alerts senden JSON an diese URL &rarr; Railway &rarr; Telegram</div>
+    </div>
+  </div>
+  <div class="field">
+    <div class="field-label">
+      <span>Webhook-URL (in jeden Alert einf&uuml;gen)</span>
+      <button class="copy-btn" onclick="copyField('wh-url',this)">Kopieren</button>
+    </div>
+    <div class="webhook-url" id="wh-url">https://dominus-tp-updater-production.up.railway.app/webhook?token=VAnpNHg7vnVf2BR5QQ1Tkk1mx3QIwHVt8LLsICzx2IAwKZwCyLvJIrxD2gKq</div>
+  </div>
+  <div class="success"><strong>Was passiert:</strong> TradingView sendet JSON &rarr; Railway empf&auml;ngt &rarr; Telegram sendet DOMINUS-Checkliste + Chart-Links in deinem Layout lX5eDAis.</div>
+</div>
+
+<!-- HARSI KONZEPT -->
+<div class="card" id="sec-harsi">
+  <div class="card-head">
+    <div class="step-badge" style="background:#2a1c08;color:#E09040">&#x26A0;</div>
+    <div>
+      <div class="h2">HARSI-Konzept <span class="upd-badge">AKTUALISIERT</span></div>
+      <div class="sub">HARSI blockiert keine Alarme mehr &mdash; Warnung + separater Exit-Alarm</div>
+    </div>
+  </div>
+
+  <!-- 30-Minuten Warnhinweis -->
+  <div class="danger" style="margin-bottom:12px;font-size:13px">
+    <strong>&#x23F1; 30-Minuten-Regel (DOMINUS-Strategie)</strong><br>
+    Ein H2-Signal ist laut Strategie nur <strong>30 Minuten nach Kerzenschluss g&uuml;ltig</strong>.<br>
+    Das gilt auch beim HARSI-Warten: Wenn Alarm 3 / 3b nicht <strong>innerhalb von 30 Minuten</strong> feuert &rarr; Alarm l&ouml;schen, Setup &uuml;berspringen.<br>
+    <strong>Pine Script kann dies technisch nicht erzwingen</strong> (H2-Bar = 2h, keine Sub-Bar-Zeitangaben m&ouml;glich). <strong>Du musst manuell einen 30-Min-Timer stellen.</strong><br>
+    Railway gibt eine Warnung aus wenn HARSI_EXIT sp&auml;ter als 30 Min nach dem Signal eintrifft.
+  </div>
+
+  <!-- Zwei Pfade: harsi_warn 0 vs 1 -->
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px">
+
+    <!-- Pfad A: harsi_warn 0 -->
+    <div style="background:#0d1a0d;border:1px solid #2a4a2a;border-radius:10px;padding:10px 12px">
+      <div style="font-size:11px;font-weight:700;color:#5EC45E;text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px">&#x2705; harsi_warn: 0 — Sofort einsteigen</div>
+      <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+        <div style="background:#162a16;border-radius:6px;padding:5px 8px;font-size:11px;color:#5EC45E;text-align:center;min-width:70px">H2 Signal</div>
+        <div style="color:#5EC45E;font-size:14px">&#x2192;</div>
+        <div style="background:#162a16;border-radius:6px;padding:5px 8px;font-size:11px;color:#5EC45E;text-align:center;min-width:70px">BTC/T2<br>pr&uuml;fen</div>
+        <div style="color:#5EC45E;font-size:14px">&#x2192;</div>
+        <div style="background:#0e3518;border:1px solid #4ECBA0;border-radius:6px;padding:5px 8px;font-size:11px;color:#4ECBA0;font-weight:600;text-align:center;min-width:70px">/trade<br>ausf&uuml;hren</div>
+      </div>
+      <div style="margin-top:8px;background:#0a1f0a;border-radius:6px;padding:6px 8px;font-size:11px;color:#E09040;line-height:1.5">
+        &#x23F1; <strong>30-Min-Fenster</strong> ab H2-Signal f&uuml;r den <strong>Einstieg</strong>.<br>
+        Sp&auml;ter einsteigen = Setup abgelaufen.
+      </div>
+    </div>
+
+    <!-- Pfad B: harsi_warn 1 -->
+    <div style="background:#1a1200;border:1px solid #4a3a00;border-radius:10px;padding:10px 12px">
+      <div style="font-size:11px;font-weight:700;color:#E09040;text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px">&#x26A0;&#xFE0F; harsi_warn: 1 — Auf HARSI-Exit warten</div>
+      <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+        <div style="background:#2a1c08;border-radius:6px;padding:5px 8px;font-size:11px;color:#E09040;text-align:center;min-width:62px">H2 Signal<br>+ Timer</div>
+        <div style="color:#E09040;font-size:14px">&#x2192;</div>
+        <div style="background:#2a1c08;border-radius:6px;padding:5px 8px;font-size:11px;color:#E09040;text-align:center;min-width:62px">Alarm 3<br>erstellen</div>
+        <div style="color:#E09040;font-size:14px">&#x2192;</div>
+        <div style="background:#0e1f33;border:1px solid #7BB8F5;border-radius:6px;padding:5px 8px;font-size:11px;color:#7BB8F5;font-weight:600;text-align:center;min-width:62px">HARSI frei<br>→ /trade</div>
+      </div>
+      <div style="margin-top:8px;background:#2e1616;border-radius:6px;padding:6px 8px;font-size:11px;color:#F07070;line-height:1.5">
+        &#x23F1; <strong>30-Min-Fenster</strong> f&uuml;r den <strong>HARSI-Exit</strong>.<br>
+        Kein Exit in 30 Min &rarr; <strong>Alarm l&ouml;schen, Setup &uuml;berspringen!</strong>
+      </div>
+    </div>
+
+  </div>
+  <div style="background:#1a1a1e;border-radius:8px;padding:8px 12px;font-size:11px;color:#666;line-height:1.6">
+    <strong style="color:#888">Merkhilfe:</strong> Bei harsi_warn 0 tickt die Uhr f&uuml;r den <em>Einstieg</em> &mdash; bei harsi_warn 1 tickt die Uhr f&uuml;r den <em>HARSI-Exit</em>. In beiden F&auml;llen: 30 Min &uuml;berschritten = Setup weg.<br>
+    <strong style="color:#888">Technischer Timeout in DOM-ORC:</strong> 1 H2-Bar (2h) &mdash; die 30-Min-Trader-Regel hat Vorrang &mdash; manuellen Timer stellen!
+  </div>
+</div>
+
+<!-- ALARM 1: H4 LONG -->
+<div class="card" id="sec-alarm1">
+  <div class="card-head">
+    <div class="step-badge" style="background:#0e1f33;color:#7BB8F5">1</div>
+    <div>
+      <div class="h2">H4 Long-Trigger <span class="pill p-blue">Watchlist</span></div>
+      <div class="sub">Erkennt H4 Buy-Trigger auf allen Watchlist-Coins (optional)</div>
+    </div>
+  </div>
+  <div class="field">
+    <div class="field-label"><span>Alarm-Name</span>
+      <button class="copy-btn" onclick="copyText('&#x1F514; H4 Long-Trigger',this)">Kopieren</button>
+    </div>
+    <div class="field-value">&#x1F514; H4 Long-Trigger</div>
+  </div>
+  <div class="field">
+    <div class="field-label"><span>Bedingung</span></div>
+    <div class="cond-block">
+      <div class="cond-row">
+        <span class="cond-num">1</span>
+        <div>
+          <div class="cond-text">DOMINUS Buy/Sell &rarr; <strong>Buy</strong> &middot; Kreuzt nach oben &middot; Wert 0</div>
+          <div class="cond-detail"><span class="pill p-blue">H4</span> Kerzenschluss &middot; Einmal pro Bar &middot; Watchlist</div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="sep-label">Webhook Message (JSON)</div>
+  <div class="field" style="margin-top:8px">
+    <div class="field-label"><span>Message-Feld in TradingView</span>
+      <button class="copy-btn" onclick="copyField('h4-long',this)">Kopieren</button>
+    </div>
+    <div class="field-value mono" id="h4-long">{"symbol":"{{ticker}}","side":"long","entry":{{close}},"timeframe":"{{interval}}","signal":"H4_TRIGGER"}</div>
+  </div>
+  <div class="notif-row">
+    <div class="notif-card"><div class="notif-label">Benachrichtigung</div><div class="notif-val">App + Ton</div></div>
+    <div class="notif-card"><div class="notif-label">Ausl&ouml;sung</div><div class="notif-val">Einmal pro Bar</div></div>
+    <div class="notif-card"><div class="notif-label">Ablauf</div><div class="notif-val">Unbefristet</div></div>
+    <div class="notif-card"><div class="notif-label">Typ</div><div class="notif-val">Watchlist</div></div>
+  </div>
+</div>
+
+<!-- ALARM 1b: H4 SHORT -->
+<div class="card" id="sec-alarm1b">
+  <div class="card-head">
+    <div class="step-badge" style="background:#2e1616;color:#F07070">1b</div>
+    <div>
+      <div class="h2">H4 Short-Trigger <span class="pill p-red">Watchlist</span></div>
+      <div class="sub">Erkennt H4 Sell-Trigger auf allen Watchlist-Coins (optional)</div>
+    </div>
+  </div>
+  <div class="field">
+    <div class="field-label"><span>Alarm-Name</span>
+      <button class="copy-btn" onclick="copyText('&#x1F514; H4 Short-Trigger',this)">Kopieren</button>
+    </div>
+    <div class="field-value">&#x1F514; H4 Short-Trigger</div>
+  </div>
+  <div class="field">
+    <div class="field-label"><span>Bedingung</span></div>
+    <div class="cond-block">
+      <div class="cond-row">
+        <span class="cond-num">1</span>
+        <div>
+          <div class="cond-text">DOMINUS Buy/Sell &rarr; <strong>Sell</strong> &middot; Kreuzt nach oben &middot; Wert 0</div>
+          <div class="cond-detail"><span class="pill p-red">H4</span> Kerzenschluss &middot; Einmal pro Bar &middot; Watchlist</div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="sep-label">Webhook Message (JSON)</div>
+  <div class="field" style="margin-top:8px">
+    <div class="field-label"><span>Message-Feld in TradingView</span>
+      <button class="copy-btn" onclick="copyField('h4-short',this)">Kopieren</button>
+    </div>
+    <div class="field-value mono" id="h4-short">{"symbol":"{{ticker}}","side":"short","entry":{{close}},"timeframe":"{{interval}}","signal":"H4_TRIGGER"}</div>
+  </div>
+  <div class="notif-row">
+    <div class="notif-card"><div class="notif-label">Benachrichtigung</div><div class="notif-val">App + Ton</div></div>
+    <div class="notif-card"><div class="notif-label">Ausl&ouml;sung</div><div class="notif-val">Einmal pro Bar</div></div>
+    <div class="notif-card"><div class="notif-label">Ablauf</div><div class="notif-val">Unbefristet</div></div>
+    <div class="notif-card"><div class="notif-label">Typ</div><div class="notif-val">Watchlist</div></div>
+  </div>
+</div>
+
+<!-- ALARM 5/5b: BTC & TOTAL2 MAKRO-KONTEXT -->
+<div class="card" id="sec-alarm5" style="border-left:3px solid #7BB8F5">
+  <div class="card-head">
+    <div class="step-badge" style="background:#0e1f33;color:#7BB8F5">5</div>
+    <div>
+      <div class="h2">BTC Makro-Kontext &mdash; DOMINUS Impuls <span class="upd-badge">NEU</span></div>
+      <div class="sub">4 Alarme auf BTC H2 Chart &middot; Richtungswechsel + Zonen &middot; Railway warnt automatisch bei Gegenpositionen</div>
+    </div>
+  </div>
+
+  <!-- ZONEN-ÜBERSICHT -->
+  <div style="background:#0e1f33;border-radius:8px;padding:14px 16px;margin-bottom:16px;font-size:13px;line-height:1.7">
+    <div style="font-weight:600;color:#7BB8F5;margin-bottom:10px">📐 DOMINUS Impuls — Zonen &amp; Schwellwerte (aus Indikator-Einstellungen)</div>
+
+    <!-- Zonen-Diagramm -->
+    <div style="border-radius:6px;overflow:hidden;margin-bottom:12px;font-size:12px;font-family:monospace">
+      <div style="background:rgba(240,112,112,0.25);padding:6px 12px;color:#F07070;display:flex;justify-content:space-between"><span>⬆ Oberes Band (Extremzone Short)</span><span style="font-weight:700">+14</span></div>
+      <div style="background:rgba(240,112,112,0.15);padding:6px 12px;color:#F07070;display:flex;justify-content:space-between"><span>— Überkauft (Short Premium Grenze)</span><span style="font-weight:700">+10</span></div>
+      <div style="background:rgba(255,255,255,0.03);padding:6px 12px;color:#888;display:flex;justify-content:space-between"><span style="font-style:italic">↕ Neutral — kein Alarm nötig</span><span></span></div>
+      <div style="background:rgba(255,255,255,0.06);padding:6px 12px;color:#aaa;display:flex;justify-content:space-between;border-top:1px solid rgba(255,255,255,0.1);border-bottom:1px solid rgba(255,255,255,0.1)"><span style="font-weight:700">━━ Nulllinie — Richtungswechsel (grün ↔ rot)</span><span style="font-weight:700">0</span></div>
+      <div style="background:rgba(255,255,255,0.03);padding:6px 12px;color:#888;display:flex;justify-content:space-between"><span style="font-style:italic">↕ Neutral — kein Alarm nötig</span><span></span></div>
+      <div style="background:rgba(94,196,94,0.15);padding:6px 12px;color:#5EC45E;display:flex;justify-content:space-between"><span>— Überverkauft (Long Premium Grenze)</span><span style="font-weight:700">−10</span></div>
+      <div style="background:rgba(94,196,94,0.25);padding:6px 12px;color:#5EC45E;display:flex;justify-content:space-between"><span>⬇ Unteres Band (Extremzone Long)</span><span style="font-weight:700">−14</span></div>
+    </div>
+
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px">
+      <div style="background:rgba(94,196,94,0.1);border-radius:6px;padding:10px">
+        <div style="color:#5EC45E;font-weight:600;margin-bottom:4px">🟢 Long-Trade — BTC/Total2 ideal wenn:</div>
+        <div style="color:#aaa;font-size:12px">
+          ① Main &gt; 0 <strong style="color:#ddd">(grüne Richtung)</strong><br>
+          ② Main kreuzt −10 nach unten <strong style="color:#ddd">(Long Premium)</strong><br>
+          ③ Main unter −14 <strong style="color:#ddd">(Extremzone — stärkste Bestätigung)</strong>
+        </div>
+      </div>
+      <div style="background:rgba(240,112,112,0.1);border-radius:6px;padding:10px">
+        <div style="color:#F07070;font-weight:600;margin-bottom:4px">🔴 Short-Trade — BTC/Total2 ideal wenn:</div>
+        <div style="color:#aaa;font-size:12px">
+          ① Main &lt; 0 <strong style="color:#ddd">(rote Richtung)</strong><br>
+          ② Main kreuzt +10 nach oben <strong style="color:#ddd">(Short Premium)</strong><br>
+          ③ Main über +14 <strong style="color:#ddd">(Extremzone — stärkste Bestätigung)</strong>
+        </div>
+      </div>
+    </div>
+    <div style="padding:8px;background:rgba(255,255,255,0.04);border-radius:6px;color:#aaa;font-size:12px">
+      ⚠️ <strong style="color:#E09040">DOM-DIR (EMA-Proxy) nicht verwenden</strong> — zu langsam, falsche Werte. Direkt <strong style="color:#ddd">DOMINUS Impuls: Main</strong> auf BTC/Total2 H2 Chart als Alarm-Quelle verwenden.
+    </div>
+  </div>
+
+  <!-- SCHRITT-FÜR-SCHRITT -->
+  <div class="field">
+    <div class="field-label"><span>📋 Setup — Schritt für Schritt (BTC H2 Chart)</span></div>
+  </div>
+  <div style="position:relative;padding-left:36px;margin-bottom:20px">
+
+    <div style="position:relative;margin-bottom:14px">
+      <div style="position:absolute;left:-36px;width:22px;height:22px;border-radius:50%;background:#0e1f33;color:#7BB8F5;font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center;border:1px solid #7BB8F5">1</div>
+      <div style="font-size:13px;font-weight:600;color:#deded8">BTC H2 Chart öffnen</div>
+      <div style="font-size:12px;color:#888;margin-top:2px">Tab: <code style="background:#1a1a1d;padding:1px 5px;border-radius:3px">BITGET:BTCUSDT.P</code> → Zeitrahmen <strong>2h</strong> wählen</div>
+    </div>
+
+    <div style="position:relative;margin-bottom:14px">
+      <div style="position:absolute;left:-36px;width:22px;height:22px;border-radius:50%;background:#0e1f33;color:#7BB8F5;font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center;border:1px solid #7BB8F5">2</div>
+      <div style="font-size:13px;font-weight:600;color:#deded8">DOMINUS Impuls laden</div>
+      <div style="font-size:12px;color:#888;margin-top:2px">„Indikatoren" → DOMINUS Impuls suchen &amp; hinzufügen. Der Indikator zeigt eine Linie die <strong style="color:#5EC45E">grün</strong> (positiv) oder <strong style="color:#F07070">rot</strong> (negativ) ist — mit Extremzonen-Bändern oben/unten.</div>
+    </div>
+
+    <div style="position:relative;margin-bottom:14px">
+      <div style="position:absolute;left:-36px;width:22px;height:22px;border-radius:50%;background:#162a16;color:#5EC45E;font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center;border:1px solid #5EC45E">3</div>
+      <div style="font-size:13px;font-weight:600;color:#deded8">Zonenwerte ✓ — bereits bekannt</div>
+      <div style="font-size:12px;color:#888;margin-top:2px">Aus den Indikator-Einstellungen (Stil-Tab) bestätigt:<br>
+        <span style="display:inline-flex;gap:12px;margin-top:6px;flex-wrap:wrap">
+          <span style="background:#2e1616;padding:4px 10px;border-radius:4px;font-family:monospace;font-size:12px;color:#F07070">Überkauft = <strong>+10</strong></span>
+          <span style="background:#162a16;padding:4px 10px;border-radius:4px;font-family:monospace;font-size:12px;color:#5EC45E">Überverkauft = <strong>−10</strong></span>
+          <span style="background:#2e1616;padding:4px 10px;border-radius:4px;font-family:monospace;font-size:12px;color:#F07070">Oberes Band = <strong>+14</strong></span>
+          <span style="background:#162a16;padding:4px 10px;border-radius:4px;font-family:monospace;font-size:12px;color:#5EC45E">Unteres Band = <strong>−14</strong></span>
+        </span><br>
+        <span style="color:#666;font-size:11px;margin-top:4px;display:block">Gleich für BTC und Total2 — kein manuelles Ablesen nötig.</span>
+      </div>
+    </div>
+
+    <div style="position:relative;margin-bottom:4px">
+      <div style="position:absolute;left:-36px;width:22px;height:22px;border-radius:50%;background:#0e1f33;color:#7BB8F5;font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center;border:1px solid #7BB8F5">4</div>
+      <div style="font-size:13px;font-weight:600;color:#deded8">4 Alarme anlegen</div>
+      <div style="font-size:12px;color:#888;margin-top:2px">Alarm-Button oben (<strong>Alt+A</strong>) → jeweils neuen Alarm erstellen</div>
+    </div>
+  </div>
+
+  <!-- ALARM A -->
+  <div style="border:1px solid rgba(94,196,94,0.3);border-radius:8px;padding:14px;margin-bottom:12px">
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
+      <span style="background:#162a16;color:#5EC45E;font-size:11px;font-weight:700;padding:2px 8px;border-radius:4px">ALARM A</span>
+      <span style="color:#5EC45E;font-size:13px;font-weight:600">BTC wird Grün — Richtungswechsel zu Bullish</span>
+    </div>
+    <div class="field-label" style="margin-bottom:6px"><span>Alarm-Name</span>
+      <button class="copy-btn" onclick="copyText('📡 BTC Impuls → Grün',this)">Kopieren</button>
+    </div>
+    <div class="field-value" style="margin-bottom:10px">📡 BTC Impuls → Grün</div>
+    <div class="field-label" style="margin-bottom:6px"><span>Bedingung (TradingView Alarm-Dialog)</span></div>
+    <div class="cond-block" style="margin-bottom:8px">
+      <div class="cond-row">
+        <span class="cond-num" style="background:#162a16;color:#5EC45E">1</span>
+        <div>
+          <div class="cond-text"><strong>DOMINUS Impuls</strong> &rarr; <strong>Main</strong> &rarr; <strong style="color:#5EC45E">Kreuzt nach oben</strong> &rarr; Wert: <strong>0</strong></div>
+          <div class="cond-detail"><span class="pill p-green">H2</span> Kerzenschluss &middot; Einmal pro Bar &middot; Einzelner Coin</div>
+        </div>
+      </div>
+    </div>
+    <div style="font-size:12px;color:#777;margin-bottom:8px">↳ Feuert wenn DOMINUS Impuls von negativ (rot) nach positiv (grün) wechselt — also Nulllinie von unten nach oben kreuzt.</div>
+    <div class="field-label" style="margin-bottom:4px"><span>Webhook Message</span>
+      <button class="copy-btn" onclick="copyField('btc-dir-long',this)">Kopieren</button>
+    </div>
+    <div class="field-value mono" id="btc-dir-long">{"symbol":"BTCUSDT","side":"long","signal":"BTC_DIR","timeframe":"{{interval}}"}</div>
+  </div>
+
+  <!-- ALARM B -->
+  <div style="border:1px solid rgba(240,112,112,0.3);border-radius:8px;padding:14px;margin-bottom:12px">
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
+      <span style="background:#2e1616;color:#F07070;font-size:11px;font-weight:700;padding:2px 8px;border-radius:4px">ALARM B</span>
+      <span style="color:#F07070;font-size:13px;font-weight:600">BTC wird Rot — Richtungswechsel zu Bearish</span>
+    </div>
+    <div class="field-label" style="margin-bottom:6px"><span>Alarm-Name</span>
+      <button class="copy-btn" onclick="copyText('📡 BTC Impuls → Rot',this)">Kopieren</button>
+    </div>
+    <div class="field-value" style="margin-bottom:10px">📡 BTC Impuls → Rot</div>
+    <div class="field-label" style="margin-bottom:6px"><span>Bedingung (TradingView Alarm-Dialog)</span></div>
+    <div class="cond-block" style="margin-bottom:8px">
+      <div class="cond-row">
+        <span class="cond-num" style="background:#2e1616;color:#F07070">1</span>
+        <div>
+          <div class="cond-text"><strong>DOMINUS Impuls</strong> &rarr; <strong>Main</strong> &rarr; <strong style="color:#F07070">Kreuzt nach unten</strong> &rarr; Wert: <strong>0</strong></div>
+          <div class="cond-detail"><span class="pill p-red">H2</span> Kerzenschluss &middot; Einmal pro Bar &middot; Einzelner Coin</div>
+        </div>
+      </div>
+    </div>
+    <div style="font-size:12px;color:#777;margin-bottom:8px">↳ Feuert wenn DOMINUS Impuls von positiv (grün) nach negativ (rot) wechselt — Nulllinie von oben nach unten kreuzt.</div>
+    <div class="field-label" style="margin-bottom:4px"><span>Webhook Message</span>
+      <button class="copy-btn" onclick="copyField('btc-dir-short',this)">Kopieren</button>
+    </div>
+    <div class="field-value mono" id="btc-dir-short">{"symbol":"BTCUSDT","side":"short","signal":"BTC_DIR","timeframe":"{{interval}}"}</div>
+  </div>
+
+  <!-- ALARM C -->
+  <div style="border:1px solid rgba(94,196,94,0.2);border-radius:8px;padding:14px;margin-bottom:12px;background:rgba(94,196,94,0.03)">
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
+      <span style="background:#0d2820;color:#4ECBA0;font-size:11px;font-weight:700;padding:2px 8px;border-radius:4px">ALARM C</span>
+      <span style="color:#4ECBA0;font-size:13px;font-weight:600">BTC Überverkauft — Long Premium Zone (<span style="font-family:monospace">−10</span>)</span>
+    </div>
+    <div style="background:#0d2820;border-radius:6px;padding:8px 10px;margin-bottom:10px;font-size:12px;color:#4ECBA0">
+      💡 BTC Impuls taucht unter −10 → <strong>Long Premium Bestätigung</strong>. Stärkstes Long-Signal laut DOMINUS-Strategie wenn gleichzeitig grüne Richtung.
+    </div>
+    <div class="field-label" style="margin-bottom:6px"><span>Alarm-Name</span>
+      <button class="copy-btn" onclick="copyText('📡 BTC Oversold −10',this)">Kopieren</button>
+    </div>
+    <div class="field-value" style="margin-bottom:10px">📡 BTC Oversold −10</div>
+    <div class="field-label" style="margin-bottom:6px"><span>Bedingung (TradingView Alarm-Dialog)</span></div>
+    <div class="cond-block" style="margin-bottom:8px">
+      <div class="cond-row">
+        <span class="cond-num" style="background:#0d2820;color:#4ECBA0">1</span>
+        <div>
+          <div class="cond-text"><strong>DOMINUS Impuls</strong> &rarr; <strong>Main</strong> &rarr; <strong style="color:#4ECBA0">Kreuzt nach unten</strong> &rarr; Wert: <strong style="color:#5EC45E;font-size:15px">−10</strong></div>
+          <div class="cond-detail"><span class="pill p-green">H2</span> Kerzenschluss &middot; Einmal pro Bar &middot; Einzelner Coin</div>
+        </div>
+      </div>
+    </div>
+    <div style="font-size:12px;color:#777;margin-bottom:8px">↳ Feuert wenn Main-Linie die Überverkauft-Grenze (−10) von oben nach unten kreuzt = Eintritt in Long Premium Zone.</div>
+    <div class="field-label" style="margin-bottom:4px"><span>Webhook Message</span>
+      <button class="copy-btn" onclick="copyField('btc-oversold',this)">Kopieren</button>
+    </div>
+    <div class="field-value mono" id="btc-oversold">{"symbol":"BTCUSDT","side":"long","signal":"BTC_DIR","zone":"oversold","timeframe":"{{interval}}"}</div>
+  </div>
+
+  <!-- ALARM D -->
+  <div style="border:1px solid rgba(240,112,112,0.2);border-radius:8px;padding:14px;margin-bottom:16px;background:rgba(240,112,112,0.03)">
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
+      <span style="background:#2e1616;color:#F07070;font-size:11px;font-weight:700;padding:2px 8px;border-radius:4px">ALARM D</span>
+      <span style="color:#F07070;font-size:13px;font-weight:600">BTC Überkauft — Short Premium Zone (<span style="font-family:monospace">+10</span>)</span>
+    </div>
+    <div style="background:#2e1616;border-radius:6px;padding:8px 10px;margin-bottom:10px;font-size:12px;color:#F07070">
+      💡 BTC Impuls steigt über +10 → <strong>Short Premium Bestätigung</strong>. Stärkstes Short-Signal laut DOMINUS-Strategie wenn gleichzeitig rote Richtung.
+    </div>
+    <div class="field-label" style="margin-bottom:6px"><span>Alarm-Name</span>
+      <button class="copy-btn" onclick="copyText('📡 BTC Overbought +10',this)">Kopieren</button>
+    </div>
+    <div class="field-value" style="margin-bottom:10px">📡 BTC Overbought +10</div>
+    <div class="field-label" style="margin-bottom:6px"><span>Bedingung (TradingView Alarm-Dialog)</span></div>
+    <div class="cond-block" style="margin-bottom:8px">
+      <div class="cond-row">
+        <span class="cond-num" style="background:#2e1616;color:#F07070">1</span>
+        <div>
+          <div class="cond-text"><strong>DOMINUS Impuls</strong> &rarr; <strong>Main</strong> &rarr; <strong style="color:#F07070">Kreuzt nach oben</strong> &rarr; Wert: <strong style="color:#F07070;font-size:15px">+10</strong></div>
+          <div class="cond-detail"><span class="pill p-red">H2</span> Kerzenschluss &middot; Einmal pro Bar &middot; Einzelner Coin</div>
+        </div>
+      </div>
+    </div>
+    <div style="font-size:12px;color:#777;margin-bottom:8px">↳ Feuert wenn Main-Linie die Überkauft-Grenze (+10) von unten nach oben kreuzt = Eintritt in Short Premium Zone.</div>
+    <div class="field-label" style="margin-bottom:4px"><span>Webhook Message</span>
+      <button class="copy-btn" onclick="copyField('btc-overbought',this)">Kopieren</button>
+    </div>
+    <div class="field-value mono" id="btc-overbought">{"symbol":"BTCUSDT","side":"short","signal":"BTC_DIR","zone":"overbought","timeframe":"{{interval}}"}</div>
+  </div>
+
+  <!-- ZUSAMMENFASSUNG ALARM-EINSTELLUNGEN -->
+  <div class="field">
+    <div class="field-label"><span>Einstellungen — gleich für alle 4 Alarme</span></div>
+  </div>
+  <div class="notif-row">
+    <div class="notif-card"><div class="notif-label">Benachrichtigung</div><div class="notif-val">App (kein Ton nötig)</div></div>
+    <div class="notif-card"><div class="notif-label">Ausl&ouml;sung</div><div class="notif-val">Einmal pro Bar</div></div>
+    <div class="notif-card"><div class="notif-label">Ablauf</div><div class="notif-val">Unbefristet</div></div>
+    <div class="notif-card"><div class="notif-label">Typ</div><div class="notif-val">Einzelner Coin</div></div>
+    <div class="notif-card"><div class="notif-label">Webhook-URL</div><div class="notif-val">Railway URL + Token</div></div>
+  </div>
+
+  <div class="success" style="margin-top:12px">
+    <strong>Railway reagiert automatisch auf alle 4 Alarme:</strong><br>
+    🔴 BTC wird Rot → Telegram-Warnung für alle offenen Long-Positionen<br>
+    🟢 BTC wird Grün → Telegram-Info (kein Handlungsbedarf bei Longs)<br>
+    📉 BTC Overbought → Warnung: Short-Umfeld verschlechtert sich<br>
+    📈 BTC Oversold → Info: Long-Umfeld verbessert sich<br>
+    <code>/berechnen</code> zeigt danach: <strong>🔴 BTC: SHORT</strong> oder <strong>🟢 BTC: LONG</strong>
+  </div>
+</div>
+
+<!-- ALARM 5b: TOTAL2 -->
+<div class="card" id="sec-alarm5b" style="border-left:3px solid #7BB8F5">
+  <div class="card-head">
+    <div class="step-badge" style="background:#0e1f33;color:#7BB8F5">5b</div>
+    <div>
+      <div class="h2">Total2 Makro-Kontext &mdash; DOMINUS Impuls <span class="upd-badge">NEU</span></div>
+      <div class="sub">4 Alarme auf CRYPTOCAP:TOTAL2 H2 Chart &middot; identisch wie Alarm 5 aber für Altcoin-Markt</div>
+    </div>
+  </div>
+
+  <div style="background:#0e1f33;border-radius:8px;padding:12px 16px;margin-bottom:16px;font-size:12px;color:#888;line-height:1.6">
+    <strong style="color:#7BB8F5">Setup identisch wie Alarm 5</strong> — aber auf dem <code style="background:#1a1a1d;padding:1px 5px;border-radius:3px">CRYPTOCAP:TOTAL2</code> H2 Chart.<br>
+    DOMINUS Impuls dort laden → gleiche 4 Alarm-Bedingungen → nur JSON-Signal ändern: <code>BTC_DIR</code> → <code>T2_DIR</code>
+  </div>
+
+  <!-- ALARM A Total2 -->
+  <div style="border:1px solid rgba(94,196,94,0.3);border-radius:8px;padding:14px;margin-bottom:12px">
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
+      <span style="background:#162a16;color:#5EC45E;font-size:11px;font-weight:700;padding:2px 8px;border-radius:4px">ALARM A</span>
+      <span style="color:#5EC45E;font-size:13px;font-weight:600">Total2 wird Grün — Richtungswechsel zu Bullish</span>
+    </div>
+    <div class="field-label" style="margin-bottom:6px"><span>Alarm-Name</span>
+      <button class="copy-btn" onclick="copyText('📡 Total2 Impuls → Grün',this)">Kopieren</button>
+    </div>
+    <div class="field-value" style="margin-bottom:10px">📡 Total2 Impuls → Grün</div>
+    <div class="cond-block" style="margin-bottom:8px">
+      <div class="cond-row">
+        <span class="cond-num" style="background:#162a16;color:#5EC45E">1</span>
+        <div>
+          <div class="cond-text"><strong>DOMINUS Impuls</strong> &rarr; <strong>Main</strong> &rarr; <strong style="color:#5EC45E">Kreuzt nach oben</strong> &rarr; Wert: <strong>0</strong></div>
+          <div class="cond-detail"><span class="pill p-green">H2</span> Kerzenschluss &middot; Einmal pro Bar &middot; Einzelner Coin</div>
+        </div>
+      </div>
+    </div>
+    <div class="field-label" style="margin-bottom:4px"><span>Webhook Message</span>
+      <button class="copy-btn" onclick="copyField('t2-dir-long',this)">Kopieren</button>
+    </div>
+    <div class="field-value mono" id="t2-dir-long">{"symbol":"TOTAL2","side":"long","signal":"T2_DIR","timeframe":"{{interval}}"}</div>
+  </div>
+
+  <!-- ALARM B Total2 -->
+  <div style="border:1px solid rgba(240,112,112,0.3);border-radius:8px;padding:14px;margin-bottom:12px">
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
+      <span style="background:#2e1616;color:#F07070;font-size:11px;font-weight:700;padding:2px 8px;border-radius:4px">ALARM B</span>
+      <span style="color:#F07070;font-size:13px;font-weight:600">Total2 wird Rot — Richtungswechsel zu Bearish</span>
+    </div>
+    <div class="field-label" style="margin-bottom:6px"><span>Alarm-Name</span>
+      <button class="copy-btn" onclick="copyText('📡 Total2 Impuls → Rot',this)">Kopieren</button>
+    </div>
+    <div class="field-value" style="margin-bottom:10px">📡 Total2 Impuls → Rot</div>
+    <div class="cond-block" style="margin-bottom:8px">
+      <div class="cond-row">
+        <span class="cond-num" style="background:#2e1616;color:#F07070">1</span>
+        <div>
+          <div class="cond-text"><strong>DOMINUS Impuls</strong> &rarr; <strong>Main</strong> &rarr; <strong style="color:#F07070">Kreuzt nach unten</strong> &rarr; Wert: <strong>0</strong></div>
+          <div class="cond-detail"><span class="pill p-red">H2</span> Kerzenschluss &middot; Einmal pro Bar &middot; Einzelner Coin</div>
+        </div>
+      </div>
+    </div>
+    <div class="field-label" style="margin-bottom:4px"><span>Webhook Message</span>
+      <button class="copy-btn" onclick="copyField('t2-dir-short',this)">Kopieren</button>
+    </div>
+    <div class="field-value mono" id="t2-dir-short">{"symbol":"TOTAL2","side":"short","signal":"T2_DIR","timeframe":"{{interval}}"}</div>
+  </div>
+
+  <!-- ALARM C Total2 -->
+  <div style="border:1px solid rgba(94,196,94,0.2);border-radius:8px;padding:14px;margin-bottom:12px;background:rgba(94,196,94,0.03)">
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
+      <span style="background:#0d2820;color:#4ECBA0;font-size:11px;font-weight:700;padding:2px 8px;border-radius:4px">ALARM C</span>
+      <span style="color:#4ECBA0;font-size:13px;font-weight:600">Total2 Überverkauft — Long Premium Zone (<span style="font-family:monospace">−10</span>)</span>
+    </div>
+    <div style="background:#0d2820;border-radius:6px;padding:8px 10px;margin-bottom:10px;font-size:12px;color:#4ECBA0">
+      💡 Total2 Impuls taucht unter −10 → <strong>Long Premium Bestätigung für Altcoins</strong>. Gleicher Schwellwert wie BTC.
+    </div>
+    <div class="field-label" style="margin-bottom:6px"><span>Alarm-Name</span>
+      <button class="copy-btn" onclick="copyText('📡 Total2 Oversold −10',this)">Kopieren</button>
+    </div>
+    <div class="field-value" style="margin-bottom:10px">📡 Total2 Oversold −10</div>
+    <div class="cond-block" style="margin-bottom:8px">
+      <div class="cond-row">
+        <span class="cond-num" style="background:#0d2820;color:#4ECBA0">1</span>
+        <div>
+          <div class="cond-text"><strong>DOMINUS Impuls</strong> &rarr; <strong>Main</strong> &rarr; <strong style="color:#4ECBA0">Kreuzt nach unten</strong> &rarr; Wert: <strong style="color:#5EC45E;font-size:15px">−10</strong></div>
+          <div class="cond-detail"><span class="pill p-green">H2</span> Kerzenschluss &middot; Einmal pro Bar &middot; Einzelner Coin</div>
+        </div>
+      </div>
+    </div>
+    <div class="field-label" style="margin-bottom:4px"><span>Webhook Message</span>
+      <button class="copy-btn" onclick="copyField('t2-oversold',this)">Kopieren</button>
+    </div>
+    <div class="field-value mono" id="t2-oversold">{"symbol":"TOTAL2","side":"long","signal":"T2_DIR","zone":"oversold","timeframe":"{{interval}}"}</div>
+  </div>
+
+  <!-- ALARM D Total2 -->
+  <div style="border:1px solid rgba(240,112,112,0.2);border-radius:8px;padding:14px;margin-bottom:16px;background:rgba(240,112,112,0.03)">
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
+      <span style="background:#2e1616;color:#F07070;font-size:11px;font-weight:700;padding:2px 8px;border-radius:4px">ALARM D</span>
+      <span style="color:#F07070;font-size:13px;font-weight:600">Total2 Überkauft — Short Premium Zone (<span style="font-family:monospace">+10</span>)</span>
+    </div>
+    <div style="background:#2e1616;border-radius:6px;padding:8px 10px;margin-bottom:10px;font-size:12px;color:#F07070">
+      💡 Total2 Impuls steigt über +10 → <strong>Short Premium Bestätigung für Altcoins</strong>. Gleicher Schwellwert wie BTC.
+    </div>
+    <div class="field-label" style="margin-bottom:6px"><span>Alarm-Name</span>
+      <button class="copy-btn" onclick="copyText('📡 Total2 Overbought +10',this)">Kopieren</button>
+    </div>
+    <div class="field-value" style="margin-bottom:10px">📡 Total2 Overbought +10</div>
+    <div class="cond-block" style="margin-bottom:8px">
+      <div class="cond-row">
+        <span class="cond-num" style="background:#2e1616;color:#F07070">1</span>
+        <div>
+          <div class="cond-text"><strong>DOMINUS Impuls</strong> &rarr; <strong>Main</strong> &rarr; <strong style="color:#F07070">Kreuzt nach oben</strong> &rarr; Wert: <strong style="color:#F07070;font-size:15px">+10</strong></div>
+          <div class="cond-detail"><span class="pill p-red">H2</span> Kerzenschluss &middot; Einmal pro Bar &middot; Einzelner Coin</div>
+        </div>
+      </div>
+    </div>
+    <div class="field-label" style="margin-bottom:4px"><span>Webhook Message</span>
+      <button class="copy-btn" onclick="copyField('t2-overbought',this)">Kopieren</button>
+    </div>
+    <div class="field-value mono" id="t2-overbought">{"symbol":"TOTAL2","side":"short","signal":"T2_DIR","zone":"overbought","timeframe":"{{interval}}"}</div>
+  </div>
+
+  <div class="notif-row">
+    <div class="notif-card"><div class="notif-label">Benachrichtigung</div><div class="notif-val">App (kein Ton nötig)</div></div>
+    <div class="notif-card"><div class="notif-label">Ausl&ouml;sung</div><div class="notif-val">Einmal pro Bar</div></div>
+    <div class="notif-card"><div class="notif-label">Ablauf</div><div class="notif-val">Unbefristet</div></div>
+    <div class="notif-card"><div class="notif-label">Typ</div><div class="notif-val">Einzelner Coin</div></div>
+  </div>
+
+  <div class="hint" style="margin-top:12px">
+    <strong>Total 8 Alarme</strong> (4× BTC + 4× Total2) auf je einem separaten H2 Chart. Jeder Alarm hat seine eigene Webhook-Message — Railway unterscheidet via <code>signal</code>-Feld (<code>BTC_DIR</code> vs. <code>T2_DIR</code>) und <code>zone</code>-Feld (<code>oversold</code> / <code>overbought</code>).
+  </div>
+</div>
+
+<!-- ALARM 2: H2 LONG ENTRY -->
+<div class="card" id="sec-alarm2">
+  <div class="card-head">
+    <div class="step-badge" style="background:#162a16;color:#5EC45E">2</div>
+    <div>
+      <div class="h2">H2 Long Entry &mdash; DOM-ORC <span class="upd-badge">AKTUALISIERT</span></div>
+      <div class="sub">Feuert bei jedem g&uuml;ltigen H2-Long-Entry &mdash; HARSI, BTC/Total2 &amp; Premium im JSON</div>
+    </div>
+  </div>
+  <div class="field">
+    <div class="field-label"><span>Alarm-Name</span>
+      <button class="copy-btn" onclick="copyText('&#x1F7E2; DOMINUS Long Entry',this)">Kopieren</button>
+    </div>
+    <div class="field-value">&#x1F7E2; DOMINUS Long Entry</div>
+  </div>
+  <div class="field">
+    <div class="field-label"><span>Bedingung</span></div>
+    <div class="cond-block">
+      <div class="cond-row">
+        <span class="cond-num">1</span>
+        <div>
+          <div class="cond-text">DOMINUS Orchestrator &rarr; <strong>DOMINUS Long</strong></div>
+          <div class="cond-detail"><span class="pill p-green">H2</span> Kerzenschluss &middot; Einmal pro Bar &middot; Einzelner Coin</div>
+        </div>
+      </div>
+    </div>
+    <div class="hint"><strong>Manuell aktivieren</strong> auf H2-Chart nach H4-Trigger-Best&auml;tigung. Alarm feuert unabh&auml;ngig von HARSI &mdash; HARSI-Status im JSON erkennbar.</div>
+  </div>
+  <div class="sep-label">Webhook Message (JSON)</div>
+  <div class="field" style="margin-top:8px">
+    <div class="field-label"><span>Message-Feld in TradingView</span>
+      <button class="copy-btn" onclick="copyField('h2-long',this)">Kopieren</button>
+    </div>
+    <div class="field-value mono" id="h2-long">{"symbol":"{{ticker}}","side":"long","entry":{{close}},"timeframe":"{{interval}}","signal":"H2_SIGNAL","premium":{{plot("Premium Long")}},"harsi_warn":{{plot("Long HARSI Warnung")}},"btc_t2_warn":{{plot("Long BTC/Total2 Warn")}}}</div>
+  </div>
+  <div class="success">
+    <strong>harsi_warn: 0</strong> = HARSI OK &rarr; ✅ sofort einsteigen<br>
+    <strong>harsi_warn: 1</strong> = HARSI in Extremzone &rarr; ⚠️ Alarm 3 erstellen, 30-Min-Timer starten<br>
+    <strong>btc_t2_warn: 0</strong> = BTC + Total2 gleiche Richtung &rarr; ✅<br>
+    <strong>btc_t2_warn: 1</strong> = BTC/Total2 Abweichung &rarr; ⚠️ kein Trade<br>
+    <strong>premium: 1</strong> = Impuls im Premium-Bereich &rarr; ⭐ Qualit&auml;ts-Setup
+  </div>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px">
+    <div style="background:#0d1a0d;border:1px solid #2a4a2a;border-radius:8px;padding:8px 10px;font-size:12px">
+      <div style="color:#5EC45E;font-weight:600;margin-bottom:3px">&#x23F1; harsi_warn: 0 — Einstiegs-Timer</div>
+      <div style="color:#888;line-height:1.5">BTC &amp; Total2 manuell pr&uuml;fen &rarr; <code>/trade</code> ausf&uuml;hren<br><strong style="color:#E09040">Max. 30 Min ab Signal!</strong></div>
+    </div>
+    <div style="background:#1a1200;border:1px solid #4a3a00;border-radius:8px;padding:8px 10px;font-size:12px">
+      <div style="color:#E09040;font-weight:600;margin-bottom:3px">&#x23F1; harsi_warn: 1 — HARSI-Exit-Timer</div>
+      <div style="color:#888;line-height:1.5">Alarm 3 erstellen &rarr; 30-Min-Timer stellen<br><strong style="color:#F07070">Kein Exit in 30 Min = Setup &uuml;berspringen!</strong></div>
+    </div>
+  </div>
+  <div class="hint" style="margin-top:8px"><strong>Watchlist-Alarm:</strong> <code>{{plot(...)}}</code> wird in Watchlist-Alarmen von TradingView <strong>nicht aufgel&ouml;st</strong>. Railway ersetzt nicht aufgel&ouml;ste Werte automatisch mit <code>0</code> &mdash; premium/harsi_warn/btc_t2_warn zeigen dann immer 0. F&uuml;r vollst&auml;ndige Daten: Alarm als <strong>Einzelner Coin / Technisch</strong> auf dem H2-Chart anlegen (nicht Watchlist).</div>
+  <div class="notif-row">
+    <div class="notif-card"><div class="notif-label">Benachrichtigung</div><div class="notif-val">App + Ton</div></div>
+    <div class="notif-card"><div class="notif-label">Ausl&ouml;sung</div><div class="notif-val">Einmal pro Bar</div></div>
+    <div class="notif-card"><div class="notif-label">Ablauf</div><div class="notif-val">Unbefristet</div></div>
+    <div class="notif-card"><div class="notif-label">Typ</div><div class="notif-val">Technisch</div></div>
+  </div>
+</div>
+
+<!-- ALARM 2b: H2 SHORT ENTRY -->
+<div class="card" id="sec-alarm2b">
+  <div class="card-head">
+    <div class="step-badge" style="background:#2e1616;color:#F07070">2b</div>
+    <div>
+      <div class="h2">H2 Short Entry &mdash; DOM-ORC <span class="upd-badge">AKTUALISIERT</span></div>
+      <div class="sub">Feuert bei jedem g&uuml;ltigen H2-Short-Entry &mdash; HARSI, BTC/Total2 &amp; Premium im JSON</div>
+    </div>
+  </div>
+  <div class="field">
+    <div class="field-label"><span>Alarm-Name</span>
+      <button class="copy-btn" onclick="copyText('&#x1F534; DOMINUS Short Entry',this)">Kopieren</button>
+    </div>
+    <div class="field-value">&#x1F534; DOMINUS Short Entry</div>
+  </div>
+  <div class="field">
+    <div class="field-label"><span>Bedingung</span></div>
+    <div class="cond-block">
+      <div class="cond-row">
+        <span class="cond-num">1</span>
+        <div>
+          <div class="cond-text">DOMINUS Orchestrator &rarr; <strong>DOMINUS Short</strong></div>
+          <div class="cond-detail"><span class="pill p-red">H2</span> Kerzenschluss &middot; Einmal pro Bar &middot; Einzelner Coin</div>
+        </div>
+      </div>
+    </div>
+    <div class="hint"><strong>Manuell aktivieren</strong> auf H2-Chart nach H4-Trigger-Best&auml;tigung.</div>
+  </div>
+  <div class="sep-label">Webhook Message (JSON)</div>
+  <div class="field" style="margin-top:8px">
+    <div class="field-label"><span>Message-Feld in TradingView</span>
+      <button class="copy-btn" onclick="copyField('h2-short',this)">Kopieren</button>
+    </div>
+    <div class="field-value mono" id="h2-short">{"symbol":"{{ticker}}","side":"short","entry":{{close}},"timeframe":"{{interval}}","signal":"H2_SIGNAL","premium":{{plot("Premium Short")}},"harsi_warn":{{plot("Short HARSI Warnung")}},"btc_t2_warn":{{plot("Short BTC/Total2 Warn")}}}</div>
+  </div>
+  <div class="success">
+    <strong>harsi_warn: 0</strong> = HARSI OK &rarr; ✅ sofort einsteigen<br>
+    <strong>harsi_warn: 1</strong> = HARSI in Extremzone &rarr; ⚠️ Alarm 3b erstellen, 30-Min-Timer starten<br>
+    <strong>btc_t2_warn: 0</strong> = BTC + Total2 gleiche Richtung &rarr; ✅<br>
+    <strong>btc_t2_warn: 1</strong> = BTC/Total2 Abweichung &rarr; ⚠️ kein Trade<br>
+    <strong>premium: 1</strong> = Impuls im Premium-Bereich &rarr; ⭐ Qualit&auml;ts-Setup
+  </div>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px">
+    <div style="background:#0d1a0d;border:1px solid #2a4a2a;border-radius:8px;padding:8px 10px;font-size:12px">
+      <div style="color:#5EC45E;font-weight:600;margin-bottom:3px">&#x23F1; harsi_warn: 0 — Einstiegs-Timer</div>
+      <div style="color:#888;line-height:1.5">BTC &amp; Total2 manuell pr&uuml;fen &rarr; <code>/trade</code> ausf&uuml;hren<br><strong style="color:#E09040">Max. 30 Min ab Signal!</strong></div>
+    </div>
+    <div style="background:#1a1200;border:1px solid #4a3a00;border-radius:8px;padding:8px 10px;font-size:12px">
+      <div style="color:#E09040;font-weight:600;margin-bottom:3px">&#x23F1; harsi_warn: 1 — HARSI-Exit-Timer</div>
+      <div style="color:#888;line-height:1.5">Alarm 3b erstellen &rarr; 30-Min-Timer stellen<br><strong style="color:#F07070">Kein Exit in 30 Min = Setup &uuml;berspringen!</strong></div>
+    </div>
+  </div>
+  <div class="hint" style="margin-top:8px"><strong>Watchlist-Alarm:</strong> <code>{{plot(...)}}</code> wird in Watchlist-Alarmen von TradingView <strong>nicht aufgel&ouml;st</strong>. Railway ersetzt nicht aufgel&ouml;ste Werte automatisch mit <code>0</code> &mdash; premium/harsi_warn/btc_t2_warn zeigen dann immer 0. F&uuml;r vollst&auml;ndige Daten: Alarm als <strong>Einzelner Coin / Technisch</strong> auf dem H2-Chart anlegen (nicht Watchlist).</div>
+  <div class="notif-row">
+    <div class="notif-card"><div class="notif-label">Benachrichtigung</div><div class="notif-val">App + Ton</div></div>
+    <div class="notif-card"><div class="notif-label">Ausl&ouml;sung</div><div class="notif-val">Einmal pro Bar</div></div>
+    <div class="notif-card"><div class="notif-label">Ablauf</div><div class="notif-val">Unbefristet</div></div>
+    <div class="notif-card"><div class="notif-label">Typ</div><div class="notif-val">Technisch</div></div>
+  </div>
+</div>
+
+<!-- ALARM 3: HARSI EXIT LONG -->
+<div class="card" id="sec-alarm3">
+  <div class="card-head">
+    <div class="step-badge" style="background:#0d2820;color:#4ECBA0">3</div>
+    <div>
+      <div class="h2">HARSI Exit Long <span class="new-badge">NEU</span></div>
+      <div class="sub">Feuert wenn HARSI Extremzone verl&auml;sst &mdash; jetzt Long einsteigen</div>
+    </div>
+  </div>
+  <div class="field">
+    <div class="field-label"><span>Alarm-Name</span>
+      <button class="copy-btn" onclick="copyText('&#x23F0; DOMINUS Long HARSI frei',this)">Kopieren</button>
+    </div>
+    <div class="field-value">&#x23F0; DOMINUS Long HARSI frei</div>
+  </div>
+  <div class="field">
+    <div class="field-label"><span>Bedingung</span></div>
+    <div class="cond-block">
+      <div class="cond-row">
+        <span class="cond-num">1</span>
+        <div>
+          <div class="cond-text">DOMINUS Orchestrator &rarr; <strong>DOMINUS Long HARSI frei</strong></div>
+          <div class="cond-detail"><span class="pill p-teal">H2</span> Kerzenschluss &middot; Einmal pro Bar &middot; Einzelner Coin</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="danger" style="margin-top:8px">
+      <strong>&#x23F1; 30-Minuten-Zeitfenster — strikt einhalten!</strong><br>
+      Alarm 3 nur erstellen wenn du den 30-Min-Timer sofort startest. Wenn der Alarm <strong>nach Ablauf der 30 Minuten</strong> feuert &rarr; <strong>nicht einsteigen</strong>, Signal ist abgelaufen.<br>
+      Railway gibt automatisch eine Warnung aus wenn das HARSI_EXIT-Signal sp&auml;ter als 30 Min nach dem urspr&uuml;nglichen H2-Signal eintrifft.
+    </div>
+    <div class="warn" style="margin-top:6px">
+      <strong>Wann erstellen:</strong> Sofort nachdem <a href="#sec-alarm2" style="color:#E09040;font-weight:500">Alarm 2</a> mit <code>harsi_warn: 1</code> feuert &rarr; H2-Chart des betroffenen Coins &ouml;ffnen &rarr; Alarm 3 erstellen &rarr; 30-Min-Timer starten.<br>
+      <strong>Nicht dauerhaft voranlegen</strong> &mdash; gilt nur f&uuml;r den einen aktuell signalisierten Coin.<br>
+      Alarm nach 30 Min l&ouml;schen wenn er noch nicht gefeuert hat.
+    </div>
+    <div class="info" style="margin-top:6px">F&uuml;r SL-Anpassung bei offenem Trade: <a href="#sec-alarm4" style="color:#7BB8F5;font-weight:500">Alarm 4 / 4b (HARSI_SL)</a> verwenden.</div>
+  </div>
+  <div class="sep-label">Webhook Message (JSON)</div>
+  <div class="field" style="margin-top:8px">
+    <div class="field-label"><span>Message-Feld in TradingView</span>
+      <button class="copy-btn" onclick="copyField('harsi-exit-long',this)">Kopieren</button>
+    </div>
+    <div class="field-value mono" id="harsi-exit-long">{"symbol":"{{ticker}}","side":"long","entry":{{close}},"timeframe":"{{interval}}","signal":"HARSI_EXIT"}</div>
+  </div>
+  <div class="notif-row">
+    <div class="notif-card"><div class="notif-label">Benachrichtigung</div><div class="notif-val">App + Ton</div></div>
+    <div class="notif-card"><div class="notif-label">Ausl&ouml;sung</div><div class="notif-val">Einmal pro Bar</div></div>
+    <div class="notif-card"><div class="notif-label">Ablauf</div><div class="notif-val">Unbefristet</div></div>
+    <div class="notif-card"><div class="notif-label">Typ</div><div class="notif-val">Technisch</div></div>
+  </div>
+</div>
+
+<!-- ALARM 3b: HARSI EXIT SHORT -->
+<div class="card" id="sec-alarm3b">
+  <div class="card-head">
+    <div class="step-badge" style="background:#2e1616;color:#F07070">3b</div>
+    <div>
+      <div class="h2">HARSI Exit Short <span class="new-badge">NEU</span></div>
+      <div class="sub">Feuert wenn HARSI Extremzone verl&auml;sst &mdash; jetzt Short einsteigen</div>
+    </div>
+  </div>
+  <div class="field">
+    <div class="field-label"><span>Alarm-Name</span>
+      <button class="copy-btn" onclick="copyText('&#x23F0; DOMINUS Short HARSI frei',this)">Kopieren</button>
+    </div>
+    <div class="field-value">&#x23F0; DOMINUS Short HARSI frei</div>
+  </div>
+  <div class="field">
+    <div class="field-label"><span>Bedingung</span></div>
+    <div class="cond-block">
+      <div class="cond-row">
+        <span class="cond-num">1</span>
+        <div>
+          <div class="cond-text">DOMINUS Orchestrator &rarr; <strong>DOMINUS Short HARSI frei</strong></div>
+          <div class="cond-detail"><span class="pill p-red">H2</span> Kerzenschluss &middot; Einmal pro Bar &middot; Einzelner Coin</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="danger" style="margin-top:8px">
+      <strong>&#x23F1; 30-Minuten-Zeitfenster — strikt einhalten!</strong><br>
+      Alarm 3b nur erstellen wenn du den 30-Min-Timer sofort startest. Wenn der Alarm <strong>nach Ablauf der 30 Minuten</strong> feuert &rarr; <strong>nicht einsteigen</strong>, Signal ist abgelaufen.<br>
+      Railway gibt automatisch eine Warnung aus wenn das HARSI_EXIT-Signal sp&auml;ter als 30 Min nach dem urspr&uuml;nglichen H2-Signal eintrifft.
+    </div>
+    <div class="warn" style="margin-top:6px">
+      <strong>Wann erstellen:</strong> Sofort nachdem <a href="#sec-alarm2b" style="color:#E09040;font-weight:500">Alarm 2b</a> mit <code>harsi_warn: 1</code> feuert &rarr; H2-Chart des betroffenen Coins &ouml;ffnen &rarr; Alarm 3b erstellen &rarr; 30-Min-Timer starten.<br>
+      <strong>Nicht dauerhaft voranlegen</strong> &mdash; gilt nur f&uuml;r den einen aktuell signalisierten Coin.<br>
+      Alarm nach 30 Min l&ouml;schen wenn er noch nicht gefeuert hat.
+    </div>
+    <div class="info" style="margin-top:6px">F&uuml;r SL-Anpassung bei offenem Trade: <a href="#sec-alarm4b" style="color:#7BB8F5;font-weight:500">Alarm 4 / 4b (HARSI_SL)</a> verwenden.</div>
+  </div>
+  <div class="sep-label">Webhook Message (JSON)</div>
+  <div class="field" style="margin-top:8px">
+    <div class="field-label"><span>Message-Feld in TradingView</span>
+      <button class="copy-btn" onclick="copyField('harsi-exit-short',this)">Kopieren</button>
+    </div>
+    <div class="field-value mono" id="harsi-exit-short">{"symbol":"{{ticker}}","side":"short","entry":{{close}},"timeframe":"{{interval}}","signal":"HARSI_EXIT"}</div>
+  </div>
+  <div class="notif-row">
+    <div class="notif-card"><div class="notif-label">Benachrichtigung</div><div class="notif-val">App + Ton</div></div>
+    <div class="notif-card"><div class="notif-label">Ausl&ouml;sung</div><div class="notif-val">Einmal pro Bar</div></div>
+    <div class="notif-card"><div class="notif-label">Ablauf</div><div class="notif-val">Unbefristet</div></div>
+    <div class="notif-card"><div class="notif-label">Typ</div><div class="notif-val">Technisch</div></div>
+  </div>
+</div>
+
+<!-- ALARM 4: HARSI SL LONG -->
+<div class="card" id="sec-alarm4">
+  <div class="card-head">
+    <div class="step-badge" style="background:#0d2820;color:#4ECBA0">4</div>
+    <div>
+      <div class="h2">HARSI SL &mdash; Long <span class="new-badge">NEU</span></div>
+      <div class="sub">Zieht SL auf HARSI RSI Overlay (Preisniveau) bei offenem Long-Trade</div>
+    </div>
+  </div>
+  <div class="warn" style="margin-bottom:12px">
+    <strong>Unterschied zu Alarm 3 (Einstieg):</strong> Alarm 4 feuert w&auml;hrend eines LAUFENDEN LONG-Trades und passt den Stop-Loss an &mdash; nicht f&uuml;r Einsteigen.
+  </div>
+  <div class="field">
+    <div class="field-label"><span>Alarm-Name</span>
+      <button class="copy-btn" onclick="copyText('&#x1F6E1; DOMINUS HARSI SL Long',this)">Kopieren</button>
+    </div>
+    <div class="field-value">&#x1F6E1; DOMINUS HARSI SL Long</div>
+  </div>
+  <div class="field">
+    <div class="field-label"><span>Bedingung</span></div>
+    <div class="cond-block">
+      <div class="cond-row">
+        <span class="cond-num">1</span>
+        <div>
+          <div class="cond-text">HARSI-Indikator &rarr; <strong>RSI Histogram</strong> &middot; Aufwärts kreuzend &middot; Wert: <code style="background:#252528;padding:1px 4px;border-radius:3px">-20</code></div>
+          <div class="cond-detail"><span class="pill p-teal">H2</span> Kerzenschluss &middot; Einmal pro Bar &middot; Einzelner Coin &middot; JSON: <code style="background:#252528;padding:1px 4px;border-radius:3px">RSI Overlay</code> für den Preis</div>
+        </div>
+      </div>
+    </div>
+    <div class="success" style="margin-top:6px"><strong>Bestätigte Plots (via Platzhalter hinzufügen):</strong> Alarm-Bedingung = <code>RSI Histogram aufwärts kreuzend −20</code> &middot; JSON price = <code>{{plot("RSI Overlay")}}</code> &mdash; Alarm 4 kommt direkt vom HARSI-Indikator, nicht von DOM-ORC.</div>
+  </div>
+  <div class="sep-label">Webhook Message (JSON)</div>
+  <div class="field" style="margin-top:8px">
+    <div class="field-label"><span>Message-Feld in TradingView</span>
+      <button class="copy-btn" onclick="copyField('harsi-sl-long',this)">Kopieren</button>
+    </div>
+    <div class="field-value mono" id="harsi-sl-long">{"symbol":"{{ticker}}","direction":"long","signal":"HARSI_SL","price":{{plot("RSI Overlay")}}}</div>
+  </div>
+  <div class="info"><strong>RSI Overlay</strong> = der HARSI-Wert auf die Preisskala projiziert &mdash; entspricht dem echten Preisniveau der Ausstiegslinie auf dem Chart. <strong>RSI Histogram</strong> wäre falsch (liefert den 0-zentrierten RSI-Wert, nicht den Preis). Der SL wird nur gesetzt wenn der neue Preis schützender (höher) als der aktuelle SL ist.</div>
+  <div style="margin-top:12px">
+    <div style="font-size:11px;color:#666;text-transform:uppercase;letter-spacing:.04em;margin-bottom:6px">Telegram-Benachrichtigung (Vorschau)</div>
+    <div style="background:#0d0d10;border-radius:10px;padding:12px 14px;font-family:'SF Mono','Fira Mono',monospace;font-size:12px;color:#e0e0e0;line-height:1.7">
+      <span style="color:#FF6B6B">&#x1F4C9; Harsi-Ausstiegslinie &mdash; ETHUSDT</span><br>
+      SL &rarr; <b>2920.00 USDT</b>&nbsp; (vorher: 2850.00)<br>
+      &#x2501;&#x2501;&#x2501;&#x2501;&#x2501;&#x2501;&#x2501;&#x2501;&#x2501;&#x2501;<br>
+      &#x1F4E6; Restposition:&nbsp;&nbsp;&nbsp;&nbsp; <b>52.00 Kontrakte</b><br>
+      &#x1F6E1; Min. Gewinn:&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <b>+3640.00 USDT</b><br>
+      &#x26A0;&#xFE0F; Harsi-Momentum dreht &mdash; SL auf Ausstiegslinie gesetzt
+    </div>
+  </div>
+  <div class="notif-row">
+    <div class="notif-card"><div class="notif-label">Benachrichtigung</div><div class="notif-val">App + Ton</div></div>
+    <div class="notif-card"><div class="notif-label">Ausl&ouml;sung</div><div class="notif-val">Einmal pro Bar</div></div>
+    <div class="notif-card"><div class="notif-label">Ablauf</div><div class="notif-val">Unbefristet</div></div>
+    <div class="notif-card"><div class="notif-label">Typ</div><div class="notif-val">Technisch</div></div>
+  </div>
+</div>
+
+<!-- ALARM 4b: HARSI SL SHORT -->
+<div class="card" id="sec-alarm4b">
+  <div class="card-head">
+    <div class="step-badge" style="background:#2e1616;color:#F07070">4b</div>
+    <div>
+      <div class="h2">HARSI SL &mdash; Short <span class="new-badge">NEU</span></div>
+      <div class="sub">Zieht SL auf HARSI RSI Overlay (Preisniveau) bei offenem Short-Trade</div>
+    </div>
+  </div>
+  <div class="warn" style="margin-bottom:12px">
+    <strong>Unterschied zu Alarm 3b (Einstieg):</strong> Alarm 4b feuert w&auml;hrend eines LAUFENDEN SHORT-Trades und passt den Stop-Loss an &mdash; nicht f&uuml;r Einsteigen.
+  </div>
+  <div class="field">
+    <div class="field-label"><span>Alarm-Name</span>
+      <button class="copy-btn" onclick="copyText('&#x1F6E1; DOMINUS HARSI SL Short',this)">Kopieren</button>
+    </div>
+    <div class="field-value">&#x1F6E1; DOMINUS HARSI SL Short</div>
+  </div>
+  <div class="field">
+    <div class="field-label"><span>Bedingung</span></div>
+    <div class="cond-block">
+      <div class="cond-row">
+        <span class="cond-num">1</span>
+        <div>
+          <div class="cond-text">HARSI-Indikator &rarr; <strong>RSI Histogram</strong> &middot; Abwärts kreuzend &middot; Wert: <code style="background:#252528;padding:1px 4px;border-radius:3px">+20</code></div>
+          <div class="cond-detail"><span class="pill p-red">H2</span> Kerzenschluss &middot; Einmal pro Bar &middot; Einzelner Coin &middot; JSON: <code style="background:#252528;padding:1px 4px;border-radius:3px">RSI Overlay</code> für den Preis</div>
+        </div>
+      </div>
+    </div>
+    <div class="success" style="margin-top:6px"><strong>Bestätigte Plots (via Platzhalter hinzufügen):</strong> Alarm-Bedingung = <code>RSI Histogram abwärts kreuzend +20</code> &middot; JSON price = <code>{{plot("RSI Overlay")}}</code> &mdash; Alarm 4b kommt direkt vom HARSI-Indikator, nicht von DOM-ORC.</div>
+  </div>
+  <div class="sep-label">Webhook Message (JSON)</div>
+  <div class="field" style="margin-top:8px">
+    <div class="field-label"><span>Message-Feld in TradingView</span>
+      <button class="copy-btn" onclick="copyField('harsi-sl-short',this)">Kopieren</button>
+    </div>
+    <div class="field-value mono" id="harsi-sl-short">{"symbol":"{{ticker}}","direction":"short","signal":"HARSI_SL","price":{{plot("RSI Overlay")}}}</div>
+  </div>
+  <div class="info"><strong>RSI Overlay</strong> = der HARSI-Wert auf die Preisskala projiziert &mdash; entspricht dem echten Preisniveau der Ausstiegslinie auf dem Chart. <strong>RSI Histogram</strong> wäre falsch (liefert den 0-zentrierten RSI-Wert, nicht den Preis). Der SL wird nur gesetzt wenn der neue Preis schützender (tiefer) als der aktuelle SL ist.</div>
+  <div style="margin-top:12px">
+    <div style="font-size:11px;color:#666;text-transform:uppercase;letter-spacing:.04em;margin-bottom:6px">Telegram-Benachrichtigung (Vorschau)</div>
+    <div style="background:#0d0d10;border-radius:10px;padding:12px 14px;font-family:'SF Mono','Fira Mono',monospace;font-size:12px;color:#e0e0e0;line-height:1.7">
+      <span style="color:#FF6B6B">&#x1F4C9; Harsi-Ausstiegslinie &mdash; ETHUSDT SHORT</span><br>
+      SL &rarr; <b>3080.00 USDT</b>&nbsp; (vorher: 3150.00)<br>
+      &#x2501;&#x2501;&#x2501;&#x2501;&#x2501;&#x2501;&#x2501;&#x2501;&#x2501;&#x2501;<br>
+      &#x1F4E6; Restposition:&nbsp;&nbsp;&nbsp;&nbsp; <b>52.00 Kontrakte</b><br>
+      &#x1F6E1; Min. Gewinn:&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <b>+3640.00 USDT</b><br>
+      &#x26A0;&#xFE0F; Harsi-Momentum dreht &mdash; SL auf Ausstiegslinie gesetzt
+    </div>
+  </div>
+  <div class="notif-row">
+    <div class="notif-card"><div class="notif-label">Benachrichtigung</div><div class="notif-val">App + Ton</div></div>
+    <div class="notif-card"><div class="notif-label">Ausl&ouml;sung</div><div class="notif-val">Einmal pro Bar</div></div>
+    <div class="notif-card"><div class="notif-label">Ablauf</div><div class="notif-val">Unbefristet</div></div>
+    <div class="notif-card"><div class="notif-label">Typ</div><div class="notif-val">Technisch</div></div>
+  </div>
+</div>
+
+<!-- ALARM 5c: BTC RECOVERY -10 -->
+<div class="card" id="sec-alarm5c" style="border-left:3px solid #E09040">
+  <div class="card-head">
+    <div class="step-badge" style="background:#1a1200;color:#E09040">5c</div>
+    <div>
+      <div class="h2">BTC Long Recovery &minus;10 <span class="new-badge">NEU</span></div>
+      <div class="sub">DOMINUS Impuls verlässt Oversold-Zone aufwärts &mdash; Railway setzt btc_dir = "recovering"</div>
+    </div>
+  </div>
+
+  <div style="background:#1a1200;border:1px solid rgba(224,144,64,0.25);border-radius:8px;padding:10px 12px;margin-bottom:12px;font-size:12px;line-height:1.6">
+    <strong style="color:#E09040">&#x23F1; Zweistufige Permission-Logik</strong><br>
+    <span style="color:#888">Dieser Alarm setzt Railway in den <strong style="color:#E09040">recovering</strong>-Zustand. Trades sind nur bei <strong>premium=1</strong> erlaubt.<br>
+    Sobald BTC die Nulllinie bestätigt (&rarr; Alarm 5 "BTC Impuls &rarr; Gr&uuml;n"), wechselt Railway automatisch zu <strong>long</strong> (voll erlaubt).</span>
+  </div>
+
+  <!-- Permission Tabelle -->
+  <div style="overflow-x:auto;margin-bottom:12px">
+    <table style="width:100%;border-collapse:collapse;font-size:12px">
+      <thead>
+        <tr style="background:#252528">
+          <th style="padding:6px 10px;text-align:left;color:#888;font-weight:500;border-bottom:1px solid rgba(255,255,255,0.06)">BTC Zustand</th>
+          <th style="padding:6px 10px;text-align:left;color:#888;font-weight:500;border-bottom:1px solid rgba(255,255,255,0.06)">Total2 Zustand</th>
+          <th style="padding:6px 10px;text-align:left;color:#888;font-weight:500;border-bottom:1px solid rgba(255,255,255,0.06)">Altcoin-Long</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr style="border-bottom:1px solid rgba(255,255,255,0.04)">
+          <td style="padding:6px 10px;color:#5EC45E">🟢 long (&ge;0)</td>
+          <td style="padding:6px 10px;color:#5EC45E">🟢 long (&ge;0)</td>
+          <td style="padding:6px 10px;color:#5EC45E">✅ Alle Setups</td>
+        </tr>
+        <tr style="border-bottom:1px solid rgba(255,255,255,0.04);background:#1a1200">
+          <td style="padding:6px 10px;color:#E09040">🟡 recovering (&minus;10→0)</td>
+          <td style="padding:6px 10px;color:#5EC45E">🟢 long</td>
+          <td style="padding:6px 10px;color:#E09040">🟡 Nur premium=1</td>
+        </tr>
+        <tr style="border-bottom:1px solid rgba(255,255,255,0.04);background:#1a1200">
+          <td style="padding:6px 10px;color:#5EC45E">🟢 long</td>
+          <td style="padding:6px 10px;color:#E09040">🟡 recovering (&minus;10→0)</td>
+          <td style="padding:6px 10px;color:#E09040">🟡 Nur premium=1</td>
+        </tr>
+        <tr style="background:#2e1616">
+          <td style="padding:6px 10px;color:#E09040">🟡 recovering</td>
+          <td style="padding:6px 10px;color:#E09040">🟡 recovering</td>
+          <td style="padding:6px 10px;color:#F07070">❌ Kein Trade</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="field">
+    <div class="field-label"><span>Alarm-Name</span>
+      <button class="copy-btn" onclick="copyText('&#x1F7E1; BTC Long Recovery -10',this)">Kopieren</button>
+    </div>
+    <div class="field-value">&#x1F7E1; BTC Long Recovery -10</div>
+  </div>
+  <div class="field">
+    <div class="field-label"><span>Bedingung</span></div>
+    <div class="cond-block">
+      <div class="cond-row">
+        <span class="cond-num">1</span>
+        <div>
+          <div class="cond-text">DOMINUS Impuls &rarr; <strong>Main</strong> &middot; Kreuzt nach oben &middot; Wert <strong>&minus;10</strong></div>
+          <div class="cond-detail"><span class="pill p-orange">H2</span> Kerzenschluss &middot; Einmal pro Bar &middot; BTC Chart</div>
+        </div>
+      </div>
+    </div>
+    <div class="warn" style="margin-top:8px">Alarm auf dem <strong>BTCUSDTPERP H2-Chart</strong> anlegen — identisch wie die bestehenden BTC-Makro-Alarme (Alarm 5), nur mit Schwellwert <strong>&minus;10</strong> statt 0.</div>
+  </div>
+  <div class="sep-label">Webhook Message (JSON)</div>
+  <div class="field" style="margin-top:8px">
+    <div class="field-label"><span>Message-Feld in TradingView</span>
+      <button class="copy-btn" onclick="copyField('btc-recovery',this)">Kopieren</button>
+    </div>
+    <div class="field-value mono" id="btc-recovery">{"symbol":"BTCUSDT","side":"long","signal":"BTC_DIR","zone":"recovering"}</div>
+  </div>
+  <div class="info" style="margin-top:8px">
+    <strong>zone: "recovering"</strong> teilt Railway mit, dass BTC noch zwischen &minus;10 und 0 liegt (nicht voll bestätigt).<br>
+    Railway setzt <code>btc_dir = "recovering"</code> und zeigt 🟡 in Telegram &amp; /status.
+  </div>
+  <div class="notif-row">
+    <div class="notif-card"><div class="notif-label">Benachrichtigung</div><div class="notif-val">App + Ton</div></div>
+    <div class="notif-card"><div class="notif-label">Auslösung</div><div class="notif-val">Einmal pro Bar</div></div>
+    <div class="notif-card"><div class="notif-label">Ablauf</div><div class="notif-val">Unbefristet</div></div>
+    <div class="notif-card"><div class="notif-label">Chart</div><div class="notif-val">BTCUSDTPERP H2</div></div>
+  </div>
+</div>
+
+<!-- ALARM 5d: TOTAL2 RECOVERY -10 -->
+<div class="card" id="sec-alarm5d" style="border-left:3px solid #E09040">
+  <div class="card-head">
+    <div class="step-badge" style="background:#1a1200;color:#E09040">5d</div>
+    <div>
+      <div class="h2">Total2 Long Recovery &minus;10 <span class="new-badge">NEU</span></div>
+      <div class="sub">DOMINUS Impuls Total2 verlässt Oversold aufwärts &mdash; Railway setzt t2_dir = "recovering"</div>
+    </div>
+  </div>
+  <div style="background:#1a1200;border:1px solid rgba(224,144,64,0.25);border-radius:8px;padding:10px 12px;margin-bottom:12px;font-size:12px;line-height:1.6;color:#888">
+    Identisch wie Alarm 5c aber für <strong style="color:#E09040">CRYPTOCAP:TOTAL2</strong>. Gleiche Permission-Tabelle gilt.
+  </div>
+  <div class="field">
+    <div class="field-label"><span>Alarm-Name</span>
+      <button class="copy-btn" onclick="copyText('&#x1F7E1; Total2 Long Recovery -10',this)">Kopieren</button>
+    </div>
+    <div class="field-value">&#x1F7E1; Total2 Long Recovery -10</div>
+  </div>
+  <div class="field">
+    <div class="field-label"><span>Bedingung</span></div>
+    <div class="cond-block">
+      <div class="cond-row">
+        <span class="cond-num">1</span>
+        <div>
+          <div class="cond-text">DOMINUS Impuls &rarr; <strong>Main</strong> &middot; Kreuzt nach oben &middot; Wert <strong>&minus;10</strong></div>
+          <div class="cond-detail"><span class="pill p-orange">H2</span> Kerzenschluss &middot; Einmal pro Bar &middot; Total2 Chart</div>
+        </div>
+      </div>
+    </div>
+    <div class="warn" style="margin-top:8px">Alarm auf dem <strong>CRYPTOCAP:TOTAL2 H2-Chart</strong> anlegen — identisch wie die bestehenden Total2-Makro-Alarme (Alarm 5b), nur mit Schwellwert <strong>&minus;10</strong> statt 0.</div>
+  </div>
+  <div class="sep-label">Webhook Message (JSON)</div>
+  <div class="field" style="margin-top:8px">
+    <div class="field-label"><span>Message-Feld in TradingView</span>
+      <button class="copy-btn" onclick="copyField('t2-recovery',this)">Kopieren</button>
+    </div>
+    <div class="field-value mono" id="t2-recovery">{"symbol":"TOTAL2","side":"long","signal":"T2_DIR","zone":"recovering"}</div>
+  </div>
+  <div class="info" style="margin-top:8px">
+    Railway setzt <code>t2_dir = "recovering"</code>. Die Permission-Logik kombiniert dann btc_dir + t2_dir — genau wie in der Tabelle in Alarm 5c beschrieben.
+  </div>
+  <div class="notif-row">
+    <div class="notif-card"><div class="notif-label">Benachrichtigung</div><div class="notif-val">App + Ton</div></div>
+    <div class="notif-card"><div class="notif-label">Auslösung</div><div class="notif-val">Einmal pro Bar</div></div>
+    <div class="notif-card"><div class="notif-label">Ablauf</div><div class="notif-val">Unbefristet</div></div>
+    <div class="notif-card"><div class="notif-label">Chart</div><div class="notif-val">CRYPTOCAP:TOTAL2 H2</div></div>
+  </div>
+</div>
+
+<!-- ALARM 5e: BTC SHORT RECOVERY +10 -->
+<div class="card" id="sec-alarm5e" style="border-left:3px solid #F07070">
+  <div class="card-head">
+    <div class="step-badge" style="background:#1a0808;color:#F07070">5e</div>
+    <div>
+      <div class="h2">BTC Short Recovery +10 <span class="new-badge">NEU</span></div>
+      <div class="sub">DOMINUS Impuls verlässt Overbought-Zone abwärts &mdash; Railway setzt btc_dir = "recovering_short"</div>
+    </div>
+  </div>
+  <div style="background:#1a0808;border:1px solid rgba(240,112,112,0.25);border-radius:8px;padding:10px 12px;margin-bottom:12px;font-size:12px;line-height:1.6;color:#888">
+    Symmetrisch zu Alarm 5c (Long-Recovery), aber für die Short-Seite.<br>
+    BTC Impuls war über +10 (Overbought) und kreuzt +10 <strong style="color:#F07070">abwärts</strong> — Exit aus der Extremzone, Impuls noch zwischen 0 und +10.<br>
+    Railway setzt <code>btc_dir = "recovering_short"</code> (🟠). Nur Premium-Shorts erlaubt bis Bestätigung bei 0.
+  </div>
+  <div class="field">
+    <div class="field-label"><span>Alarm-Name</span>
+      <button class="copy-btn" onclick="copyText('&#x1F7E0; BTC Short Recovery +10',this)">Kopieren</button>
+    </div>
+    <div class="field-value">&#x1F7E0; BTC Short Recovery +10</div>
+  </div>
+  <div class="field">
+    <div class="field-label"><span>Bedingung</span></div>
+    <div class="cond-block">
+      <div class="cond-row">
+        <span class="cond-num">1</span>
+        <div>
+          <div class="cond-text">DOMINUS Impuls &rarr; <strong>Main</strong> &middot; <strong>Kreuzt nach unten</strong> &middot; Wert <strong>+10</strong></div>
+          <div class="cond-detail"><span class="pill p-red">H2</span> Kerzenschluss &middot; Einmal pro Bar &middot; BTC Chart</div>
+        </div>
+      </div>
+    </div>
+    <div class="danger" style="margin-top:8px">Richtung: <strong>Abwärts kreuzend</strong> (nicht aufwärts!) — Impuls fällt von über +10 zurück unter +10.</div>
+  </div>
+  <div class="sep-label">Webhook Message (JSON)</div>
+  <div class="field" style="margin-top:8px">
+    <div class="field-label"><span>Message-Feld in TradingView</span>
+      <button class="copy-btn" onclick="copyField('btc-short-recovery',this)">Kopieren</button>
+    </div>
+    <div class="field-value mono" id="btc-short-recovery">{"symbol":"BTCUSDT","side":"short","signal":"BTC_DIR","zone":"recovering"}</div>
+  </div>
+  <div class="notif-row">
+    <div class="notif-card"><div class="notif-label">Benachrichtigung</div><div class="notif-val">App + Ton</div></div>
+    <div class="notif-card"><div class="notif-label">Auslösung</div><div class="notif-val">Einmal pro Bar</div></div>
+    <div class="notif-card"><div class="notif-label">Ablauf</div><div class="notif-val">Unbefristet</div></div>
+    <div class="notif-card"><div class="notif-label">Chart</div><div class="notif-val">BTCUSDTPERP H2</div></div>
+  </div>
+</div>
+
+<!-- ALARM 5f: TOTAL2 SHORT RECOVERY +10 -->
+<div class="card" id="sec-alarm5f" style="border-left:3px solid #F07070">
+  <div class="card-head">
+    <div class="step-badge" style="background:#1a0808;color:#F07070">5f</div>
+    <div>
+      <div class="h2">Total2 Short Recovery +10 <span class="new-badge">NEU</span></div>
+      <div class="sub">DOMINUS Impuls Total2 verlässt Overbought abwärts &mdash; Railway setzt t2_dir = "recovering_short"</div>
+    </div>
+  </div>
+  <div style="background:#1a0808;border:1px solid rgba(240,112,112,0.25);border-radius:8px;padding:10px 12px;margin-bottom:12px;font-size:12px;line-height:1.6;color:#888">
+    Identisch wie Alarm 5e aber für <strong style="color:#F07070">CRYPTOCAP:TOTAL2</strong>. Gleiche Logik — nur bei Premium-Shorts erlaubt.
+  </div>
+  <div class="field">
+    <div class="field-label"><span>Alarm-Name</span>
+      <button class="copy-btn" onclick="copyText('&#x1F7E0; Total2 Short Recovery +10',this)">Kopieren</button>
+    </div>
+    <div class="field-value">&#x1F7E0; Total2 Short Recovery +10</div>
+  </div>
+  <div class="field">
+    <div class="field-label"><span>Bedingung</span></div>
+    <div class="cond-block">
+      <div class="cond-row">
+        <span class="cond-num">1</span>
+        <div>
+          <div class="cond-text">DOMINUS Impuls &rarr; <strong>Main</strong> &middot; <strong>Kreuzt nach unten</strong> &middot; Wert <strong>+10</strong></div>
+          <div class="cond-detail"><span class="pill p-red">H2</span> Kerzenschluss &middot; Einmal pro Bar &middot; Total2 Chart</div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="sep-label">Webhook Message (JSON)</div>
+  <div class="field" style="margin-top:8px">
+    <div class="field-label"><span>Message-Feld in TradingView</span>
+      <button class="copy-btn" onclick="copyField('t2-short-recovery',this)">Kopieren</button>
+    </div>
+    <div class="field-value mono" id="t2-short-recovery">{"symbol":"TOTAL2","side":"short","signal":"T2_DIR","zone":"recovering"}</div>
+  </div>
+  <div class="notif-row">
+    <div class="notif-card"><div class="notif-label">Benachrichtigung</div><div class="notif-val">App + Ton</div></div>
+    <div class="notif-card"><div class="notif-label">Auslösung</div><div class="notif-val">Einmal pro Bar</div></div>
+    <div class="notif-card"><div class="notif-label">Ablauf</div><div class="notif-val">Unbefristet</div></div>
+    <div class="notif-card"><div class="notif-label">Chart</div><div class="notif-val">CRYPTOCAP:TOTAL2 H2</div></div>
+  </div>
+</div>
+
+<!-- TRAILING SL -->
+<div class="card" id="sec-trailing">
+  <div class="card-head">
+    <div class="step-badge" style="background:#0d2820;color:#4ECBA0">&#x1F4C8;</div>
+    <div>
+      <div class="h2">TP-Step Trailing SL <span class="new-badge">NEU</span></div>
+      <div class="sub">Automatisches Nachziehen nach jedem TP &mdash; Gewinne schrittweise sichern</div>
+    </div>
+  </div>
+  <div class="trailing-flow">
+    <div class="trailing-box t1"><strong>TP1 ausgel&ouml;st</strong><br>&#x2193;<br>SL auf Entry<br><span style="font-size:11px;opacity:.7">Break-even gesichert</span></div>
+    <div class="trailing-arrow">&#x2192;</div>
+    <div class="trailing-box t2"><strong>TP2 ausgel&ouml;st</strong><br>&#x2193;<br>SL auf TP1-Preis<br><span style="font-size:11px;opacity:.7">TP1-Gewinn gesichert</span></div>
+    <div class="trailing-arrow">&#x2192;</div>
+    <div class="trailing-box t3"><strong>TP3 ausgel&ouml;st</strong><br>&#x2193;<br>SL auf TP2-Preis<br><span style="font-size:11px;opacity:.7">TP2-Gewinn gesichert</span></div>
+  </div>
+  <div style="font-size:13px;color:#b0b0a8;line-height:1.6;margin-top:12px">
+    Nach jedem ausgel&ouml;sten TP wird der SL automatisch auf das Niveau des vorherigen TPs nachgezogen. So ist bei jedem neuen TP-Level der gesamte Gewinn bis dahin auf der Restposition gesichert.
+  </div>
+  <div style="margin-top:14px;overflow-x:auto">
+    <table style="width:100%;border-collapse:collapse;font-size:12px">
+      <thead>
+        <tr style="background:#252528;border-bottom:1px solid rgba(255,255,255,0.07)">
+          <th style="padding:8px 10px;text-align:left;font-weight:600;color:#909090;font-size:11px;text-transform:uppercase;letter-spacing:.04em">Level</th>
+          <th style="padding:8px 10px;text-align:left;font-weight:600;color:#909090;font-size:11px;text-transform:uppercase;letter-spacing:.04em">Ausl&ouml;ser</th>
+          <th style="padding:8px 10px;text-align:left;font-weight:600;color:#909090;font-size:11px;text-transform:uppercase;letter-spacing:.04em">SL wird gesetzt auf</th>
+          <th style="padding:8px 10px;text-align:left;font-weight:600;color:#909090;font-size:11px;text-transform:uppercase;letter-spacing:.04em">Gesicherter Mindestgewinn</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr style="border-bottom:0.5px solid rgba(255,255,255,0.05)">
+          <td style="padding:8px 10px"><span class="pill p-green">1</span></td>
+          <td style="padding:8px 10px;color:#deded8">TP1 (10% ROI, 15% geschlossen)</td>
+          <td style="padding:8px 10px;color:#deded8;font-weight:500">Entry-Preis</td>
+          <td style="padding:8px 10px;color:#5EC45E">Break-even (0 USDT)</td>
+        </tr>
+        <tr style="border-bottom:0.5px solid rgba(255,255,255,0.05)">
+          <td style="padding:8px 10px"><span class="pill p-teal">2</span></td>
+          <td style="padding:8px 10px;color:#deded8">TP2 (20% ROI, +20% geschlossen)</td>
+          <td style="padding:8px 10px;color:#deded8;font-weight:500">TP1-Preis</td>
+          <td style="padding:8px 10px;color:#5EC45E">TP1-Gewinn auf Restposition</td>
+        </tr>
+        <tr>
+          <td style="padding:8px 10px"><span class="pill p-blue">3</span></td>
+          <td style="padding:8px 10px;color:#deded8">TP3 (30% ROI, +25% geschlossen)</td>
+          <td style="padding:8px 10px;color:#deded8;font-weight:500">TP2-Preis</td>
+          <td style="padding:8px 10px;color:#5EC45E">TP2-Gewinn auf Restposition</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="info" style="margin-top:10px">Telegram-Benachrichtigung bei jedem Level mit Restposition und gesichertem Mindestgewinn. <strong>/refresh</strong> pr&uuml;ft und repariert das Trailing-Niveau automatisch.</div>
+  <div class="hint" style="margin-top:6px"><strong>Erkennungssystem:</strong> Fill-basiert (prim&auml;r, 48h) + Gr&ouml;ssenbasiert (Fallback bei &auml;lteren Trades)</div>
+  <div style="margin-top:14px">
+    <div style="font-size:11px;color:#666;text-transform:uppercase;letter-spacing:.04em;margin-bottom:6px">Telegram-Benachrichtigung (Vorschau)</div>
+    <div style="background:#0d0d10;border-radius:10px;padding:12px 14px;font-family:'SF Mono','Fira Mono',monospace;font-size:12px;color:#e0e0e0;line-height:1.7">
+      <span style="color:#5DCAA5">&#x1F4C8; TP2 ausgel&ouml;st &mdash; ETHUSDT</span><br>
+      SL &rarr; <b>2850.00 USDT</b> (TP1 (10% ROI) gesichert)<br>
+      &#x2501;&#x2501;&#x2501;&#x2501;&#x2501;&#x2501;&#x2501;&#x2501;&#x2501;&#x2501;<br>
+      &#x1F4E6; Restposition:&nbsp;&nbsp;&nbsp;&nbsp; <b>65.00 Kontrakte</b><br>
+      &#x1F6E1; Min. Gewinn Rest: <b>+142.50 USDT</b><br>
+      &nbsp; (falls SL greift bevor TP3)
+    </div>
+  </div>
+</div>
+
+<!-- ABWEICHUNGSWARNUNGEN -->
+<div class="card" id="sec-deviation">
+  <div class="card-head">
+    <div class="step-badge" style="background:#2a1c08;color:#E09040">&#x26A0;&#xFE0F;</div>
+    <div>
+      <div class="h2">Telegram Abweichungswarnungen <span class="new-badge">NEU</span></div>
+      <div class="sub">Railway sendet automatisch eine Zusatzmeldung wenn Hebel, Kelly oder R:R vom Optimum abweichen</div>
+    </div>
+  </div>
+
+  <div style="font-size:13px;color:#b0b0a8;line-height:1.6;margin-bottom:14px">
+    Direkt nach dem Trade-Setup-Bericht sendet Railway eine <strong style="color:#E09040">separate Warnung</strong> wenn einer der drei finanzmathematischen Parameter ausserhalb des empfohlenen Bereichs liegt. Nur die abweichenden Punkte werden aufgeführt &mdash; bei einem perfekten Setup erscheint keine Zusatzmeldung.
+  </div>
+
+  <!-- Beispiel-Meldung -->
+  <div style="font-size:11px;color:#666;text-transform:uppercase;letter-spacing:.04em;margin-bottom:6px">Telegram-Warnung (Beispiel — alle drei Punkte aktiv)</div>
+  <div style="background:#0d0d10;border-radius:10px;padding:12px 14px;font-family:'SF Mono','Fira Mono',monospace;font-size:12px;color:#e0e0e0;line-height:1.75;margin-bottom:16px">
+    <span style="color:#E09040">⚠️ 🟢↗️ <b>Abweichungen erkannt &mdash; ETHUSDT</b></span><br>
+    ━━━━━━━━━━━━<br>
+    <span style="color:#E09040">⚡ <b>Hebel:</b></span> 20x gesetzt &mdash; 12x empfohlen<br>
+    &nbsp;&nbsp;&nbsp;zu hoch ↑ (+8x) &mdash; mehr Risiko als empfohlen<br>
+    &nbsp;&nbsp;&nbsp;Formel: 25 / 2.10% SL-Abstand = 12x<br>
+    <br>
+    <span style="color:#E09040">📊 <b>Positionsgrösse:</b></span> Initial-Margin 85.00 USDT<br>
+    &nbsp;&nbsp;&nbsp;überschreitet Half-Kelly (42.50 USDT)<br>
+    &nbsp;&nbsp;&nbsp;Full-Kelly: 85.00 USDT → Initial = 100% des Optimums<br>
+    &nbsp;&nbsp;&nbsp;Total mit DCA ca. 425.00 USDT<br>
+    <br>
+    <span style="color:#E09040">📉 <b>R:R Ratio:</b></span> 1.2 unter Minimum 1.5<br>
+    &nbsp;&nbsp;&nbsp;Trade statistisch nicht optimal &mdash; SL oder Hebel anpassen
+  </div>
+
+  <!-- Erklärungen -->
+  <div class="sep-label">Was bedeuten die drei Parameter?</div>
+
+  <!-- 1. Hebel -->
+  <div class="cond-block" style="margin-top:10px">
+    <div class="cond-row">
+      <div class="cond-num" style="background:#2a1c08;color:#E09040;font-weight:700">⚡</div>
+      <div style="flex:1">
+        <div style="font-size:13px;font-weight:600;color:#deded8;margin-bottom:4px">
+          Hebel (Leverage)
+          <a href="https://de.wikipedia.org/wiki/Hebelwirkung_(Finanzwirtschaft)" target="_blank" rel="noopener" style="font-size:10px;color:#7BB8F5;text-decoration:none;margin-left:8px;border:0.5px solid #7BB8F5;padding:1px 5px;border-radius:3px">Wikipedia ↗</a>
+        </div>
+        <div style="font-size:12px;color:#b0b0a8;line-height:1.65">
+          Der Hebel multipliziert sowohl Gewinne als auch Verluste. Bei <strong style="color:#deded8">10x Hebel</strong> bedeutet eine Kursbewegung von 1% einen Gewinn oder Verlust von 10% auf die eingesetzte Margin.<br><br>
+          <strong style="color:#deded8">DOMINUS-Formel:</strong> Empfohlener Hebel = <code style="background:#252528;padding:1px 5px;border-radius:3px">25 / SL-Abstand%</code><br>
+          Beispiel: SL 2.5% vom Entry entfernt → Hebel = 25 / 2.5 = <strong style="color:#5EC45E">10x</strong><br><br>
+          Die 25 steht für den maximalen Verlust von 25% der Margin bei SL-Auslösung — unabhängig vom gewählten Hebel. Ein zu hoher Hebel bedeutet: schon kleine Kursbewegungen lösen den SL aus.
+        </div>
+        <div class="warn" style="margin-top:8px"><strong>Warnung ausgelöst wenn:</strong> gesetzter Hebel weicht um mehr als 2× vom Optimum ab &mdash; z.&nbsp;B. 20x statt empfohlener 12x.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 2. Kelly -->
+  <div class="cond-block" style="margin-top:8px">
+    <div class="cond-row">
+      <div class="cond-num" style="background:#0e1f33;color:#7BB8F5;font-weight:700">📊</div>
+      <div style="flex:1">
+        <div style="font-size:13px;font-weight:600;color:#deded8;margin-bottom:4px">
+          Kelly-Kriterium (Positionsgrösse)
+          <a href="https://de.wikipedia.org/wiki/Kellysches_Kriterium" target="_blank" rel="noopener" style="font-size:10px;color:#7BB8F5;text-decoration:none;margin-left:8px;border:0.5px solid #7BB8F5;padding:1px 5px;border-radius:3px">Wikipedia ↗</a>
+        </div>
+        <div style="font-size:12px;color:#b0b0a8;line-height:1.65">
+          Das Kelly-Kriterium berechnet die mathematisch optimale Positionsgrösse um das langfristige Kapitalwachstum zu maximieren, ohne das Risiko eines Totalverlustes einzugehen.<br><br>
+          <strong style="color:#deded8">Formel:</strong> <code style="background:#252528;padding:1px 5px;border-radius:3px">f* = (p × b − q) / b</code><br>
+          <span style="color:#888">p = Winrate (z.&nbsp;B. 0.55), q = 1−p, b = Gewinn/Verlust-Verhältnis</span><br><br>
+          In der Praxis wird oft der <strong style="color:#deded8">Half-Kelly</strong> (halbe Grösse) verwendet, um Schwankungen zu dämpfen. Railway zeigt den Kelly-% und den Half-Kelly-% im Trade-Setup-Bericht.
+        </div>
+        <div class="warn" style="margin-top:8px"><strong>Warnung ausgelöst wenn:</strong> Initial-Margin der ersten Order übersteigt den Half-Kelly-Betrag. Mit DCA (1.5× + 2.5× Nachkauf) würde das Gesamtexposure dann ein Vielfaches des Optimums erreichen.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 3. R:R Ratio -->
+  <div class="cond-block" style="margin-top:8px">
+    <div class="cond-row">
+      <div class="cond-num" style="background:#162a16;color:#5EC45E;font-weight:700">📉</div>
+      <div style="flex:1">
+        <div style="font-size:13px;font-weight:600;color:#deded8;margin-bottom:4px">
+          Chance-Risiko-Verhältnis (R:R Ratio)
+          <a href="https://de.wikipedia.org/wiki/Chance-Risiko-Verh%C3%A4ltnis" target="_blank" rel="noopener" style="font-size:10px;color:#7BB8F5;text-decoration:none;margin-left:8px;border:0.5px solid #7BB8F5;padding:1px 5px;border-radius:3px">Wikipedia ↗</a>
+        </div>
+        <div style="font-size:12px;color:#b0b0a8;line-height:1.65">
+          Das R:R-Verhältnis setzt den möglichen Gewinn (bis TP) in Relation zum möglichen Verlust (bis SL). Ein R:R von <strong style="color:#5EC45E">2.0</strong> bedeutet: für jeden riskierten Franken wird 2 Franken Gewinn angestrebt.<br><br>
+          <strong style="color:#deded8">Beispiel:</strong> Entry 100, SL 98 (−2%), TP 104 (+4%) → R:R = 4/2 = <strong style="color:#5EC45E">2.0</strong><br><br>
+          Ein R:R von mindestens <strong style="color:#deded8">1.5</strong> ist Minimum (Railway-Variable <code style="background:#252528;padding:1px 5px;border-radius:3px">MIN_RR</code>). Darunter lohnt sich der Trade statistisch nicht, selbst bei guter Winrate &mdash; die schlechten Trades fressen die guten auf.
+        </div>
+        <div class="warn" style="margin-top:8px"><strong>Warnung ausgelöst wenn:</strong> R:R &lt; MIN_RR (Standard: 1.5). Abhilfe: SL enger setzen oder einen besseren Entry abwarten. Das Setup wird trotzdem aufgebaut &mdash; die Entscheidung liegt bei dir.</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="info" style="margin-top:12px"><strong>Keine Warnung = alles im grünen Bereich.</strong> Railway sendet die Abweichungs-Meldung nur wenn mindestens ein Parameter ausserhalb des Optimums liegt. Bei einem perfekten Setup erscheint nur der normale Trade-Bericht.</div>
+</div>
+
+<!-- TELEGRAM BEFEHLE -->
+<div class="card" id="sec-telegram">
+  <div class="card-head">
+    <div class="step-badge" style="background:#0d2820;color:#4ECBA0">&#x2709;</div>
+    <div>
+      <div class="h2">Telegram Bot &mdash; Befehle</div>
+      <div class="sub">Direkt im Telegram-Chat eingeben</div>
+    </div>
+  </div>
+  <div class="two-col">
+    <div>
+      <div class="field">
+        <div class="field-label"><span>Kontostand &amp; Positionen</span>
+          <button class="copy-btn" onclick="copyText('/berechnen',this)">Kopieren</button>
+        </div>
+        <div class="field-value mono">/berechnen</div>
+      </div>
+      <div class="field">
+        <div class="field-label"><span>Positions-&Uuml;bersicht</span>
+          <button class="copy-btn" onclick="copyText('/status',this)">Kopieren</button>
+        </div>
+        <div class="field-value mono">/status</div>
+      </div>
+      <div class="field">
+        <div class="field-label"><span>Alle Befehle</span>
+          <button class="copy-btn" onclick="copyText('/hilfe',this)">Kopieren</button>
+        </div>
+        <div class="field-value mono">/hilfe</div>
+      </div>
+      <div class="field">
+        <div class="field-label"><span>Daily P&amp;L Report</span>
+          <button class="copy-btn" onclick="copyText('/report',this)">Kopieren</button>
+        </div>
+        <div class="field-value mono">/report</div>
+      </div>
+      <div style="font-size:11px;color:#888;line-height:1.55;margin-top:4px;padding:0 2px">Wird t&auml;glich um 23:59 automatisch gesendet. Enth&auml;lt: Tages-P&amp;L, abgeschlossene Trades, laufende Positionen, Monats-Kumulativ.</div>
+    </div>
+    <div>
+      <div class="field">
+        <div class="field-label"><span>Trade berechnen (Vorschau)</span>
+          <button class="copy-btn" onclick="copyText('/trade ETHUSDT LONG 10 2850 2700',this)">Kopieren</button>
+        </div>
+        <div class="field-value mono">/trade SYMBOL LONG|SHORT HEBEL ENTRY SL
+
+Beispiel:
+/trade ETHUSDT LONG 10 2850 2700</div>
+      </div>
+    </div>
+  </div>
+  <div class="info"><strong>/trade</strong> f&uuml;hrt nichts aus &mdash; zeigt R:R, empfohlenen Hebel, DCA-Preise, TPs, Kelly und Chart-Links in Layout lX5eDAis.</div>
+</div>
+
+<!-- TELEGRAM VORSCHAU -->
+<div class="card" id="sec-telegram-preview">
+  <div class="card-head">
+    <div class="step-badge" style="background:#0e1f33;color:#7BB8F5">&#x1F4F1;</div>
+    <div>
+      <div class="h2">Telegram Nachricht &mdash; Vorschau <span class="new-badge">NEU</span></div>
+      <div class="sub">So sieht die H2-Signal Benachrichtigung aus &mdash; mit Buttons statt langen URLs</div>
+    </div>
+  </div>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+    <div>
+      <div style="font-size:11px;color:#666;text-transform:uppercase;letter-spacing:.04em;margin-bottom:6px">Beispiel: Alles OK</div>
+      <div style="background:#0d0d10;border-radius:10px;padding:12px 14px;font-family:'SF Mono','Fira Mono',monospace;font-size:12px;color:#e0e0e0;line-height:1.7">
+        <span style="color:#5DCAA5">🟢↗️ <b>H2 Signal — ETHUSDT LONG</b></span><br>
+        ━━━━━━━━━━━━━━<br>
+        Kurs: <b>2850.00</b><br><br>
+        📋 <b>Status:</b><br>
+        <span style="color:#5DCAA5">✅ HARSI OK</span><br>
+        <span style="color:#5DCAA5">✅ BTC + Total2 OK</span><br>
+        <span style="color:#FFD700">⭐ Premium Setup</span><br><br>
+        💰 1240 USDT &nbsp;|&nbsp; Pro Order: 413 USDT<br>
+        📊 Kelly: 4.2%<br><br>
+        <span style="color:#5DCAA5">⏱ <b>30 Min zum Einsteigen — jetzt /trade!</b></span><br>
+        <span style="color:#666">/trade ETHUSDT LONG 10 2850.00 2137.50</span>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px;margin-top:6px">
+        <div style="background:#2b5278;color:#fff;border-radius:6px;padding:5px 8px;font-size:11px;text-align:center">📈 H2 ETHUSDT</div>
+        <div style="background:#2b5278;color:#fff;border-radius:6px;padding:5px 8px;font-size:11px;text-align:center">📊 H4 ETHUSDT</div>
+        <div style="background:#2b5278;color:#fff;border-radius:6px;padding:5px 8px;font-size:11px;text-align:center">₿ BTC H2</div>
+        <div style="background:#2b5278;color:#fff;border-radius:6px;padding:5px 8px;font-size:11px;text-align:center">🌐 Total2</div>
+        <div style="background:#2b5278;color:#fff;border-radius:6px;padding:5px 8px;font-size:11px;text-align:center;grid-column:span 2">📋 /trade kopieren</div>
+      </div>
+    </div>
+    <div>
+      <div style="font-size:11px;color:#666;text-transform:uppercase;letter-spacing:.04em;margin-bottom:6px">Beispiel: Mit Warnungen</div>
+      <div style="background:#0d0d10;border-radius:10px;padding:12px 14px;font-family:'SF Mono','Fira Mono',monospace;font-size:12px;color:#e0e0e0;line-height:1.7">
+        <span style="color:#5DCAA5">🟢↗️ <b>H2 Signal — TRXUSDT LONG</b></span><br>
+        ━━━━━━━━━━━━━━<br>
+        Kurs: <b>0.32650</b><br><br>
+        📋 <b>Status:</b><br>
+        <span style="color:#FFA500">⚠️ HARSI in Extremzone — warten</span><br>
+        <span style="color:#FFA500">⚠️ BTC/Total2 keine Übereinstimmung</span><br>
+        <span style="color:#888">— Kein Premium</span><br><br>
+        💰 1240 USDT &nbsp;|&nbsp; Pro Order: 413 USDT<br>
+        📊 Kelly: 4.2%<br><br>
+        <span style="color:#FFA500">⏱ <b>Alarm 3 erstellen + Timer starten!</b></span><br>
+        <span style="color:#F07070">Kein HARSI-Exit in 30 Min → Setup überspringen</span><br>
+        <span style="color:#666">/trade TRXUSDT LONG 10 0.32650 0.24488</span>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px;margin-top:6px">
+        <div style="background:#2b5278;color:#fff;border-radius:6px;padding:5px 8px;font-size:11px;text-align:center">📈 H2 TRXUSDT</div>
+        <div style="background:#2b5278;color:#fff;border-radius:6px;padding:5px 8px;font-size:11px;text-align:center">📊 H4 TRXUSDT</div>
+        <div style="background:#2b5278;color:#fff;border-radius:6px;padding:5px 8px;font-size:11px;text-align:center">₿ BTC H2</div>
+        <div style="background:#2b5278;color:#fff;border-radius:6px;padding:5px 8px;font-size:11px;text-align:center">🌐 Total2</div>
+        <div style="background:#2b5278;color:#fff;border-radius:6px;padding:5px 8px;font-size:11px;text-align:center;grid-column:span 2">📋 /trade kopieren</div>
+      </div>
+    </div>
+  </div>
+  <div class="info" style="margin-top:12px">
+    <strong>📋 /trade kopieren</strong>: Tippt drauf &rarr; Befehl mit Einstiegspreis &amp; SL (Entry &minus;25%) in Zwischenablage &rarr; direkt einfügen und Hebel/SL anpassen.<br>
+    <strong>SL Vorschlag</strong>: Entry &times; 0.75 (Long) &nbsp;/&nbsp; Entry &times; 1.25 (Short) &mdash; nur als Ausgangspunkt, immer manuell pr&uuml;fen.
+  </div>
+</div>
+
+<!-- WORKFLOW -->
+<div class="card" id="sec-workflow">
+  <div class="card-head" style="margin-bottom:.75rem">
+    <div class="step-badge" style="background:#252528;color:#909090">&#x2630;</div>
+    <div>
+      <div class="h2">Vollst&auml;ndiger Workflow <span class="upd-badge">AKTUALISIERT</span></div>
+      <div class="sub">Alarm 2/2b dauerhaft aktiv &mdash; kein manuelles Aktivieren nach H4 n&ouml;tig</div>
+    </div>
+  </div>
+  <div class="steps-list">
+    <div class="step-row">
+      <div class="step-n" style="background:#252528;color:#909090;font-size:10px">vor&shy;ab</div>
+      <div class="step-t"><strong>Alarm 2 + 2b</strong> (DOM-ORC Long/Short) dauerhaft aktiv f&uuml;r alle Watchlist-Coins &mdash; DOM-ORC filtert intern, kein manuelles Eingreifen n&ouml;tig</div>
+    </div>
+    <div class="step-row">
+      <div class="step-n">1</div>
+      <div class="step-t"><strong>H2 Entry feuert</strong> (Alarm 2 / 2b) &rarr; Telegram: Setup-Details + harsi_warn &middot; <em><strong style="color:#F07070">sofort reagieren &mdash; max. 30 Min!</strong></em></div>
+    </div>
+    <div class="step-row">
+      <div class="step-n" style="background:#162a16;color:#5EC45E">2a</div>
+      <div class="step-t"><strong>harsi_warn: 0</strong> &rarr; BTC &amp; Total2 Impuls-Farbe manuell pr&uuml;fen &rarr; bei &Uuml;bereinstimmung: sofort zu Schritt 4</div>
+    </div>
+    <div class="step-row">
+      <div class="step-n" style="background:#2a1c08;color:#E09040">2b</div>
+      <div class="step-t"><strong>harsi_warn: 1</strong> &rarr; H2-Chart dieses Coins &ouml;ffnen &rarr; <strong>Alarm 3 / 3b sofort erstellen + 30-Min-Timer starten</strong> &rarr; auf Feuern warten &middot; <strong style="color:#F07070">Alarm nach 30 Min l&ouml;schen wenn kein Exit</strong></div>
+    </div>
+    <div class="step-row">
+      <div class="step-n" style="background:#0e1f33;color:#7BB8F5">3</div>
+      <div class="step-t"><strong>HARSI-Exit-Alarm feuert</strong> (nur bei 2b, innerhalb 30 Min) &rarr; BTC &amp; Total2 Impuls-Farbe pr&uuml;fen &rarr; bei &Uuml;bereinstimmung: weiter zu Schritt 4</div>
+    </div>
+    <div class="step-row">
+      <div class="step-n">4</div>
+      <div class="step-t">Telegram: <code>/trade ETHUSDT LONG 10 2850 2700</code> &rarr; vollst&auml;ndige Setup-Vorschau (R:R, Hebel, DCA, TPs, Kelly)</div>
+    </div>
+    <div class="step-row">
+      <div class="step-n">5</div>
+      <div class="step-t"><strong>Market Order + SL</strong> auf Bitget setzen &rarr; Railway erkennt Trade automatisch</div>
+    </div>
+    <div class="step-row">
+      <div class="step-n">6</div>
+      <div class="step-t">Railway setzt <strong>DCA1 + DCA2 + TP1&ndash;TP4</strong> automatisch &middot; Telegram-Best&auml;tigung</div>
+    </div>
+    <div class="step-row">
+      <div class="step-n">7</div>
+      <div class="step-t">TP1 ausgel&ouml;st &rarr; <strong>SL automatisch auf Entry</strong> (Break-even gesichert) &nbsp;<a href="#sec-trailing" style="font-size:11px;padding:1px 6px;border-radius:4px;background:#0d2820;color:#4ECBA0;text-decoration:none">&#x2192; Trailing SL</a></div>
+    </div>
+    <div class="step-row">
+      <div class="step-n">8</div>
+      <div class="step-t">TP2 ausgel&ouml;st &rarr; <strong>Trailing SL auf TP1-Preis</strong> (TP1-Gewinn gesichert) &nbsp;<a href="#sec-trailing" style="font-size:11px;padding:1px 6px;border-radius:4px;background:#0d2820;color:#4ECBA0;text-decoration:none">&#x2192; Trailing SL</a></div>
+    </div>
+    <div class="step-row">
+      <div class="step-n">9</div>
+      <div class="step-t">TP3 ausgel&ouml;st &rarr; <strong>Trailing SL auf TP2-Preis</strong> (TP2-Gewinn gesichert) &nbsp;<a href="#sec-trailing" style="font-size:11px;padding:1px 6px;border-radius:4px;background:#0d2820;color:#4ECBA0;text-decoration:none">&#x2192; Trailing SL</a></div>
+    </div>
+  </div>
+  <div class="info" style="margin-top:12px"><strong>Automatisiert durch Railway:</strong> DCA-Orders &middot; TP1&ndash;TP4 (15/20/25/40%) &middot; SL auf Entry nach TP1 &middot; TP-Anpassung nach Nachkauf &middot; Auto-SL (&minus;25%) bei fehlendem Stop Loss &middot; Trailing SL: TP2&rarr;SL@TP1-Preis, TP3&rarr;SL@TP2-Preis &middot; Daily P&amp;L Report um 23:59 &middot; HARSI SL-Anpassung via Alarm 4/4b &middot; <strong>Abweichungswarnungen (Hebel / Kelly / R:R)</strong> &middot; Telegram bei jedem Schritt.</div>
+  <div class="hint" style="margin-top:8px"><strong>H4-Alarme (1/1b) optional:</strong> k&ouml;nnen als fr&uuml;he Vorlaufbenachrichtigung aktiv bleiben, sind aber f&uuml;r den Ablauf nicht mehr zwingend n&ouml;tig.</div>
+</div>
+
+</div>
+<script>
+function copyField(id,btn){
+  const el=document.getElementById(id);
+  navigator.clipboard.writeText(el.textContent.trim()).then(()=>{
+    btn.textContent='Kopiert!';btn.classList.add('copied');
+    setTimeout(()=>{btn.textContent='Kopieren';btn.classList.remove('copied');},2000);
+  });
+}
+function copyText(text,btn){
+  navigator.clipboard.writeText(text).then(()=>{
+    btn.textContent='Kopiert!';btn.classList.add('copied');
+    setTimeout(()=>{btn.textContent='Kopieren';btn.classList.remove('copied');},2000);
+  });
+}
+</script>
+</body>
+</html>
