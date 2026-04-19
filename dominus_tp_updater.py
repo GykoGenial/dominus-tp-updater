@@ -9,6 +9,17 @@ Finanzmathematische Optimierungen:
   ④ Asymm. TPs        — 15/20/25/40% statt 25/25/25/25%
   ⑤ Telegram Polling  — /berechnen /trade /status /hilfe
 
+Changelog v4.5 — Symbol-Präzision & Telegram USDT-Anzeige:
+  P1: volumePlace (Mengenpräzision) von Bitget Contract-API gecacht pro Symbol
+  P2: snap_qty() / round_qty() — korrekte Mengenrundung für alle Symbols (THETA, BTC, etc.)
+  P3: place_tp_orders: qty via snap_qty statt hardcoded round(...,4) / math.floor
+  P4: place_dca_orders: qty via snap_qty, fmt() entfernt
+  P5: Telegram — Restposition neu als "X.xx COIN (≈ Y.yy USDT)" in TP1/TrailingSL/HarsiSL
+  P6: Telegram — DCA-Bestätigung zeigt Menge in BaseCoin + USDT-Notional
+  P7: TP-Log zeigt Qty in BaseCoin + USDT-Notional
+  D1: DOCS_URL + _doc_link() — Alarm-Anleitung Links in allen Telegram-Nachrichten
+  D2: H2-Signal HARSI-Warnung zeigt Ablaufzeit + Link zu Alarm 3/3b
+
 Changelog v4.4 — Logik-Audit & Fixes:
   K1: TP3-Grössen-Schwellwert 0.37→0.42, TP2 0.67→0.69 (war zu tief für asym. TPs)
   K2: DCA-Fehler via Telegram gemeldet statt still ignoriert
@@ -119,7 +130,9 @@ last_known_avg:   dict = {}   # {symbol: avg_price}
 last_known_size:  dict = {}   # {symbol: position_size}
 sl_at_entry:      dict = {}   # {symbol: bool}
 new_trade_done:   dict = {}   # {symbol: bool} — DCA bereits gesetzt?
-price_decimals_cache: dict = {}
+price_decimals_cache: dict = {}  # {symbol: int}  — Preis-Dezimalstellen
+qty_decimals_cache:   dict = {}  # {symbol: int}  — Mengen-Dezimalstellen (volumePlace)
+base_coin_cache:      dict = {}  # {symbol: str}  — BaseCoin-Name (z.B. "THETA", "BTC")
 last_update_id:   int  = 0    # Telegram: letzter verarbeiteter Update-ID
 
 # Trade-Daten für Auswertung bei Abschluss
@@ -264,26 +277,64 @@ def api_post(path: str, body: dict) -> dict:
 # ═══════════════════════════════════════════════════════════════
 
 def get_price_decimals(symbol: str) -> int:
-    """Erlaubte Dezimalstellen von Bitget Contract-API (gecacht)."""
+    """Erlaubte Preis-Dezimalstellen von Bitget Contract-API (gecacht).
+    Befüllt gleichzeitig qty_decimals_cache und base_coin_cache."""
     if symbol in price_decimals_cache:
         return price_decimals_cache[symbol]
     result = api_get("/api/v2/mix/market/contracts", {
         "symbol":      symbol,
         "productType": PRODUCT_TYPE,
     })
-    decimals = 4
+    price_dec = 4
+    qty_dec   = 4
+    base_coin = symbol.replace("USDT", "").replace("USDC", "")
     try:
         contracts = result.get("data", [])
         if contracts:
-            decimals = int(contracts[0].get("pricePlace", "4"))
+            c = contracts[0]
+            price_dec = int(c.get("pricePlace",  "4"))
+            qty_dec   = int(c.get("volumePlace", "4"))
+            base_coin = c.get("baseCoin", base_coin) or base_coin
     except Exception:
         pass
-    price_decimals_cache[symbol] = decimals
-    return decimals
+    price_decimals_cache[symbol] = price_dec
+    qty_decimals_cache[symbol]   = qty_dec
+    base_coin_cache[symbol]      = base_coin
+    return price_dec
+
+
+def get_qty_decimals(symbol: str) -> int:
+    """Erlaubte Mengen-Dezimalstellen des Symbols (gecacht, wird via get_price_decimals geladen)."""
+    if symbol not in qty_decimals_cache:
+        get_price_decimals(symbol)
+    return qty_decimals_cache.get(symbol, 4)
+
+
+def get_base_coin(symbol: str) -> str:
+    """BaseCoin-Name des Symbols (z.B. 'THETA' für 'THETAUSDT')."""
+    if symbol not in base_coin_cache:
+        get_price_decimals(symbol)
+    return base_coin_cache.get(symbol, symbol.replace("USDT", ""))
+
+
+def snap_qty(symbol: str, qty: float) -> float:
+    """Rundet Menge numerisch auf die korrekte Symbol-Präzision (volumePlace)."""
+    dec = get_qty_decimals(symbol)
+    if dec == 0:
+        return float(math.floor(qty))
+    return round(qty, dec)
 
 
 def round_price(price: float, decimals: int) -> str:
     return f"{price:.{decimals}f}"
+
+
+def round_qty(symbol: str, qty: float) -> str:
+    """Formatiert Menge als API-konformen String (korrekte Dezimalstellen je Symbol)."""
+    dec = get_qty_decimals(symbol)
+    if dec == 0:
+        return str(int(math.floor(qty)))
+    return f"{qty:.{dec}f}"
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -597,13 +648,10 @@ def place_tp_orders(symbol: str, avg: float, size: float,
         tp_str = round_price(tp_raw, decimals)
         tp_val = float(tp_str)
 
-        # Qty-Berechnung: ganzzahlige Kontrakte (>= 1.0) vs. Dezimal-Kontrakte (< 1.0)
-        # max(1, floor()) war falsch für BTC: floor(0.0013 × 0.15)=0 → "1 BTC schliessen"
+        # Qty-Berechnung: Symbol-spezifische Präzision via volumePlace (Bitget Contract-Info)
+        # snap_qty() rundet korrekt: 0 Dezimalstellen = math.floor (ganze Kontrakte)
         base_qty = size * pct
-        if size >= 1.0:
-            qty = math.floor(base_qty + carry_qty)
-        else:
-            qty = round(base_qty + carry_qty, 4)
+        qty      = snap_qty(symbol, base_qty + carry_qty)
 
         if qty <= 0:
             log(f"    ⏭ {label}: Position zu klein für Teilschliessung (size={size}, pct={pct}) — "
@@ -621,6 +669,7 @@ def place_tp_orders(symbol: str, avg: float, size: float,
                 log(f"    ⏭ {label} @ {tp_str} bereits überschritten — übersprungen")
                 continue
 
+        qty_str  = round_qty(symbol, qty)
         res = api_post("/api/v2/mix/order/place-tpsl-order", {
             "symbol":       symbol,
             "productType":  PRODUCT_TYPE,
@@ -630,10 +679,11 @@ def place_tp_orders(symbol: str, avg: float, size: float,
             "triggerType":  "mark_price",
             "executePrice": "0",
             "holdSide":     direction,
-            "size":         str(qty),
+            "size":         qty_str,
         })
         if res.get("code") == "00000":
-            log(f"    ✓ {label} @ {tp_str} USDT (Qty: {qty})")
+            notional = tp_val * qty
+            log(f"    ✓ {label} @ {tp_str} USDT × {qty_str} {get_base_coin(symbol)} (≈ {notional:.2f} USDT)")
             count += 1
             prices.append(f"{label}: {tp_str}")
         else:
@@ -652,7 +702,7 @@ def place_tp_orders(symbol: str, avg: float, size: float,
                     "triggerType":  "mark_price",
                     "executePrice": "0",
                     "holdSide":     direction,
-                    "size":         str(qty),
+                    "size":         qty_str,
                 })
                 if res2.get("code") == "00000":
                     log(f"    ✓ {label} @ {tp_str2} USDT [retry OK]")
@@ -1104,14 +1154,20 @@ def set_sl_at_entry(symbol: str, direction: str, entry_price: float,
         tp1_price  = calc_tp_price(entry_price, TP1_ROI, direction, leverage)
         closed_qty = max(0, peak_size - cur_size) if cur_size > 0 and peak_size > 0 else 0
         tp1_profit = closed_qty * abs(tp1_price - entry_price) if closed_qty > 0 else 0
-        size_str   = f"{cur_size:.2f}" if cur_size > 0 else "—"
+        base_coin  = get_base_coin(symbol)
+        qty_dec    = get_qty_decimals(symbol)
+        if cur_size > 0:
+            pos_usdt = cur_size * entry_price
+            size_str = f"{cur_size:.{qty_dec}f} {base_coin} (≈ {pos_usdt:.2f} USDT)"
+        else:
+            size_str = "—"
         profit_str = f"+{tp1_profit:.2f} USDT" if tp1_profit > 0 else "—"
         telegram(
             f"🔒 <b>TP1 ausgelöst — {symbol}</b>\n"
             f"SL → Entry @ {sl_str} USDT (Break-even gesichert)\n"
             f"━━━━━━━━━━\n"
             f"💰 Realisiert:      {profit_str}\n"
-            f"📦 Restposition:    {size_str} Kontrakte\n"
+            f"📦 Restposition:    {size_str}\n"
             f"🛡 Min. Gewinn Rest: 0 USDT (Break-even)\n"
             f"✓ DCA-Orders storniert"
         )
@@ -1183,12 +1239,15 @@ def set_sl_trailing(symbol: str, direction: str, sl_price: float, level: int,
         sl_at_entry[symbol]       = True
         save_state()
 
-        td    = trade_data.get(symbol, {})
-        entry = float(td.get("entry", 0))
+        td        = trade_data.get(symbol, {})
+        entry     = float(td.get("entry", 0))
+        base_coin = get_base_coin(symbol)
+        qty_dec   = get_qty_decimals(symbol)
         if cur_size > 0 and entry > 0:
             guaranteed = (cur_size * (sl_price - entry) if direction == "long"
                           else cur_size * (entry - sl_price))
-            size_str       = f"{cur_size:.2f} Kontrakte"
+            pos_usdt       = cur_size * entry
+            size_str       = f"{cur_size:.{qty_dec}f} {base_coin} (≈ {pos_usdt:.2f} USDT)"
             guaranteed_str = (f"+{guaranteed:.2f} USDT" if guaranteed > 0
                               else f"{guaranteed:.2f} USDT")
         else:
@@ -1245,12 +1304,15 @@ def set_sl_harsi(symbol: str, direction: str, harsi_price: float, cur_size: floa
         sl_set_ts[symbol] = time.time()
         save_state()
 
-        td    = trade_data.get(symbol, {})
-        entry = float(td.get("entry", 0))
+        td        = trade_data.get(symbol, {})
+        entry     = float(td.get("entry", 0))
+        base_coin = get_base_coin(symbol)
+        qty_dec   = get_qty_decimals(symbol)
         if cur_size > 0 and entry > 0:
             guaranteed = (cur_size * (harsi_price - entry) if direction == "long"
                           else cur_size * (entry - harsi_price))
-            size_str       = f"{cur_size:.2f} Kontrakte"
+            pos_usdt       = cur_size * entry
+            size_str       = f"{cur_size:.{qty_dec}f} {base_coin} (≈ {pos_usdt:.2f} USDT)"
             guaranteed_str = (f"+{guaranteed:.2f} USDT" if guaranteed >= 0
                               else f"{guaranteed:.2f} USDT")
         else:
@@ -1300,26 +1362,26 @@ def place_dca_orders(symbol: str, entry: float, sl: float,
 
     dca1_str  = round_price(dca1, decimals)
     dca2_str  = round_price(dca2, decimals)
-    dca1_size = round(base_size * DCA1_MULTIPLIER, 4)
-    dca2_size = round(base_size * DCA2_MULTIPLIER, 4)
+    dca1_size = snap_qty(symbol, base_size * DCA1_MULTIPLIER)
+    dca2_size = snap_qty(symbol, base_size * DCA2_MULTIPLIER)
+    base_coin = get_base_coin(symbol)
 
     log(f"  DCA Sizing 20/30/50: "
         f"Market={base_size} | DCA1={dca1_size} | DCA2={dca2_size}")
-
-    def fmt(s):
-        return str(int(s)) if s == int(s) else str(round(s, 4))
 
     results = []
     for label, price_str, qty in [
         ("DCA1", dca1_str, dca1_size),
         ("DCA2", dca2_str, dca2_size),
     ]:
+        qty_str  = round_qty(symbol, qty)
+        notional = float(price_str) * qty
         res = api_post("/api/v2/mix/order/place-order", {
             "symbol":      symbol,
             "productType": PRODUCT_TYPE,
             "marginMode":  "isolated",
             "marginCoin":  MARGIN_COIN,
-            "size":        fmt(qty),
+            "size":        qty_str,
             "price":       price_str,
             "side":        side,
             "tradeSide":   "open",
@@ -1327,8 +1389,8 @@ def place_dca_orders(symbol: str, entry: float, sl: float,
             "force":       "gtc",
         })
         if res.get("code") == "00000":
-            log(f"  ✓ {label} Limit @ {price_str} USDT (Qty: {fmt(qty)})")
-            results.append(f"{label}: {price_str} USDT × {fmt(qty)}")
+            log(f"  ✓ {label} Limit @ {price_str} USDT × {qty_str} {base_coin} (≈ {notional:.2f} USDT)")
+            results.append(f"{label}: {price_str} USDT × {qty_str} {base_coin} (≈ {notional:.2f} USDT)")
         else:
             log(f"  ✗ {label} FEHLER: {res.get('msg', res)}")
 
