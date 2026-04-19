@@ -145,11 +145,13 @@ last_h2_signal_time: dict = {}   # {symbol_dir: datetime}
 
 # Makro-Kontext: BTC & Total2 DOM-DIR Impuls-Richtung
 # Gesetzt via Webhook signal="BTC_DIR" / "T2_DIR" oder beim H2_SIGNAL-Empfang
-# Werte: "long"       → Impuls ≥ 0, bestätigt bullish   (Alarm: 0 aufwärts)
-#        "recovering" → Impuls −10→0, Exit Oversold       (Alarm: −10 aufwärts, nur Premium-Trades)
-#        "short"      → Impuls ≤ 0, bestätigt bearish    (Alarm: 0 abwärts)
-#        ""           → unbekannt (noch kein Webhook)
-# Permission-Logik:  long+long → voll  |  long+recovering → nur premium=1  |  recovering+recovering → kein Trade
+# Werte: "long"              → Impuls ≥ 0, bestätigt bullish    (Alarm 5:  0 aufwärts)
+#        "recovering"        → Impuls −10→0, Exit Oversold       (Alarm 5c: −10 aufwärts, nur Premium-Longs)
+#        "short"             → Impuls ≤ 0, bestätigt bearish     (Alarm 5:  0 abwärts)
+#        "recovering_short"  → Impuls 0→+10, Exit Overbought     (Alarm 5e: +10 abwärts, nur Premium-Shorts)
+#        ""                  → unbekannt (noch kein Webhook)
+# Long-Permission:   long+long → voll  |  long/recovering gemischt → nur premium=1  |  recovering+recovering → kein Trade
+# Short-Permission:  short+short → voll  |  short/recovering_short gemischt → nur premium=1  |  recovering_short+recovering_short → kein Trade
 btc_dir:  str = ""   # aktuelle BTC Impuls-Richtung
 t2_dir:   str = ""   # aktuelle Total2 Impuls-Richtung
 
@@ -1807,17 +1809,32 @@ def cmd_berechnen():
 
     # Makro-Kontext: BTC & Total2 Impuls-Richtung
     def _dir_icon(d: str) -> str:
-        return "🟢" if d == "long" else ("🟡" if d == "recovering" else ("🔴" if d == "short" else "⬜"))
+        return ("🟢" if d == "long"
+                else "🟡" if d == "recovering"
+                else "🟠" if d == "recovering_short"
+                else "🔴" if d == "short"
+                else "⬜")
     def _dir_lbl(d: str) -> str:
-        return "LONG (bestätigt)" if d == "long" else ("RECOVERING (−10→0, nur Premium)" if d == "recovering" else (d.upper() if d else "unbekannt"))
+        return ("LONG (bestätigt)"              if d == "long"
+                else "RECOVERING (−10→0, nur Premium-Longs)"    if d == "recovering"
+                else "RECOVERING (0→+10, nur Premium-Shorts)"   if d == "recovering_short"
+                else "SHORT (bestätigt)"         if d == "short"
+                else "unbekannt")
     btc_icon = _dir_icon(btc_dir)
     t2_icon  = _dir_icon(t2_dir)
     btc_lbl  = _dir_lbl(btc_dir)
     t2_lbl   = _dir_lbl(t2_dir)
-    _macro_full    = btc_dir == "long"       and t2_dir == "long"
-    _macro_partial = btc_dir in ("long", "recovering") and t2_dir in ("long", "recovering") and not _macro_full
-    macro_ok   = _macro_full or _macro_partial
-    macro_icon = "✅" if _macro_full else ("🟡" if _macro_partial else ("⚠️" if (btc_dir and t2_dir) else "❓"))
+    _macro_full         = btc_dir == "long"              and t2_dir == "long"
+    _macro_full_short   = btc_dir == "short"             and t2_dir == "short"
+    _macro_partial_long = (btc_dir in ("long", "recovering")       and t2_dir in ("long", "recovering")       and not _macro_full)
+    _macro_partial_short= (btc_dir in ("short", "recovering_short") and t2_dir in ("short", "recovering_short") and not _macro_full_short)
+    _macro_partial      = _macro_partial_long or _macro_partial_short
+    macro_ok   = _macro_full or _macro_full_short or _macro_partial
+    macro_icon = ("✅" if (_macro_full or _macro_full_short)
+                  else "🟡" if _macro_partial_long
+                  else "🟠" if _macro_partial_short
+                  else "⚠️" if (btc_dir and t2_dir)
+                  else "❓")
 
     lines = [
         "💰 <b>Kontostand & Status</b>",
@@ -1833,7 +1850,7 @@ def cmd_berechnen():
         f"📡 <b>Makro-Kontext (DOM-DIR):</b>",
         f"  {btc_icon} BTC:    {btc_lbl}",
         f"  {t2_icon} Total2: {t2_lbl}",
-        f"  {macro_icon} {'Beide bestätigt ✓' if _macro_full else 'Recovery aktiv — nur Premium-Setups!' if _macro_partial else 'Abweichung — kein neuer Trade!' if (btc_dir and t2_dir) else 'Noch kein DOM-DIR Webhook empfangen'}",
+        f"  {macro_icon} {'Beide bestätigt ✓' if (_macro_full or _macro_full_short) else 'Long-Recovery — nur Premium-Longs!' if _macro_partial_long else 'Short-Recovery — nur Premium-Shorts!' if _macro_partial_short else 'Abweichung — kein neuer Trade!' if (btc_dir and t2_dir) else 'Noch kein DOM-DIR Webhook empfangen'}",
     ]
 
     if positions:
@@ -2463,16 +2480,19 @@ def start_webhook_server():
         # BTC_DIR / T2_DIR — Makro-Kontext: DOM-DIR Impuls-Richtung geändert
         # Webhook von BTC H2 Chart (signal=BTC_DIR) oder Total2 (signal=T2_DIR)
         # zone="neutral"    → direction long/short ab Nulllinie (bestätigt)
-        # zone="recovering" → direction long, Impuls verlässt Oversold (−10 aufwärts)
-        #                      → nur Premium-Setups erlaubt bis Bestätigung bei 0
+        # zone="recovering" + long  → Impuls verlässt Oversold  (−10 aufwärts, noch −10..0)
+        # zone="recovering" + short → Impuls verlässt Overbought (+10 abwärts, noch 0..+10)
         # ─────────────────────────────────────────────────────────────
         if signal_type in ("BTC_DIR", "T2_DIR"):
             label    = "BTC" if signal_type == "BTC_DIR" else "Total2"
             prev     = btc_dir if signal_type == "BTC_DIR" else t2_dir
             zone_val = data.get("zone", "").lower()
 
-            # "recovering" = long-seitig aber noch zwischen −10 und 0
-            new_dir = "recovering" if (direction == "long" and zone_val == "recovering") else direction
+            # Zustand bestimmen: recovering (long) oder recovering_short oder normal
+            if zone_val == "recovering":
+                new_dir = "recovering" if direction == "long" else "recovering_short"
+            else:
+                new_dir = direction
 
             if signal_type == "BTC_DIR":
                 btc_dir = new_dir
@@ -2481,8 +2501,11 @@ def start_webhook_server():
             save_state()
 
             if new_dir == "recovering":
-                dir_label = "🟡 Recovering (−10→0)"
-                dir_info  = "Impuls verlässt Oversold-Zone.\n🟡 <b>Nur Premium-Setups</b> erlaubt bis Bestätigung bei 0."
+                dir_label = "🟡 Recovering Long (−10→0)"
+                dir_info  = "Impuls verlässt Oversold-Zone.\n🟡 <b>Nur Premium-Longs</b> erlaubt bis Bestätigung bei 0."
+            elif new_dir == "recovering_short":
+                dir_label = "🟠 Recovering Short (0→+10)"
+                dir_info  = "Impuls verlässt Overbought-Zone.\n🟠 <b>Nur Premium-Shorts</b> erlaubt bis Bestätigung bei 0."
             elif direction == "long":
                 dir_label = "🟢 Grün (Bullish bestätigt)"
                 dir_info  = "Impuls über Nulllinie bestätigt."
@@ -2501,7 +2524,9 @@ def start_webhook_server():
                     pnl = float(pos.get("unrealizedPL", 0))
                     warn_trades.append(f"  ⚠️ {sym} {side.upper()} | PnL={pnl:+.2f} USDT")
 
-            icon = "🟡" if new_dir == "recovering" else ("🟢" if direction == "long" else "🔴")
+            icon = ("🟡" if new_dir == "recovering"
+                    else "🟠" if new_dir == "recovering_short"
+                    else "🟢" if direction == "long" else "🔴")
             msg = (
                 f"{icon} <b>{label} Impuls → {dir_label}</b>\n"
                 f"━━━━━━━━━━━━\n"
@@ -2633,11 +2658,12 @@ def start_webhook_server():
 
         # Makro-Richtung des Signals speichern (BTC/Total2 als letzten bekannten Stand)
         # btc_t2_warn=0 bedeutet: BTC & Total2 passten zur Signal-Richtung
-        # WICHTIG: "recovering" Zustand NICHT überschreiben — bleibt bis BTC_DIR 0-Kreuzung kommt
+        # WICHTIG: "recovering"/"recovering_short" NICHT überschreiben
+        # → Zustand bleibt bis BTC_DIR 0-Kreuzungs-Alarm kommt (Alarm 5)
         if btc_t2_warn_val == 0:
-            if btc_dir != "recovering":
+            if btc_dir not in ("recovering", "recovering_short"):
                 btc_dir = direction
-            if t2_dir  != "recovering":
+            if t2_dir  not in ("recovering", "recovering_short"):
                 t2_dir  = direction
 
         flush_h4_buffer()
@@ -2647,29 +2673,40 @@ def start_webhook_server():
         per_order = balance * 0.10 / 3
         icon      = dir_icon(direction)
 
-        # Recovering-Prüfung: BTC oder Total2 noch zwischen −10 und 0
-        # → Nur Premium-Setups durchlassen; zeige Warnung in Telegram
-        _rec_btc = (btc_dir == "recovering")
-        _rec_t2  = (t2_dir  == "recovering")
-        _recovering_active = _rec_btc or _rec_t2
+        # Recovering-Prüfung: BTC/Total2 in Exit-Zone (Long: −10..0 / Short: 0..+10)
+        # → nur Premium-Setups in der jeweiligen Richtung erlaubt
+        _rec_long_btc  = (btc_dir == "recovering")
+        _rec_long_t2   = (t2_dir  == "recovering")
+        _rec_short_btc = (btc_dir == "recovering_short")
+        _rec_short_t2  = (t2_dir  == "recovering_short")
+        _rec_btc = _rec_long_btc or _rec_short_btc
+        _rec_t2  = _rec_long_t2  or _rec_short_t2
+        _recovering_long  = (_rec_long_btc  or _rec_long_t2)  and direction == "long"
+        _recovering_short_trade = (_rec_short_btc or _rec_short_t2) and direction == "short"
+        _recovering_active = _recovering_long or _recovering_short_trade
 
         # Checkliste: automatisch ausgefüllt wo möglich
         harsi_icon   = "✅" if harsi_warn_val  == 0 else "⚠️"
         if btc_t2_warn_val != 0:
             btc_t2_icon = "⚠️"
-        elif _recovering_active:
+        elif _recovering_long:
             btc_t2_icon = "🟡"
+        elif _recovering_short_trade:
+            btc_t2_icon = "🟠"
         else:
             btc_t2_icon = "✅"
         premium_icon = "⭐" if premium_val     == 1 else "☐"
         harsi_txt    = "HARSI OK — Einstieg möglich"       if harsi_warn_val  == 0 else "HARSI Warnung — warten auf Alarm 3"
         if btc_t2_warn_val != 0:
             btc_t2_txt = "BTC/Total2 Abweichung — Trade prüfen!"
-        elif _recovering_active:
-            _rec_who = "BTC" if _rec_btc else "Total2"
-            if _rec_btc and _rec_t2:
-                _rec_who = "BTC + Total2"
-            btc_t2_txt = f"{_rec_who} Recovery (−10→0) — nur Premium-Setup!"
+        elif _recovering_long:
+            _rec_who = ("BTC + Total2" if (_rec_long_btc and _rec_long_t2)
+                        else "BTC" if _rec_long_btc else "Total2")
+            btc_t2_txt = f"{_rec_who} Recovery Long (−10→0) — nur Premium-Long!"
+        elif _recovering_short_trade:
+            _rec_who = ("BTC + Total2" if (_rec_short_btc and _rec_short_t2)
+                        else "BTC" if _rec_short_btc else "Total2")
+            btc_t2_txt = f"{_rec_who} Recovery Short (0→+10) — nur Premium-Short!"
         else:
             btc_t2_txt = "BTC + Total2 gleiche Richtung ✓"
         premium_txt  = "Premium-Setup (dunkelgrün/-rot)"   if premium_val     == 1 else "Kein Premium (höheres Risiko)"
@@ -2677,8 +2714,10 @@ def start_webhook_server():
         # Timer-Zeile abhängig von harsi_warn und recovering-Zustand
         if harsi_warn_val != 0:
             timer_line = "⏱ <b>Alarm 3 erstellen + Timer starten!</b>"
-        elif _recovering_active and premium_val != 1:
-            timer_line = "🟡 <b>Recovery aktiv — nur bei Premium-Setup einsteigen!</b>"
+        elif _recovering_long and premium_val != 1:
+            timer_line = "🟡 <b>Long-Recovery — nur bei Premium-Long einsteigen!</b>"
+        elif _recovering_short_trade and premium_val != 1:
+            timer_line = "🟠 <b>Short-Recovery — nur bei Premium-Short einsteigen!</b>"
         else:
             timer_line = "⏱ <b>30 Min zum Einsteigen — jetzt /trade!</b>"
 
