@@ -1,5 +1,5 @@
 """
-DOMINUS Trade-Automatisierung v4.7
+DOMINUS Trade-Automatisierung v4.8
 ══════════════════════════════════════════════════════════════
 Vollautomatisches Setup nach DOMINUS-Strategie (Handbuch März 2026)
 Finanzmathematische Optimierungen:
@@ -8,6 +8,13 @@ Finanzmathematische Optimierungen:
   ③ Kelly-Kriterium   — optimale Positionsgrösse
   ④ Asymm. TPs        — 15/20/25/40% statt 25/25/25/25%
   ⑤ Telegram Polling  — /berechnen /trade /status /hilfe
+
+Changelog v4.8 — Wochen-Report & CSV-Backup:
+  W1: build_weekly_report() — Wochen-P&L-Report mit Trade-Liste
+  W2: Auto-Versand jeden Montag um 08:00 (lokale Zeit)
+  W3: weekly_report_sent_week — verhindert Doppelversand pro Woche
+  B1: /backup — sendet trades.csv + dominus_state.json als Datei via Telegram
+  B2: telegram_file() — neue Hilfsfunktion für Datei-Versand (sendDocument)
 
 Changelog v4.7 — Railway Volume CSV-Archiv:
   V1: csv_log_trade() — Trade-Archiv als CSV direkt auf Railway Volume (/app/data/trades.csv)
@@ -177,7 +184,8 @@ trailing_sl_level: dict = {}  # {symbol: int} — 0=initial, 1=Entry, 2=TP1-Prei
 
 # Daily P&L Report — Aufzeichnung abgeschlossener Trades
 closed_trades: list = []
-daily_report_sent_date: str = ""   # "2026-04-17" — verhindert Doppelversand pro Tag
+daily_report_sent_date:  str = ""   # "2026-04-17" — verhindert Doppelversand pro Tag
+weekly_report_sent_week: str = ""   # "2026-W16" — verhindert Doppelversand pro Woche
 
 # Harsi-Ausstiegslinie
 harsi_sl: dict = {}
@@ -383,6 +391,25 @@ def telegram(msg: str):
         )
     except Exception:
         pass
+
+
+def telegram_file(filepath: str, caption: str = ""):
+    """Sendet eine Datei via Telegram (sendDocument)."""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    if not os.path.isfile(filepath):
+        telegram(f"⚠️ Datei nicht gefunden: <code>{filepath}</code>")
+        return
+    try:
+        with open(filepath, "rb") as f:
+            requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument",
+                data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption},
+                files={"document": (os.path.basename(filepath), f)},
+                timeout=30
+            )
+    except Exception as e:
+        telegram(f"⚠️ Datei-Versand fehlgeschlagen: {e}")
 
 
 def sign(timestamp: str, method: str, path: str, body: str = "") -> str:
@@ -2365,6 +2392,7 @@ def cmd_hilfe():
         "/berechnen — Kontostand + Money-Management + Chart-Links\n"
         "/makro — BTC &amp; Total2 Impuls-Richtung + Trade-Erlaubnis\n"
         "/report — Tages- &amp; Monats-P&amp;L Report\n"
+        "/backup — trades.csv &amp; State als Datei senden\n"
         "\n"
         "⚙️ <b>Aktionen:</b>\n"
         "/trade SYMBOL LONG|SHORT HEBEL ENTRY SL\n"
@@ -2591,6 +2619,76 @@ def build_daily_report(date_str: str = None) -> str:
     return "\n".join(lines)
 
 
+def build_weekly_report() -> str:
+    """Erstellt einen Wochen-P&L-Report für den automatischen Montags-Versand."""
+    now       = datetime.now()
+    # Aktuelle ISO-Woche
+    week_str  = now.strftime("%Y-W%W")
+    # Montag dieser Woche als Startpunkt
+    monday    = now - timedelta(days=now.weekday())
+    monday_ts = monday.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+
+    week_trades = [
+        t for t in closed_trades
+        if t.get("ts", 0) >= monday_ts - 7 * 86400  # letzte 7 Tage
+    ]
+    month_str   = now.strftime("%Y-%m")
+    month_trades = [
+        t for t in closed_trades
+        if datetime.fromtimestamp(t.get("ts", 0)).strftime("%Y-%m") == month_str
+    ]
+
+    def _summary(trades):
+        if not trades:
+            return {"count": 0, "wins": 0, "losses": 0, "total_pnl": 0.0,
+                    "win_rate": 0.0, "best": 0.0, "worst": 0.0}
+        wins   = sum(1 for t in trades if t.get("won", False))
+        losses = len(trades) - wins
+        pnls   = [float(t.get("net_pnl", 0)) for t in trades]
+        return {
+            "count": len(trades), "wins": wins, "losses": losses,
+            "total_pnl": sum(pnls), "win_rate": wins / len(trades) * 100,
+            "best": max(pnls), "worst": min(pnls),
+        }
+
+    ws = _summary(week_trades)
+    ms = _summary(month_trades)
+
+    lines = [
+        f"📊 <b>DOMINUS Wochen-Report — {week_str}</b>",
+        "━━━━━━━━━━━━",
+        "",
+        f"📅 <b>Diese Woche:</b>",
+        f"Trades: {ws['count']}  |  🏆 {ws['wins']} / 🔴 {ws['losses']}",
+        f"Win-Rate: {ws['win_rate']:.0f}%",
+        f"Netto P&L: {ws['total_pnl']:+.2f} USDT",
+    ]
+    if ws['count'] > 0:
+        lines += [f"Bester: {ws['best']:+.2f} USDT  |  Schlechtester: {ws['worst']:+.2f} USDT"]
+
+    if week_trades:
+        lines.append("")
+        lines.append("📋 <b>Trades der Woche:</b>")
+        for t in sorted(week_trades, key=lambda x: x.get("ts", 0)):
+            icon = "🏆" if t.get("won") else "🔴"
+            lines.append(
+                f"  {icon} {t['symbol']} {t.get('direction','?').upper()} "
+                f"| {float(t.get('net_pnl',0)):+.2f} USDT "
+                f"| {t.get('hold_str','?')}"
+            )
+
+    lines += [
+        "",
+        f"📆 <b>Monat ({month_str}):</b>",
+        f"Trades: {ms['count']}  |  🏆 {ms['wins']} / 🔴 {ms['losses']}",
+        f"Win-Rate: {ms['win_rate']:.0f}%",
+        f"Netto P&L: {ms['total_pnl']:+.2f} USDT",
+        "",
+        "📋 /status | /makro | /report",
+    ]
+    return "\n".join(lines)
+
+
 def cmd_report():
     """Sendet den täglichen P&L Report auf Telegram-Anfrage."""
     try:
@@ -2599,6 +2697,26 @@ def cmd_report():
         telegram(report)
     except Exception as e:
         reply(f"❌ Report Fehler: {e}")
+
+
+def cmd_backup():
+    """Sendet trades.csv und dominus_state.json als Backup-Dateien via Telegram."""
+    now_str = datetime.now().strftime("%d.%m.%Y %H:%M")
+    sent = []
+    missing = []
+
+    for filepath in [TRADES_CSV, STATE_FILE]:
+        if os.path.isfile(filepath):
+            telegram_file(filepath, caption=f"📦 Backup {os.path.basename(filepath)} — {now_str}")
+            sent.append(os.path.basename(filepath))
+        else:
+            missing.append(os.path.basename(filepath))
+
+    summary = f"✅ Backup gesendet: {', '.join(sent)}" if sent else ""
+    if missing:
+        summary += f"\n⚠️ Nicht gefunden: {', '.join(missing)}"
+    if summary:
+        telegram(summary.strip())
 
 
 def poll_telegram_commands():
@@ -2642,6 +2760,8 @@ def poll_telegram_commands():
             cmd_refresh(parts)
         elif cmd == "/report":
             cmd_report()
+        elif cmd == "/backup":
+            cmd_backup()
         elif cmd == "/hilfe" or cmd == "/start" or cmd == "/help":
             cmd_hilfe()
         else:
@@ -3165,7 +3285,8 @@ def save_state():
             "trade_data":              trade_data,
             "trailing_sl_level":       trailing_sl_level,
             "closed_trades":           [t for t in closed_trades if t.get("ts", 0) >= time.time() - 90*86400],
-            "daily_report_sent_date":  daily_report_sent_date,
+            "daily_report_sent_date":   daily_report_sent_date,
+            "weekly_report_sent_week":  weekly_report_sent_week,
             "harsi_sl":                harsi_sl,
             "last_h2_signal_time":     h2_ts_serialized,
             "btc_dir":                 btc_dir,
@@ -3179,7 +3300,7 @@ def save_state():
 
 def load_state():
     """Lädt den gespeicherten State aus der JSON-Datei beim Start."""
-    global daily_report_sent_date
+    global daily_report_sent_date, weekly_report_sent_week
     if not os.path.exists(STATE_FILE):
         return
     try:
@@ -3192,7 +3313,8 @@ def load_state():
         trade_data.update(s.get("trade_data", {}))
         trailing_sl_level.update(s.get("trailing_sl_level", {}))
         closed_trades.extend(s.get("closed_trades", []))
-        daily_report_sent_date = s.get("daily_report_sent_date", "")
+        daily_report_sent_date  = s.get("daily_report_sent_date",  "")
+        weekly_report_sent_week = s.get("weekly_report_sent_week", "")
         harsi_sl.update(s.get("harsi_sl", {}))
         # last_h2_signal_time: ISO-Strings → datetime (nur Einträge < 30 Min laden)
         now_utc = datetime.utcnow()
@@ -4024,7 +4146,7 @@ def main():
             poll_telegram_commands()
 
             # ── 0a. Auto Daily Report um 23:59 ─────────────
-            global daily_report_sent_date
+            global daily_report_sent_date, weekly_report_sent_week
             _now   = datetime.now()
             _today = _now.strftime("%Y-%m-%d")
             if _now.hour == 23 and _now.minute == 59 and daily_report_sent_date != _today:
@@ -4036,6 +4158,18 @@ def main():
                     log("[Auto-Report] ✓ Report gesendet")
                 except Exception as _re:
                     log(f"[Auto-Report] ✗ Fehler: {_re}")
+
+            # ── 0b. Auto Weekly Report jeden Montag um 08:00 ────
+            _week = _now.strftime("%Y-W%W")
+            if _now.weekday() == 0 and _now.hour == 8 and _now.minute < 1 and weekly_report_sent_week != _week:
+                log("[Auto-Report] Wöchentlicher P&L Report wird gesendet (Mo 08:00)...")
+                try:
+                    telegram(build_weekly_report())
+                    weekly_report_sent_week = _week
+                    save_state()
+                    log("[Auto-Report] ✓ Wochen-Report gesendet")
+                except Exception as _re:
+                    log(f"[Auto-Report] ✗ Wochen-Report Fehler: {_re}")
 
             # ── 0b. H4 Puffer flushen wenn Zeitfenster abgelaufen ──
             # Lock für den ganzen Check — verhindert Race mit Webhook-Thread
