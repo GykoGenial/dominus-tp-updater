@@ -103,7 +103,7 @@ POLL_INTERVAL = 20    # Sekunden zwischen Checks
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 WEBHOOK_SECRET   = os.environ.get("WEBHOOK_SECRET", "dominus")  # Token für TradingView
-DOCS_URL         = os.environ.get("DOCS_URL", "")               # URL zu Dominus_Alarm_Templates.html (ohne Trailing-Slash)
+DOCS_URL         = os.environ.get("DOCS_URL", "https://GykoGenial.github.io/dominus-tp-updater/Dominus_Alarm_Templates.html")
 
 # Finanzmathematische Parameter
 WINRATE = float(os.environ.get("WINRATE", "0.55"))  # eigene Winrate (historisch)
@@ -169,6 +169,14 @@ def log(msg: str):
 def dir_icon(direction: str) -> str:
     """Richtungs-Icon: 🟢↗️ für Long, 🔴↘️ für Short."""
     return "🟢↗️" if direction == "long" else "🔴↘️"
+
+
+def _doc_link(anchor: str, label: str) -> str:
+    """Klickbarer Telegram-HTML-Link zur Alarm-Anleitung im HTML (via DOCS_URL + Anker).
+    Fallback auf Text-Anker falls DOCS_URL nicht gesetzt."""
+    if DOCS_URL:
+        return f'🔗 <a href="{DOCS_URL}#{anchor}">{label}</a>'
+    return f"🔗 #{anchor} in Dominus_Alarm_Templates.html"
 
 
 def telegram(msg: str):
@@ -2556,17 +2564,35 @@ def start_webhook_server():
             save_state()
 
             if new_dir == "recovering":
+                _anker = "sec-alarm5c" if signal_type == "BTC_DIR" else "sec-alarm5d"
+                _albl  = ("Alarm 5c — BTC Long Recovery" if signal_type == "BTC_DIR"
+                           else "Alarm 5d — Total2 Long Recovery")
                 dir_label = "🟡 Recovering Long (−10→0)"
-                dir_info  = "Impuls verlässt Oversold-Zone.\n🟡 <b>Nur Premium-Longs</b> erlaubt bis Bestätigung bei 0."
+                dir_info  = (
+                    "Impuls verlässt Oversold-Zone.\n"
+                    "🟡 <b>Nur Premium-Longs</b> erlaubt bis Bestätigung bei 0.\n"
+                    + _doc_link(_anker, _albl)
+                )
             elif new_dir == "recovering_short":
+                _anker = "sec-alarm5e" if signal_type == "BTC_DIR" else "sec-alarm5f"
+                _albl  = ("Alarm 5e — BTC Short Recovery" if signal_type == "BTC_DIR"
+                           else "Alarm 5f — Total2 Short Recovery")
                 dir_label = "🟠 Recovering Short (0→+10)"
-                dir_info  = "Impuls verlässt Overbought-Zone.\n🟠 <b>Nur Premium-Shorts</b> erlaubt bis Bestätigung bei 0."
+                dir_info  = (
+                    "Impuls verlässt Overbought-Zone.\n"
+                    "🟠 <b>Nur Premium-Shorts</b> erlaubt bis Bestätigung bei 0.\n"
+                    + _doc_link(_anker, _albl)
+                )
             elif direction == "long":
+                _anker = "sec-alarm5" if signal_type == "BTC_DIR" else "sec-alarm5b"
+                _albl  = "Alarm 5 — BTC Long" if signal_type == "BTC_DIR" else "Alarm 5b — Total2 Long"
                 dir_label = "🟢 Grün (Bullish bestätigt)"
-                dir_info  = "Impuls über Nulllinie bestätigt."
+                dir_info  = "Impuls über Nulllinie bestätigt.\n" + _doc_link(_anker, _albl)
             else:
+                _anker = "sec-alarm5" if signal_type == "BTC_DIR" else "sec-alarm5b"
+                _albl  = "Alarm 5 — BTC Short" if signal_type == "BTC_DIR" else "Alarm 5b — Total2 Short"
                 dir_label = "🔴 Rot (Bearish)"
-                dir_info  = "Impuls unter Nulllinie."
+                dir_info  = "Impuls unter Nulllinie.\n" + _doc_link(_anker, _albl)
             log(f"📡 {label} DOM-DIR geändert → {new_dir.upper()} (vorher: {prev or '?'})")
 
             # Offene Positionen prüfen: Positionen GEGEN neuen Impuls warnen
@@ -2659,9 +2685,12 @@ def start_webhook_server():
                 "",
             ]
             if timing_ok:
+                _e_anker = "sec-alarm2" if direction == "long" else "sec-alarm2b"
+                _e_lbl   = "Alarm 2 Long Entry" if direction == "long" else "Alarm 2b Short Entry"
                 msg_parts += [
                     "📋 <b>Einstieg jetzt möglich:</b>",
                     f"/trade {symbol} {direction.upper()} [HEBEL] {entry:.5f} [SL]",
+                    _doc_link(_e_anker, _e_lbl),
                 ]
             else:
                 msg_parts += [
@@ -2785,11 +2814,22 @@ def start_webhook_server():
                 f"{_docs_link}"
             )
         elif _recovering_long and premium_val != 1:
-            timer_line = "🟡 <b>Long-Recovery — nur bei Premium-Long einsteigen!</b>"
+            timer_line = (
+                "🟡 <b>Long-Recovery — nur bei Premium-Long einsteigen!</b>\n"
+                + _doc_link("sec-alarm2", "Alarm 2 Long Entry")
+            )
         elif _recovering_short_trade and premium_val != 1:
-            timer_line = "🟠 <b>Short-Recovery — nur bei Premium-Short einsteigen!</b>"
+            timer_line = (
+                "🟠 <b>Short-Recovery — nur bei Premium-Short einsteigen!</b>\n"
+                + _doc_link("sec-alarm2b", "Alarm 2b Short Entry")
+            )
         else:
-            timer_line = "⏱ <b>30 Min zum Einsteigen — jetzt /trade!</b>"
+            _e_anker = "sec-alarm2" if direction == "long" else "sec-alarm2b"
+            _e_lbl   = "Alarm 2 Long Entry" if direction == "long" else "Alarm 2b Short Entry"
+            timer_line = (
+                "⏱ <b>30 Min zum Einsteigen — jetzt /trade!</b>\n"
+                + _doc_link(_e_anker, _e_lbl)
+            )
 
         msg_parts = [
             f"{icon} <b>H2 Signal — {symbol} {direction.upper()}</b>",
