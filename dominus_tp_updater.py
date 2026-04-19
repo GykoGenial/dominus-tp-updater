@@ -1,5 +1,5 @@
 """
-DOMINUS Trade-Automatisierung v4.4
+DOMINUS Trade-Automatisierung v4.7
 ══════════════════════════════════════════════════════════════
 Vollautomatisches Setup nach DOMINUS-Strategie (Handbuch März 2026)
 Finanzmathematische Optimierungen:
@@ -8,6 +8,12 @@ Finanzmathematische Optimierungen:
   ③ Kelly-Kriterium   — optimale Positionsgrösse
   ④ Asymm. TPs        — 15/20/25/40% statt 25/25/25/25%
   ⑤ Telegram Polling  — /berechnen /trade /status /hilfe
+
+Changelog v4.7 — Railway Volume CSV-Archiv:
+  V1: csv_log_trade() — Trade-Archiv als CSV direkt auf Railway Volume (/app/data/trades.csv)
+  V2: TRADES_CSV — konfigurierbar via Railway Variable (Standard: /app/data/trades.csv)
+  V3: STATE_FILE Default → /app/data/dominus_state.json (Railway Volume)
+  V4: /app/data/-Verzeichnis wird automatisch angelegt (os.makedirs)
 
 Changelog v4.6 — Google Sheets Archiv & Telegram-Überarbeitung:
   G1: sheets_log_trade() — permanentes Trade-Archiv in Google Sheets (non-blocking Thread)
@@ -88,6 +94,8 @@ try:
 except ImportError:
     FLASK_AVAILABLE = False
 
+import csv
+
 try:
     import gspread
     from google.oauth2.service_account import Credentials as _GCredentials
@@ -135,6 +143,7 @@ WEBHOOK_SECRET   = os.environ.get("WEBHOOK_SECRET", "dominus")  # Token für Tra
 DOCS_URL           = os.environ.get("DOCS_URL", "https://GykoGenial.github.io/dominus-tp-updater/Dominus_Alarm_Templates.html")
 GOOGLE_CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS", "")  # Service Account JSON als String
 GOOGLE_SHEET_ID    = os.environ.get("GOOGLE_SHEET_ID",    "")  # Spreadsheet ID aus URL
+TRADES_CSV         = os.environ.get("TRADES_CSV", "/app/data/trades.csv")  # Persistentes Trade-Archiv auf Railway Volume
 
 # Finanzmathematische Parameter
 WINRATE = float(os.environ.get("WINRATE", "0.55"))  # eigene Winrate (historisch)
@@ -305,6 +314,61 @@ def sheets_log_trade(trade: dict):
 
     # In separatem Thread — blockiert den Webhook-Handler nicht
     threading.Thread(target=_append, daemon=True).start()
+
+
+_CSV_HEADER = [
+    "Datum", "Zeit (UTC)", "Symbol", "Richtung", "Hebel",
+    "Entry", "Close", "PnL USDT", "ROI %", "Dauer",
+    "Trailing Level", "Won", "Monat", "Jahr",
+]
+
+
+def csv_log_trade(trade: dict):
+    """Hängt einen abgeschlossenen Trade ans Railway-Volume CSV an (non-blocking)."""
+    if not TRADES_CSV:
+        return
+
+    def _write():
+        try:
+            ts       = trade.get("ts", time.time())
+            dt       = datetime.utcfromtimestamp(ts)
+            pnl      = float(trade.get("net_pnl", 0))
+            entry_px = float(trade.get("entry", 0))
+            close_px = float(trade.get("close_price", 0))
+            lev      = int(trade.get("leverage", 1))
+            roi_pct  = round((close_px - entry_px) / entry_px * lev * 100, 2) if entry_px > 0 else 0
+            if trade.get("direction") == "short":
+                roi_pct = -roi_pct
+
+            # Verzeichnis anlegen falls noch nicht vorhanden
+            os.makedirs(os.path.dirname(TRADES_CSV), exist_ok=True)
+
+            file_exists = os.path.isfile(TRADES_CSV)
+            with open(TRADES_CSV, "a", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f, delimiter=";")
+                if not file_exists:
+                    writer.writerow(_CSV_HEADER)  # Header nur beim ersten Mal
+                writer.writerow([
+                    dt.strftime("%d.%m.%Y"),            # Datum
+                    dt.strftime("%H:%M"),                # Zeit UTC
+                    trade.get("symbol", ""),             # Symbol
+                    trade.get("direction", "").upper(),  # Richtung
+                    lev,                                 # Hebel
+                    entry_px,                            # Entry
+                    close_px,                            # Close
+                    round(pnl, 2),                       # PnL USDT
+                    roi_pct,                             # ROI %
+                    trade.get("hold_str", ""),           # Dauer
+                    trade.get("trailing_level", 0),      # Trailing Level
+                    "Ja" if trade.get("won") else "Nein", # Won
+                    dt.strftime("%Y-%m"),                # Monat (für Filterung)
+                    dt.strftime("%Y"),                   # Jahr
+                ])
+            log(f"[CSV] Trade geloggt: {trade.get('symbol')} {pnl:+.2f} USDT → {TRADES_CSV}")
+        except Exception as e:
+            log(f"[CSV] Log-Fehler: {e}")
+
+    threading.Thread(target=_write, daemon=True).start()
 
 
 def telegram(msg: str):
@@ -1166,6 +1230,7 @@ def handle_position_closed(symbol: str, reason: str = ""):
         "won":            won,
     }
     closed_trades.append(_trade_record)
+    csv_log_trade(_trade_record)     # → Railway Volume CSV (non-blocking, immer aktiv)
     sheets_log_trade(_trade_record)  # → Google Sheets (non-blocking, optional)
     save_state()
 
@@ -3077,12 +3142,12 @@ def start_webhook_server():
 # STATE PERSISTENZ (speichern / laden)
 # ═══════════════════════════════════════════════════════════════
 
-STATE_FILE = os.environ.get("STATE_FILE", "/tmp/dominus_state.json")
-# WARNUNG: /tmp/ ist auf Railway flüchtig (wird bei Restart geleert).
-# Persistenter State: STATE_FILE als Railway-Variable auf /app/dominus_state.json setzen.
-if not os.environ.get("STATE_FILE"):
-    print("[WARN] STATE_FILE nicht gesetzt — State liegt in /tmp/ und geht bei Restart verloren!")
-    print("[WARN] → Railway Variable STATE_FILE=/app/dominus_state.json setzen.")
+STATE_FILE = os.environ.get("STATE_FILE", "/app/data/dominus_state.json")
+# /app/data/ = Railway Volume (persistiert über Restarts und Redeploys).
+# Falls kein Volume gemountet: Railway Variable STATE_FILE=/app/data/dominus_state.json setzen.
+if not os.path.isdir("/app/data"):
+    print("[WARN] /app/data/ nicht gefunden — Railway Volume korrekt gemountet?")
+    print("[WARN] → Volume-Mount-Path: /app/data | STATE_FILE=/app/data/dominus_state.json")
 
 
 def save_state():
