@@ -1,5 +1,5 @@
 """
-DOMINUS Trade-Automatisierung v4.8
+DOMINUS Trade-Automatisierung v4.9
 ══════════════════════════════════════════════════════════════
 Vollautomatisches Setup nach DOMINUS-Strategie (Handbuch März 2026)
 Finanzmathematische Optimierungen:
@@ -8,6 +8,14 @@ Finanzmathematische Optimierungen:
   ③ Kelly-Kriterium   — optimale Positionsgrösse
   ④ Asymm. TPs        — 15/20/25/40% statt 25/25/25/25%
   ⑤ Telegram Polling  — /berechnen /trade /status /hilfe /alarm
+
+Changelog v4.9 — Makro-Extremzonen-Block (Falling-Knife-Schutz):
+  M1: macro_extreme-State + EXTREME_COOLDOWN_H (default 4h)
+  M2: Webhook-Signale BTC_OVERSOLD/BTC_OVERBOUGHT/T2_OVERSOLD/T2_OVERBOUGHT
+      setzen Hard-Block für Entries in Gegen-Richtung (long↔oversold, short↔overbought)
+  M3: extreme_block() prüft beide Makros in H2_SIGNAL, HARSI_EXIT und /trade
+  M4: /status zeigt aktuellen Makro-Extremzonen-Zustand + Restzeit
+  M5: State persistiert (save_state/load_state), Cooldown überlebt Restart
 
 Changelog v4.8 — Copy-Paste Alarm-Generator für TradingView:
   A1: /alarm Command — generiert fertige Alarm-Vorlagen (Name, Bedingung, JSON, Webhook-URL)
@@ -211,6 +219,23 @@ last_h2_signal_time: dict = {}   # {symbol_dir: datetime}
 btc_dir:  str = ""   # aktuelle BTC Impuls-Richtung
 t2_dir:   str = ""   # aktuelle Total2 Impuls-Richtung
 
+# ────────────────────────────────────────────────────────────────
+# v4.9: Makro-Extremzonen-Block (Falling-Knife-Schutz)
+# ────────────────────────────────────────────────────────────────
+# state:  -1 = OVERSOLD   (Impuls ≤ -10) → LONG-Entries werden blockiert
+#         +1 = OVERBOUGHT (Impuls ≥ +10) → SHORT-Entries werden blockiert
+#          0 = neutral (kein Block)
+# until_ts: UNIX-Zeit, bis wann der Block greift (gesetzt durch Oversold/Overbought-Alarm
+#           + EXTREME_COOLDOWN_H Stunden). Ein neuer Oversold-/Overbought-Alarm setzt
+#           den until_ts neu (Sliding Window). Nach Ablauf: state bleibt stehen, aber
+#           extreme_block() gibt keinen Block mehr zurück.
+EXTREME_COOLDOWN_H = int(os.environ.get("EXTREME_COOLDOWN_H", "4"))
+
+macro_extreme: dict = {
+    "btc":    {"state": 0, "until_ts": 0.0},
+    "total2": {"state": 0, "until_ts": 0.0},
+}
+
 
 # ═══════════════════════════════════════════════════════════════
 # BASIS-FUNKTIONEN
@@ -231,6 +256,108 @@ def _doc_link(anchor: str, label: str) -> str:
     if DOCS_URL:
         return f'🔗 <a href="{DOCS_URL}#{anchor}">{label}</a>'
     return f"🔗 #{anchor} in Dominus_Alarm_Templates.html"
+
+
+# ═══════════════════════════════════════════════════════════════
+# v4.9: MAKRO-EXTREMZONEN-BLOCK — Falling-Knife-Schutz
+# ═══════════════════════════════════════════════════════════════
+
+def _set_macro_extreme(market: str, state_val: int) -> None:
+    """Setzt Oversold (-1) oder Overbought (+1) für 'btc' oder 'total2'.
+    until_ts = now + EXTREME_COOLDOWN_H Stunden (Sliding Window: ein neuer Alarm
+    in der gleichen Richtung schiebt den Ablauf nach hinten)."""
+    if market not in macro_extreme:
+        return
+    macro_extreme[market]["state"]    = state_val
+    macro_extreme[market]["until_ts"] = time.time() + EXTREME_COOLDOWN_H * 3600
+
+
+def _reset_macro_extreme(market: str) -> None:
+    """Zurücksetzen nach Ablauf oder Gegen-Signal. Belässt state auf 0."""
+    if market not in macro_extreme:
+        return
+    macro_extreme[market]["state"]    = 0
+    macro_extreme[market]["until_ts"] = 0.0
+
+
+def extreme_block(direction: str) -> list:
+    """
+    Gibt eine Liste von Block-Gründen zurück. Leere Liste = kein Block.
+
+    Regel:
+      • LONG  wird blockiert wenn BTC oder Total2 in OVERSOLD-Cooldown sind
+        (verhindert Falling-Knife in Extrem-Downtrend)
+      • SHORT wird blockiert wenn BTC oder Total2 in OVERBOUGHT-Cooldown sind
+        (verhindert Top-Selling in Extrem-Uptrend)
+
+    Abgelaufene Cooldowns werden automatisch zurückgesetzt.
+    """
+    if direction not in ("long", "short"):
+        return []
+    now = time.time()
+    reasons: list = []
+    for market, label in (("btc", "BTC"), ("total2", "Total2")):
+        s = macro_extreme.get(market, {})
+        state    = int(s.get("state", 0))
+        until_ts = float(s.get("until_ts", 0.0))
+        # Abgelaufen? → zurücksetzen
+        if until_ts > 0 and until_ts <= now:
+            _reset_macro_extreme(market)
+            continue
+        if state == 0 or until_ts == 0:
+            continue
+        remaining_h = max(0.0, (until_ts - now) / 3600.0)
+        if direction == "long" and state == -1:
+            reasons.append(f"{label} OVERSOLD (noch {remaining_h:.1f}h)")
+        elif direction == "short" and state == +1:
+            reasons.append(f"{label} OVERBOUGHT (noch {remaining_h:.1f}h)")
+    return reasons
+
+
+def macro_extreme_status_lines() -> list:
+    """Lesbare Status-Zeilen für /status — zeigt ob aktuell geblockt wird."""
+    now = time.time()
+    lines: list = []
+    for market, label in (("btc", "BTC"), ("total2", "Total2")):
+        s = macro_extreme.get(market, {})
+        state    = int(s.get("state", 0))
+        until_ts = float(s.get("until_ts", 0.0))
+        if until_ts > 0 and until_ts <= now:
+            _reset_macro_extreme(market)
+            state, until_ts = 0, 0.0
+        if state == 0:
+            lines.append(f"  {label}: ✅ neutral")
+            continue
+        remaining_min = int((until_ts - now) / 60)
+        h, m = divmod(remaining_min, 60)
+        if state == -1:
+            lines.append(f"  {label}: 🔻 OVERSOLD (Long-Block noch {h}h {m}min)")
+        else:
+            lines.append(f"  {label}: 🔺 OVERBOUGHT (Short-Block noch {h}h {m}min)")
+    return lines
+
+
+def format_extreme_block_msg(symbol: str, direction: str, reasons: list, source: str) -> str:
+    """Standardisierte Telegram-Nachricht, wenn ein Entry wegen Makro-Extremzone abgelehnt wird."""
+    lines = [
+        f"🛑 <b>Entry BLOCKIERT — {symbol} {direction.upper()}</b>",
+        "━" * 12,
+        f"Quelle: {source}",
+        "",
+        "<b>Makro-Extremzonen aktiv:</b>",
+    ]
+    for r in reasons:
+        lines.append(f"  • {r}")
+    lines += [
+        "",
+        "Dieser Entry wird verworfen (v4.9 Falling-Knife-Schutz).",
+        f"Cooldown: {EXTREME_COOLDOWN_H}h je Oversold/Overbought-Alarm.",
+        "",
+        "Next Steps:",
+        "  • /status — zeigt verbleibende Cooldown-Zeit",
+        "  • Warte auf Gegen-Signal (Impuls → Grün/Rot) oder Ablauf",
+    ]
+    return "\n".join(lines)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -2205,6 +2332,14 @@ def cmd_trade(parts: list):
         reply("❌ Richtung muss LONG oder SHORT sein.")
         return
 
+    # v4.9: Makro-Extremzonen-Block — refuse BEFORE calculating anything.
+    # Ein LONG bei BTC-Oversold oder SHORT bei BTC-Overbought wird gar nicht erst
+    # gerechnet, damit der Nutzer nicht in Versuchung kommt die Warnung zu ignorieren.
+    _xblock = extreme_block(direction)
+    if _xblock:
+        reply(format_extreme_block_msg(symbol, direction, _xblock, "/trade"))
+        return
+
     # Validierungen
     if direction == "long" and sl >= entry:
         reply(f"❌ SL ({sl}) muss bei Long unter Entry ({entry}) liegen.")
@@ -2719,16 +2854,31 @@ def cmd_hilfe():
         "⚡ <b>Automatisch nach /trade:</b>\n"
         "• DCA1 + DCA2 Limit-Orders (20/30/50% Sizing)\n"
         "• TP1–TP4 (15/20/25/40% ROI)\n"
-        "• SL → Entry nach TP1 | Trailing SL nach TP2/TP3"
+        "• SL → Entry nach TP1 | Trailing SL nach TP2/TP3\n"
+        "\n"
+        "🛡️ <b>v4.9 Makro-Extremzonen-Block:</b>\n"
+        "• TradingView-Alarme BTC_OVERSOLD / BTC_OVERBOUGHT\n"
+        "  + T2_OVERSOLD / T2_OVERBOUGHT aktivieren Hard-Block\n"
+        "• Cooldown 4h (EXTREME_COOLDOWN_H): LONG in Oversold\n"
+        "  bzw. SHORT in Overbought wird automatisch blockiert\n"
+        "• Status der Zonen sichtbar unter /status"
     )
 
 
 def cmd_status():
-    """Kurzer Positionsstatus."""
+    """Kurzer Positionsstatus + v4.9 Makro-Extremzonen."""
+    # v4.9: Makro-Extremzonen vorab auflisten (auch bei 0 offenen Positionen relevant)
+    _extreme_lines = macro_extreme_status_lines()
+    _any_block     = any("Block" in l for l in _extreme_lines)
+    _macro_header  = "🌍 <b>Makro-Extremzonen:</b>" + (" ⚠️" if _any_block else "")
+
     positions = get_all_positions()
     if not positions:
         reply(
             "✅ Keine offenen Positionen.\n"
+            "\n"
+            + _macro_header + "\n"
+            + "\n".join(_extreme_lines) + "\n"
             "\n"
             "📋 /berechnen | /makro | /report"
         )
@@ -2755,6 +2905,9 @@ def cmd_status():
             f"   Mark: {mark} | PnL: {pnl:+.2f} USDT{trl_tag}"
         )
     lines += [
+        "",
+        _macro_header,
+        *_extreme_lines,
         "",
         "📋 /berechnen | /makro | /report | /refresh",
     ]
@@ -3146,6 +3299,67 @@ def start_webhook_server():
         log(f"\U0001f4e1 Alert: {symbol} {direction.upper()} @ {entry} [{timeframe}]")
 
         # ─────────────────────────────────────────────────────────────
+        # v4.9: BTC_OVERSOLD / BTC_OVERBOUGHT / T2_OVERSOLD / T2_OVERBOUGHT
+        # Makro-Extremzonen-Alarm — setzt Cooldown-Block für Entries in Gegenrichtung
+        # ─────────────────────────────────────────────────────────────
+        if signal_type in ("BTC_OVERSOLD", "BTC_OVERBOUGHT",
+                            "T2_OVERSOLD",  "T2_OVERBOUGHT"):
+            _market = "btc" if signal_type.startswith("BTC_") else "total2"
+            _label  = "BTC" if _market == "btc" else "Total2"
+            if signal_type.endswith("_OVERSOLD"):
+                _set_macro_extreme(_market, -1)
+                _state_txt   = "OVERSOLD"
+                _emoji       = "🔻"
+                _blocks      = "LONG"
+            else:
+                _set_macro_extreme(_market, +1)
+                _state_txt   = "OVERBOUGHT"
+                _emoji       = "🔺"
+                _blocks      = "SHORT"
+            save_state()
+
+            _until_ts  = macro_extreme[_market]["until_ts"]
+            _until_str = datetime.utcfromtimestamp(_until_ts).strftime("%d.%m.%Y %H:%M UTC")
+            log(f"📡 {_label} → {_state_txt} (Block bis {_until_str})")
+
+            # Offene Gegenpositionen warnen (analog zu BTC_DIR)
+            _target_side = "long" if _blocks == "LONG" else "short"
+            _warn_trades = []
+            for pos in get_all_positions():
+                if pos.get("holdSide", "").lower() == _target_side:
+                    _sym  = pos.get("symbol", "")
+                    _pnl  = float(pos.get("unrealizedPL", 0))
+                    _warn_trades.append(f"  ⚠️ {_sym} {_target_side.upper()} | PnL={_pnl:+.2f} USDT")
+
+            _msg_lines = [
+                f"{_emoji} <b>{_label} Impuls → {_state_txt}</b>",
+                "━" * 12,
+                f"🛑 <b>{_blocks}-Entry-Block aktiviert</b>",
+                f"Cooldown: {EXTREME_COOLDOWN_H}h",
+                f"Läuft ab: <b>{_until_str}</b>",
+                "",
+                "→ Neue H2-Signale in Block-Richtung werden abgelehnt.",
+                "→ Bestehende Positionen laufen normal weiter (Trailing SL aktiv).",
+            ]
+            if _warn_trades:
+                _msg_lines += [
+                    "",
+                    f"⚠️ <b>Offene {_target_side.upper()}-Positionen (entgegen Makro):</b>",
+                    *_warn_trades,
+                    "",
+                    "🔔 SL/Trailing prüfen!",
+                ]
+            telegram("\n".join(_msg_lines))
+
+            return jsonify({
+                "status":   "ok",
+                "market":   _market,
+                "extreme":  _state_txt,
+                "blocks":   _blocks,
+                "until":    _until_str,
+            }), 200
+
+        # ─────────────────────────────────────────────────────────────
         # BTC_DIR / T2_DIR — Makro-Kontext: DOM-DIR Impuls-Richtung geändert
         # Webhook von BTC H2 Chart (signal=BTC_DIR) oder Total2 (signal=T2_DIR)
         # zone="neutral"    → direction long/short ab Nulllinie (bestätigt)
@@ -3253,6 +3467,15 @@ def start_webhook_server():
             # Hier wird geprüft ob das 30-Min-Fenster nach dem letzten H2_SIGNAL
             # noch offen ist. Falls abgelaufen oder unbekannt → Warnung in Telegram.
             # ─────────────────────────────────────────────────────────────
+            # v4.9: Makro-Extremzonen-Block vor allem anderen prüfen.
+            # Wenn BTC oder Total2 gerade in Oversold/Overbought ist, wird der Entry
+            # verworfen (Hard-Block). Bestehende Positionen laufen normal weiter.
+            _xblock = extreme_block(direction)
+            if _xblock:
+                telegram(format_extreme_block_msg(symbol, direction, _xblock, "HARSI_EXIT"))
+                return jsonify({"status": "blocked", "reasons": _xblock,
+                                "source": "HARSI_EXIT"}), 200
+
             sig_key = f"{symbol}_{direction}"
             h2_ts   = last_h2_signal_time.get(sig_key)
             icon    = dir_icon(direction)
@@ -3331,6 +3554,16 @@ def start_webhook_server():
                     })
                     log(f"  H4 gepuffert ({len(h4_buffer)} im Puffer)")
             return jsonify({"status": "buffered", "symbol": symbol}), 200
+
+        # v4.9: Makro-Extremzonen-Block vor H2-Signal-Verarbeitung
+        # Wenn BTC/Total2 gerade in Oversold (für Long) oder Overbought (für Short) sind,
+        # wird der Entry verworfen. 30-Min-Fenster wird NICHT gestartet, damit ein späterer
+        # HARSI_EXIT-Alarm sauber ohne stale Timestamp ankommt.
+        _xblock = extreme_block(direction)
+        if _xblock:
+            telegram(format_extreme_block_msg(symbol, direction, _xblock, "H2_SIGNAL"))
+            return jsonify({"status": "blocked", "reasons": _xblock,
+                            "source": "H2_SIGNAL"}), 200
 
         # H2 Signal → H4 Puffer flushen dann sofort senden
         # 30-Min-Fenster starten: Zeitstempel für HARSI_EXIT-Prüfung speichern
@@ -3520,6 +3753,8 @@ def save_state():
             "last_h2_signal_time":     h2_ts_serialized,
             "btc_dir":                 btc_dir,
             "t2_dir":                  t2_dir,
+            # v4.9 Makro-Extremzonen persistieren (überlebt Railway-Restarts)
+            "macro_extreme":           macro_extreme,
         }
         with open(STATE_FILE, "w") as f:
             json.dump(state, f)
@@ -3557,8 +3792,21 @@ def load_state():
         global btc_dir, t2_dir
         btc_dir = s.get("btc_dir", "")
         t2_dir  = s.get("t2_dir",  "")
+        # v4.9: Makro-Extremzonen laden — nur gültige (noch aktive) Cooldowns übernehmen
+        _me_saved = s.get("macro_extreme", {})
+        _now_ts   = time.time()
+        for _mk in ("btc", "total2"):
+            _saved = _me_saved.get(_mk, {})
+            _until = float(_saved.get("until_ts", 0.0))
+            if _until > _now_ts:
+                macro_extreme[_mk]["state"]    = int(_saved.get("state", 0))
+                macro_extreme[_mk]["until_ts"] = _until
+            # sonst: abgelaufen oder leer → bleibt auf Defaults (0 / 0.0)
+        _me_btc = macro_extreme["btc"]["state"]
+        _me_t2  = macro_extreme["total2"]["state"]
         log(f"[load_state] State geladen: {len(last_known_avg)} Position(en) | "
-            f"BTC={btc_dir or '?'} Total2={t2_dir or '?'}")
+            f"BTC={btc_dir or '?'} Total2={t2_dir or '?'} | "
+            f"Makro-Extreme BTC={_me_btc} Total2={_me_t2}")
     except Exception as e:
         log(f"[load_state] Fehler: {e}")
 
