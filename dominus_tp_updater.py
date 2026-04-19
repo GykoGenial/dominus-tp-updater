@@ -9,6 +9,15 @@ Finanzmathematische Optimierungen:
   ④ Asymm. TPs        — 15/20/25/40% statt 25/25/25/25%
   ⑤ Telegram Polling  — /berechnen /trade /status /hilfe
 
+Changelog v4.6 — Google Sheets Archiv & Telegram-Überarbeitung:
+  G1: sheets_log_trade() — permanentes Trade-Archiv in Google Sheets (non-blocking Thread)
+  G2: _get_gsheet_ws() — lazy init, Sheet "Trades" wird auto-angelegt mit Header
+  G3: GOOGLE_CREDENTIALS + GOOGLE_SHEET_ID als Railway Variables
+  T1: /hilfe neu strukturiert (Info / Aktionen / Premium / Automatisch)
+  T2: /status — Qty mit BaseCoin + USDT, Quick-Actions-Footer
+  T3: /makro, /report, /refresh — Quick-Actions-Footer ergänzt
+  T4: /berechnen — Footer auf /status|/makro|/report|/hilfe reduziert
+
 Changelog v4.5 — Symbol-Präzision & Telegram USDT-Anzeige:
   P1: volumePlace (Mengenpräzision) von Bitget Contract-API gecacht pro Symbol
   P2: snap_qty() / round_qty() — korrekte Mengenrundung für alle Symbols (THETA, BTC, etc.)
@@ -58,6 +67,8 @@ RAILWAY VARIABLES:
   TELEGRAM_TOKEN    → optional
   TELEGRAM_CHAT_ID  → optional
   DOCS_URL          → optional — URL zu Dominus_Alarm_Templates.html (z.B. https://dein-server/Dominus_Alarm_Templates.html)
+  GOOGLE_CREDENTIALS → optional — Service Account JSON (komplett, als String)
+  GOOGLE_SHEET_ID    → optional — ID des Google Sheets (aus der URL: /spreadsheets/d/ID/edit)
 ══════════════════════════════════════════════════════════════
 """
 
@@ -76,6 +87,13 @@ try:
     FLASK_AVAILABLE = True
 except ImportError:
     FLASK_AVAILABLE = False
+
+try:
+    import gspread
+    from google.oauth2.service_account import Credentials as _GCredentials
+    GSPREAD_AVAILABLE = True
+except ImportError:
+    GSPREAD_AVAILABLE = False
 
 # ═══════════════════════════════════════════════════════════════
 # KONFIGURATION — aus Railway Variables
@@ -114,7 +132,9 @@ POLL_INTERVAL = 20    # Sekunden zwischen Checks
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 WEBHOOK_SECRET   = os.environ.get("WEBHOOK_SECRET", "dominus")  # Token für TradingView
-DOCS_URL         = os.environ.get("DOCS_URL", "https://GykoGenial.github.io/dominus-tp-updater/Dominus_Alarm_Templates.html")
+DOCS_URL           = os.environ.get("DOCS_URL", "https://GykoGenial.github.io/dominus-tp-updater/Dominus_Alarm_Templates.html")
+GOOGLE_CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS", "")  # Service Account JSON als String
+GOOGLE_SHEET_ID    = os.environ.get("GOOGLE_SHEET_ID",    "")  # Spreadsheet ID aus URL
 
 # Finanzmathematische Parameter
 WINRATE = float(os.environ.get("WINRATE", "0.55"))  # eigene Winrate (historisch)
@@ -190,6 +210,101 @@ def _doc_link(anchor: str, label: str) -> str:
     if DOCS_URL:
         return f'🔗 <a href="{DOCS_URL}#{anchor}">{label}</a>'
     return f"🔗 #{anchor} in Dominus_Alarm_Templates.html"
+
+
+# ═══════════════════════════════════════════════════════════════
+# GOOGLE SHEETS — Permanentes Trade-Archiv
+# ═══════════════════════════════════════════════════════════════
+
+_gsheet_ws = None   # gecachte Worksheet-Instanz (lazy init)
+
+_GSHEET_SCOPES = [
+    "https://spreadsheets.google.com/feeds",
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+
+_GSHEET_HEADER = [
+    "Datum", "Zeit (UTC)", "Symbol", "Richtung", "Hebel",
+    "Entry", "Close", "PnL USDT", "ROI %", "Dauer",
+    "Trailing Level", "Won", "Monat", "Jahr",
+]
+
+
+def _get_gsheet_ws():
+    """Gibt gecachtes Worksheet zurück — lazy init beim ersten Aufruf."""
+    global _gsheet_ws
+    if _gsheet_ws is not None:
+        return _gsheet_ws
+    if not GSPREAD_AVAILABLE:
+        log("[GSheets] gspread nicht installiert — pip install gspread google-auth")
+        return None
+    if not GOOGLE_CREDENTIALS or not GOOGLE_SHEET_ID:
+        return None
+    try:
+        creds_dict = json.loads(GOOGLE_CREDENTIALS)
+        creds      = _GCredentials.from_service_account_info(creds_dict, scopes=_GSHEET_SCOPES)
+        gc         = gspread.authorize(creds)
+        sh         = gc.open_by_key(GOOGLE_SHEET_ID)
+        # Erstes Sheet "Trades" verwenden oder anlegen
+        try:
+            ws = sh.worksheet("Trades")
+        except gspread.WorksheetNotFound:
+            ws = sh.add_worksheet(title="Trades", rows=10000, cols=len(_GSHEET_HEADER))
+            ws.append_row(_GSHEET_HEADER)
+            ws.format("A1:N1", {"textFormat": {"bold": True}})
+        _gsheet_ws = ws
+        log("[GSheets] Verbindung OK — Worksheet 'Trades' bereit")
+        return ws
+    except Exception as e:
+        log(f"[GSheets] Init-Fehler: {e}")
+        return None
+
+
+def sheets_log_trade(trade: dict):
+    """Hängt einen abgeschlossenen Trade ans Google Sheet an (non-blocking)."""
+    if not GOOGLE_CREDENTIALS or not GOOGLE_SHEET_ID:
+        return
+
+    def _append():
+        try:
+            ws = _get_gsheet_ws()
+            if ws is None:
+                return
+            ts       = trade.get("ts", time.time())
+            dt       = datetime.utcfromtimestamp(ts)
+            pnl      = float(trade.get("net_pnl", 0))
+            entry_px = float(trade.get("entry", 0))
+            close_px = float(trade.get("close_price", 0))
+            lev      = int(trade.get("leverage", 1))
+            # ROI% = (PnL / (entry * size / lev)) * 100  — Näherung via net_pnl und entry
+            # Einfachere Variante: direkt aus realized_pnl vs. margin
+            roi_pct  = round((close_px - entry_px) / entry_px * lev * 100, 2) if entry_px > 0 else 0
+            if trade.get("direction") == "short":
+                roi_pct = -roi_pct
+            row = [
+                dt.strftime("%d.%m.%Y"),           # Datum
+                dt.strftime("%H:%M"),               # Zeit UTC
+                trade.get("symbol", ""),            # Symbol
+                trade.get("direction", "").upper(), # Richtung
+                lev,                                # Hebel
+                entry_px,                           # Entry
+                close_px,                           # Close
+                round(pnl, 2),                      # PnL USDT
+                roi_pct,                            # ROI %
+                trade.get("hold_str", ""),          # Dauer
+                trade.get("trailing_level", 0),     # Trailing Level
+                "✓" if trade.get("won") else "✗",  # Won
+                dt.strftime("%Y-%m"),               # Monat (für Pivot)
+                dt.strftime("%Y"),                  # Jahr (für Pivot)
+            ]
+            ws.append_row(row, value_input_option="USER_ENTERED")
+            log(f"[GSheets] Trade geloggt: {trade.get('symbol')} {pnl:+.2f} USDT")
+        except Exception as e:
+            log(f"[GSheets] Log-Fehler: {e}")
+
+    # In separatem Thread — blockiert den Webhook-Handler nicht
+    threading.Thread(target=_append, daemon=True).start()
 
 
 def telegram(msg: str):
@@ -1034,22 +1149,24 @@ def handle_position_closed(symbol: str, reason: str = ""):
 
     telegram("\n".join(msg_lines))
 
-    # Trade für Daily Report aufzeichnen
-    closed_trades.append({
-        "symbol":       symbol,
-        "direction":    direction,
-        "leverage":     leverage,
-        "entry":        entry,
-        "close_price":  close_px,
-        "net_pnl":      net_pnl,
-        "realized_pnl": realized,
-        "fee":          fee,
-        "peak_size":    peak_size,
-        "hold_str":     hold_str,
-        "ts":           int(time.time()),
+    # Trade für Daily Report aufzeichnen + Google Sheets Archiv
+    _trade_record = {
+        "symbol":         symbol,
+        "direction":      direction,
+        "leverage":       leverage,
+        "entry":          entry,
+        "close_price":    close_px,
+        "net_pnl":        net_pnl,
+        "realized_pnl":   realized,
+        "fee":            fee,
+        "peak_size":      peak_size,
+        "hold_str":       hold_str,
+        "ts":             int(time.time()),
         "trailing_level": trailing_sl_level.get(symbol, 0),
-        "won":          won,
-    })
+        "won":            won,
+    }
+    closed_trades.append(_trade_record)
+    sheets_log_trade(_trade_record)  # → Google Sheets (non-blocking, optional)
     save_state()
 
     # Internen Status zurücksetzen
