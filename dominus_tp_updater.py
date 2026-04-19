@@ -7,14 +7,17 @@ Finanzmathematische Optimierungen:
   ② R:R-Filter        — kein Trade unter 1.5 R:R
   ③ Kelly-Kriterium   — optimale Positionsgrösse
   ④ Asymm. TPs        — 15/20/25/40% statt 25/25/25/25%
-  ⑤ Telegram Polling  — /berechnen /trade /status /hilfe
+  ⑤ Telegram Polling  — /berechnen /trade /status /hilfe /alarm
 
-Changelog v4.8 — Wochen-Report & CSV-Backup:
-  W1: build_weekly_report() — Wochen-P&L-Report mit Trade-Liste
-  W2: Auto-Versand jeden Montag um 08:00 (lokale Zeit)
-  W3: weekly_report_sent_week — verhindert Doppelversand pro Woche
-  B1: /backup — sendet trades.csv + dominus_state.json als Datei via Telegram
-  B2: telegram_file() — neue Hilfsfunktion für Datei-Versand (sendDocument)
+Changelog v4.8 — Copy-Paste Alarm-Generator für TradingView:
+  A1: /alarm Command — generiert fertige Alarm-Vorlagen (Name, Bedingung, JSON, Webhook-URL)
+      für Alarm 1/1b (H4), 2/2b (H2), 3/3b (HARSI_EXIT), 4/4b (HARSI_SL)
+  A2: /alarm harsi SYMBOL long|short — berücksichtigt das 30-Min-Fenster aus
+      last_h2_signal_time und zeigt Rest-Minuten bzw. Ablauf-Warnung
+  A3: H2_SIGNAL-Webhook bei harsi_warn=1 → inline-Block mit kopierbarer
+      Alarm-3/3b-Vorlage direkt in der Telegram-Nachricht
+  A4: WEBHOOK_URL Railway-Variable — optional, wird 1:1 in Alarm-Vorlagen eingesetzt
+  A5: /hilfe erweitert um /alarm
 
 Changelog v4.7 — Railway Volume CSV-Archiv:
   V1: csv_log_trade() — Trade-Archiv als CSV direkt auf Railway Volume (/app/data/trades.csv)
@@ -91,6 +94,7 @@ import base64
 import time
 import json
 import os
+import html
 import threading
 import requests
 import math
@@ -147,6 +151,7 @@ POLL_INTERVAL = 20    # Sekunden zwischen Checks
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 WEBHOOK_SECRET   = os.environ.get("WEBHOOK_SECRET", "dominus")  # Token für TradingView
+WEBHOOK_URL      = os.environ.get("WEBHOOK_URL", "")  # optional: vollständige Railway-URL inkl. ?token=… für /alarm-Vorlagen
 DOCS_URL           = os.environ.get("DOCS_URL", "https://GykoGenial.github.io/dominus-tp-updater/Dominus_Alarm_Templates.html")
 GOOGLE_CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS", "")  # Service Account JSON als String
 GOOGLE_SHEET_ID    = os.environ.get("GOOGLE_SHEET_ID",    "")  # Spreadsheet ID aus URL
@@ -184,8 +189,7 @@ trailing_sl_level: dict = {}  # {symbol: int} — 0=initial, 1=Entry, 2=TP1-Prei
 
 # Daily P&L Report — Aufzeichnung abgeschlossener Trades
 closed_trades: list = []
-daily_report_sent_date:  str = ""   # "2026-04-17" — verhindert Doppelversand pro Tag
-weekly_report_sent_week: str = ""   # "2026-W16" — verhindert Doppelversand pro Woche
+daily_report_sent_date: str = ""   # "2026-04-17" — verhindert Doppelversand pro Tag
 
 # Harsi-Ausstiegslinie
 harsi_sl: dict = {}
@@ -391,25 +395,6 @@ def telegram(msg: str):
         )
     except Exception:
         pass
-
-
-def telegram_file(filepath: str, caption: str = ""):
-    """Sendet eine Datei via Telegram (sendDocument)."""
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-    if not os.path.isfile(filepath):
-        telegram(f"⚠️ Datei nicht gefunden: <code>{filepath}</code>")
-        return
-    try:
-        with open(filepath, "rb") as f:
-            requests.post(
-                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument",
-                data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption},
-                files={"document": (os.path.basename(filepath), f)},
-                timeout=30
-            )
-    except Exception as e:
-        telegram(f"⚠️ Datei-Versand fehlgeschlagen: {e}")
 
 
 def sign(timestamp: str, method: str, path: str, body: str = "") -> str:
@@ -2382,6 +2367,325 @@ def cmd_makro():
     )
 
 
+# ═══════════════════════════════════════════════════════════════
+# ALARM-VORLAGEN-GENERATOR (v4.8) — Copy & Paste für TradingView
+# ───────────────────────────────────────────────────────────────
+# Erzeugt fertige Alarm-Vorlagen (Name, Bedingung, Message-JSON,
+# Webhook-URL, Einstellungen) die der User nur noch per Copy-Paste
+# in den TradingView-Alarm-Dialog einfügen muss.
+# Abgedeckt: Alarm 1/1b (H4_TRIGGER), 2/2b (H2_SIGNAL),
+#            3/3b (HARSI_EXIT — inkl. 30-Min-Fenster-Status),
+#            4/4b (HARSI_SL).
+# ═══════════════════════════════════════════════════════════════
+
+_WEBHOOK_URL_PLACEHOLDER = "<deine-railway-domain>"
+
+
+def _alarm_webhook_url() -> str:
+    """Vollständige Webhook-URL inkl. Token für die Alarm-Vorlage.
+    Nutzt WEBHOOK_URL (Railway Variable) 1:1; sonst Fallback mit Hinweis-
+    Placeholder für die Domain."""
+    if WEBHOOK_URL:
+        return WEBHOOK_URL
+    token = WEBHOOK_SECRET or "dominus"
+    return f"https://{_WEBHOOK_URL_PLACEHOLDER}/webhook?token={token}"
+
+
+def _alarm_window_status(symbol: str, direction: str) -> tuple:
+    """(status_line_html, is_active) — prüft last_h2_signal_time[symbol_direction].
+    Gibt dem User sofort Klarheit ob der HARSI-Alarm überhaupt noch Sinn macht."""
+    key = f"{symbol}_{direction}"
+    ts  = last_h2_signal_time.get(key)
+    if ts is None:
+        return (
+            "ℹ️ <i>Kein aktives H2-Signal für diese Richtung gespeichert — "
+            "Alarm-Vorlage kann trotzdem genutzt werden, das 30-Min-Fenster "
+            "startet sobald Alarm 2/2b das nächste Mal feuert.</i>",
+            False,
+        )
+    elapsed_sec = (datetime.utcnow() - ts).total_seconds()
+    elapsed_min = int(elapsed_sec // 60)
+    if elapsed_sec > 1800:
+        return (
+            f"⛔ <b>30-Min-Fenster abgelaufen</b> — H2-Signal vor {elapsed_min} Min empfangen.\n"
+            f"Signal gilt laut DOMINUS-Regel <b>nicht mehr</b> — HARSI-Exit jetzt nicht mehr einsteigen!",
+            False,
+        )
+    remaining = 30 - elapsed_min
+    expiry = (ts + timedelta(minutes=30)).strftime("%d.%m.%Y %H:%M UTC")
+    return (
+        f"⏱ <b>Fenster offen — noch ca. {remaining} Min gültig</b> (läuft {expiry} ab)",
+        True,
+    )
+
+
+def _alarm_block(title: str, alarm_name: str, condition_html: str, json_msg: str,
+                 trigger_cfg: str, doc_anchor: str, window_line: str = "") -> str:
+    """Einheitlicher Copy-Paste-Block — Name/JSON/URL als <code> für
+    Telegram „tap to copy". html.escape() nur auf externe Strings
+    (Symbol/Webhook/etc.) — das Pine-Template {{close}} darf NICHT
+    escaped werden, sonst funktioniert es in TradingView nicht."""
+    webhook = _alarm_webhook_url()
+    parts = [f"🔔 <b>{title}</b>", "━" * 12]
+    if window_line:
+        parts += [window_line, ""]
+    parts += [
+        "<b>① Alarm-Name</b> — kopieren:",
+        f"<code>{html.escape(alarm_name)}</code>",
+        "",
+        "<b>② Bedingung</b> im TV-Alarm-Dialog einstellen:",
+        condition_html,
+        "",
+        "<b>③ Message (JSON)</b> — kopieren &amp; ins Message-Feld einfügen:",
+        f"<code>{html.escape(json_msg)}</code>",
+        "",
+        "<b>④ Webhook-URL</b> — unter <i>Benachrichtigungen → Webhook-URL</i>:",
+        f"<code>{html.escape(webhook)}</code>",
+        "",
+        f"<b>⑤ Einstellungen:</b> {trigger_cfg}",
+        "",
+        _doc_link(doc_anchor, "Detaillierte Anleitung im Handbuch"),
+    ]
+    return "\n".join(parts)
+
+
+def build_alarm_harsi_exit(symbol: str, direction: str, show_window: bool = True) -> str:
+    """Alarm 3/3b — HARSI_EXIT. Berücksichtigt das 30-Min-Fenster
+    aus last_h2_signal_time."""
+    is_long = direction == "long"
+    label   = "Long" if is_long else "Short"
+    side    = "long" if is_long else "short"
+    alarm_name = f"⏰ DOMINUS {label} HARSI frei"
+    condition = (
+        f"Indikator <b>DOMINUS Orchestrator</b> → Bedingung <b>DOMINUS {label} HARSI frei</b>\n"
+        f"Intervall: <b>H2</b> · Auslösung: <b>Einmal pro Bar Close</b> · Typ: <b>Einzelner Coin</b>"
+    )
+    # JSON identisch zum HTML-Template (Alarm 3/3b)
+    json_msg = (
+        '{"symbol":"' + symbol + '","side":"' + side +
+        '","entry":{{close}},"timeframe":"{{interval}}","signal":"HARSI_EXIT"}'
+    )
+    trigger_cfg = "Einmal pro Bar · Unbefristet · App + Ton · Typ: Technisch"
+    anchor = "sec-alarm3" if is_long else "sec-alarm3b"
+    title  = f"Alarm {'3' if is_long else '3b'} — HARSI Exit {label} ({symbol})"
+
+    window_line = ""
+    if show_window:
+        wl, _active = _alarm_window_status(symbol, direction)
+        window_line = wl
+    # Strikte 30-Min-Regel immer explizit anhängen (auch bei leerem Fenster-Status)
+    strict = (
+        "⚠️ <b>Strikt 30 Min ab H2-Signal</b> — danach Alarm in TV löschen; "
+        "spätere Feuerungen nicht mehr traden."
+    )
+    window_line = (window_line + "\n" + strict) if window_line else strict
+    return _alarm_block(title, alarm_name, condition, json_msg, trigger_cfg, anchor, window_line)
+
+
+def build_alarm_harsi_sl(symbol: str, direction: str) -> str:
+    """Alarm 4/4b — HARSI_SL: zieht SL bei offenem Trade auf HARSI-Ausstiegslinie."""
+    is_long = direction == "long"
+    label   = "Long" if is_long else "Short"
+    direction_val = "long" if is_long else "short"
+    alarm_name = f"🛡 DOMINUS HARSI SL {label}"
+    cross_dir  = "aufwärts" if is_long else "abwärts"
+    cross_val  = "−20" if is_long else "+20"
+    condition = (
+        f"Indikator <b>HARSI</b> → Plot <b>RSI Histogram</b> · kreuzt <b>{cross_dir}</b> · "
+        f"Wert <code>{cross_val}</code>\n"
+        f"Intervall: <b>H2</b> · Auslösung: <b>Einmal pro Bar Close</b> · Typ: <b>Einzelner Coin</b>\n"
+        f"<i>Wichtig:</i> im JSON-Message unten <code>RSI Overlay</code> (echter Preis) — "
+        f"<b>nicht</b> RSI Histogram!"
+    )
+    # JSON identisch zum HTML-Template (Alarm 4/4b)
+    json_msg = (
+        '{"symbol":"' + symbol + '","direction":"' + direction_val +
+        '","signal":"HARSI_SL","price":{{plot("RSI Overlay")}}}'
+    )
+    trigger_cfg = "Einmal pro Bar · Unbefristet · App + Ton · Typ: Technisch"
+    anchor = "sec-alarm4" if is_long else "sec-alarm4b"
+    title  = f"Alarm {'4' if is_long else '4b'} — HARSI SL {label} ({symbol})"
+    return _alarm_block(title, alarm_name, condition, json_msg, trigger_cfg, anchor)
+
+
+def build_alarm_h2_entry(symbol: str, direction: str) -> str:
+    """Alarm 2/2b — H2_SIGNAL Entry (mit Plot-Werten für premium/harsi_warn/btc_t2_warn)."""
+    is_long = direction == "long"
+    label   = "Long" if is_long else "Short"
+    side    = "long" if is_long else "short"
+    icon    = "🟢" if is_long else "🔴"
+    alarm_name = f"{icon} DOMINUS {label} Entry"
+    condition = (
+        f"Indikator <b>DOMINUS Orchestrator</b> → Bedingung <b>DOMINUS {label}</b>\n"
+        f"Intervall: <b>H2</b> · Auslösung: <b>Einmal pro Bar Close</b> · Typ: <b>Einzelner Coin</b>"
+    )
+    plot_prem   = '{{plot("Premium ' + label + '")}}'
+    plot_harsi  = '{{plot("' + label + ' HARSI Warnung")}}'
+    plot_btc_t2 = '{{plot("' + label + ' BTC/Total2 Warn")}}'
+    json_msg = (
+        '{"symbol":"' + symbol + '","side":"' + side +
+        '","entry":{{close}},"timeframe":"{{interval}}","signal":"H2_SIGNAL"' +
+        ',"premium":' + plot_prem +
+        ',"harsi_warn":' + plot_harsi +
+        ',"btc_t2_warn":' + plot_btc_t2 + '}'
+    )
+    trigger_cfg = (
+        "Einmal pro Bar · Unbefristet · App + Ton · Typ: <b>Technisch</b> "
+        "(NICHT Watchlist — sonst bleiben Plots leer!)"
+    )
+    anchor = "sec-alarm2" if is_long else "sec-alarm2b"
+    title  = f"Alarm {'2' if is_long else '2b'} — H2 {label} Entry ({symbol})"
+    return _alarm_block(title, alarm_name, condition, json_msg, trigger_cfg, anchor)
+
+
+def build_alarm_h4_trigger(direction: str) -> str:
+    """Alarm 1/1b — H4_TRIGGER (Watchlist-Alarm, nutzt {{ticker}})."""
+    is_long  = direction == "long"
+    label    = "Long" if is_long else "Short"
+    side     = "long" if is_long else "short"
+    buy_sell = "Buy" if is_long else "Sell"
+    alarm_name = f"🔔 H4 {label}-Trigger"
+    condition = (
+        f"Indikator <b>DOMINUS Buy/Sell</b> → Plot <b>{buy_sell}</b> · "
+        f"kreuzt nach oben · Wert <code>0</code>\n"
+        f"Intervall: <b>H4</b> · Auslösung: <b>Einmal pro Bar Close</b> · Typ: <b>Watchlist</b>"
+    )
+    json_msg = (
+        '{"symbol":"{{ticker}}","side":"' + side +
+        '","entry":{{close}},"timeframe":"{{interval}}","signal":"H4_TRIGGER"}'
+    )
+    trigger_cfg = "Einmal pro Bar · Unbefristet · App + Ton · Typ: <b>Watchlist</b>"
+    anchor = "sec-alarm1" if is_long else "sec-alarm1b"
+    title  = f"Alarm {'1' if is_long else '1b'} — H4 {label}-Trigger (Watchlist, alle Coins)"
+    return _alarm_block(title, alarm_name, condition, json_msg, trigger_cfg, anchor)
+
+
+def _list_active_harsi_windows() -> list:
+    """Liste (symbol, direction, remaining_min, expiry_str) aller aktiven Fenster."""
+    out = []
+    now = datetime.utcnow()
+    for key, ts in list(last_h2_signal_time.items()):
+        elapsed_min = int((now - ts).total_seconds() // 60)
+        if elapsed_min > 30:
+            continue
+        try:
+            _sym, _dir = key.rsplit("_", 1)
+        except ValueError:
+            continue
+        remaining = 30 - elapsed_min
+        expiry    = (ts + timedelta(minutes=30)).strftime("%H:%M UTC")
+        out.append((_sym, _dir, remaining, expiry))
+    # Längste Rest-Zeit zuerst
+    out.sort(key=lambda x: -x[2])
+    return out
+
+
+def cmd_alarm(parts: list):
+    """
+    Copy-Paste ready Alarm-Vorlagen für TradingView.
+
+    /alarm                             → Übersicht & aktive HARSI-Fenster
+    /alarm SYMBOL LONG|SHORT           → Kurzform → Alarm 3/3b (HARSI Exit)
+    /alarm harsi  SYMBOL LONG|SHORT    → Alarm 3/3b (HARSI_EXIT) inkl. 30-Min-Status
+    /alarm harsisl SYMBOL LONG|SHORT   → Alarm 4/4b (HARSI_SL, für offene Trades)
+    /alarm h2     SYMBOL LONG|SHORT    → Alarm 2/2b (H2_SIGNAL Entry)
+    /alarm h4     LONG|SHORT           → Alarm 1/1b (H4_TRIGGER Watchlist)
+    """
+    # 1) Keine Args → Übersicht
+    if len(parts) == 1:
+        lines = [
+            "🔔 <b>Alarm-Vorlagen — Copy &amp; Paste für TradingView</b>",
+            "━" * 12,
+            "",
+            "<b>Befehle:</b>",
+            "<code>/alarm SYMBOL LONG|SHORT</code> — Kurzform → HARSI Exit (Alarm 3/3b)",
+            "<code>/alarm harsi SYMBOL LONG|SHORT</code> — Alarm 3/3b (HARSI Exit)",
+            "<code>/alarm harsisl SYMBOL LONG|SHORT</code> — Alarm 4/4b (HARSI SL)",
+            "<code>/alarm h2 SYMBOL LONG|SHORT</code> — Alarm 2/2b (H2 Entry)",
+            "<code>/alarm h4 LONG|SHORT</code> — Alarm 1/1b (H4 Watchlist)",
+            "",
+        ]
+        active = _list_active_harsi_windows()
+        if active:
+            lines.append("<b>🟢 Aktive HARSI-Fenster (30-Min-Timer läuft):</b>")
+            for sym, drct, rem, exp in active:
+                icon = dir_icon(drct)
+                lines.append(f"  {icon} <b>{sym}</b> {drct.upper()} — noch {rem} Min (bis {exp})")
+                lines.append(f"     → <code>/alarm harsi {sym} {drct.upper()}</code>")
+        else:
+            lines.append("<i>Aktuell kein aktives HARSI-Fenster.</i>")
+        lines += [
+            "",
+            "💡 <i>WEBHOOK_URL in Railway setzen damit die URL automatisch "
+            "in jede Vorlage eingesetzt wird.</i>" if not WEBHOOK_URL else "",
+            "📋 /hilfe für alle Befehle",
+        ]
+        reply("\n".join([l for l in lines if l is not None]))
+        return
+
+    # 2) Args parsen
+    def _parse_direction(tok: str) -> str:
+        t = tok.lower()
+        if t in ("long", "buy", "l"):
+            return "long"
+        if t in ("short", "sell", "s"):
+            return "short"
+        return ""
+
+    def _parse_symbol(tok: str) -> str:
+        sym = tok.upper().replace("/", "").replace("-", "")
+        if not sym.endswith("USDT"):
+            sym += "USDT"
+        return sym
+
+    tokens = [p.strip() for p in parts[1:]]
+    sub    = tokens[0].lower()
+
+    # 3) Expliziter Sub-Command
+    if sub in ("harsi", "harsisl", "h2", "h4"):
+        if sub == "h4":
+            if len(tokens) < 2:
+                reply("❌ Format: <code>/alarm h4 LONG|SHORT</code>\nBeispiel: /alarm h4 LONG")
+                return
+            direction = _parse_direction(tokens[1])
+            if not direction:
+                reply("❌ Richtung muss LONG oder SHORT sein.")
+                return
+            reply(build_alarm_h4_trigger(direction))
+            return
+
+        if len(tokens) < 3:
+            reply(f"❌ Format: <code>/alarm {sub} SYMBOL LONG|SHORT</code>\n"
+                  f"Beispiel: /alarm {sub} ETHUSDT LONG")
+            return
+        symbol    = _parse_symbol(tokens[1])
+        direction = _parse_direction(tokens[2])
+        if not direction:
+            reply("❌ Richtung muss LONG oder SHORT sein.")
+            return
+
+        if sub == "harsi":
+            reply(build_alarm_harsi_exit(symbol, direction))
+        elif sub == "harsisl":
+            reply(build_alarm_harsi_sl(symbol, direction))
+        else:  # h2
+            reply(build_alarm_h2_entry(symbol, direction))
+        return
+
+    # 4) Kurzform: /alarm SYMBOL LONG|SHORT → HARSI Exit
+    if len(tokens) >= 2:
+        direction = _parse_direction(tokens[1])
+        if direction:
+            symbol = _parse_symbol(tokens[0])
+            reply(build_alarm_harsi_exit(symbol, direction))
+            return
+
+    reply(
+        "❌ Nicht erkannt.\n"
+        "Sende <code>/alarm</code> ohne Argumente für die Übersicht."
+    )
+
+
 def cmd_hilfe():
     reply(
         "🤖 <b>DOMINUS Bot — Befehle</b>\n"
@@ -2392,7 +2696,6 @@ def cmd_hilfe():
         "/berechnen — Kontostand + Money-Management + Chart-Links\n"
         "/makro — BTC &amp; Total2 Impuls-Richtung + Trade-Erlaubnis\n"
         "/report — Tages- &amp; Monats-P&amp;L Report\n"
-        "/backup — trades.csv &amp; State als Datei senden\n"
         "\n"
         "⚙️ <b>Aktionen:</b>\n"
         "/trade SYMBOL LONG|SHORT HEBEL ENTRY SL\n"
@@ -2400,6 +2703,12 @@ def cmd_hilfe():
         "   Beispiel: /trade ETHUSDT LONG 10 2850 2700\n"
         "/refresh [SYMBOL] — SL/TP/DCA sofort prüfen &amp; reparieren\n"
         "   Beispiel: /refresh BTCUSDT  (oder /refresh für alle)\n"
+        "\n"
+        "🔔 <b>Alarm-Vorlagen (Copy-Paste für TradingView):</b>\n"
+        "/alarm — Übersicht + aktive HARSI-Fenster\n"
+        "/alarm SYMBOL LONG|SHORT — Kurzform → Alarm 3/3b (HARSI Exit)\n"
+        "/alarm harsi|harsisl|h2 SYMBOL LONG|SHORT\n"
+        "/alarm h4 LONG|SHORT\n"
         "\n"
         "🎯 <b>Premium Setup (DOMINUS):</b>\n"
         "✅ Long+Long: beide Impulse ≥ 0 → voller Trade\n"
@@ -2619,76 +2928,6 @@ def build_daily_report(date_str: str = None) -> str:
     return "\n".join(lines)
 
 
-def build_weekly_report() -> str:
-    """Erstellt einen Wochen-P&L-Report für den automatischen Montags-Versand."""
-    now       = datetime.now()
-    # Aktuelle ISO-Woche
-    week_str  = now.strftime("%Y-W%W")
-    # Montag dieser Woche als Startpunkt
-    monday    = now - timedelta(days=now.weekday())
-    monday_ts = monday.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
-
-    week_trades = [
-        t for t in closed_trades
-        if t.get("ts", 0) >= monday_ts - 7 * 86400  # letzte 7 Tage
-    ]
-    month_str   = now.strftime("%Y-%m")
-    month_trades = [
-        t for t in closed_trades
-        if datetime.fromtimestamp(t.get("ts", 0)).strftime("%Y-%m") == month_str
-    ]
-
-    def _summary(trades):
-        if not trades:
-            return {"count": 0, "wins": 0, "losses": 0, "total_pnl": 0.0,
-                    "win_rate": 0.0, "best": 0.0, "worst": 0.0}
-        wins   = sum(1 for t in trades if t.get("won", False))
-        losses = len(trades) - wins
-        pnls   = [float(t.get("net_pnl", 0)) for t in trades]
-        return {
-            "count": len(trades), "wins": wins, "losses": losses,
-            "total_pnl": sum(pnls), "win_rate": wins / len(trades) * 100,
-            "best": max(pnls), "worst": min(pnls),
-        }
-
-    ws = _summary(week_trades)
-    ms = _summary(month_trades)
-
-    lines = [
-        f"📊 <b>DOMINUS Wochen-Report — {week_str}</b>",
-        "━━━━━━━━━━━━",
-        "",
-        f"📅 <b>Diese Woche:</b>",
-        f"Trades: {ws['count']}  |  🏆 {ws['wins']} / 🔴 {ws['losses']}",
-        f"Win-Rate: {ws['win_rate']:.0f}%",
-        f"Netto P&L: {ws['total_pnl']:+.2f} USDT",
-    ]
-    if ws['count'] > 0:
-        lines += [f"Bester: {ws['best']:+.2f} USDT  |  Schlechtester: {ws['worst']:+.2f} USDT"]
-
-    if week_trades:
-        lines.append("")
-        lines.append("📋 <b>Trades der Woche:</b>")
-        for t in sorted(week_trades, key=lambda x: x.get("ts", 0)):
-            icon = "🏆" if t.get("won") else "🔴"
-            lines.append(
-                f"  {icon} {t['symbol']} {t.get('direction','?').upper()} "
-                f"| {float(t.get('net_pnl',0)):+.2f} USDT "
-                f"| {t.get('hold_str','?')}"
-            )
-
-    lines += [
-        "",
-        f"📆 <b>Monat ({month_str}):</b>",
-        f"Trades: {ms['count']}  |  🏆 {ms['wins']} / 🔴 {ms['losses']}",
-        f"Win-Rate: {ms['win_rate']:.0f}%",
-        f"Netto P&L: {ms['total_pnl']:+.2f} USDT",
-        "",
-        "📋 /status | /makro | /report",
-    ]
-    return "\n".join(lines)
-
-
 def cmd_report():
     """Sendet den täglichen P&L Report auf Telegram-Anfrage."""
     try:
@@ -2697,26 +2936,6 @@ def cmd_report():
         telegram(report)
     except Exception as e:
         reply(f"❌ Report Fehler: {e}")
-
-
-def cmd_backup():
-    """Sendet trades.csv und dominus_state.json als Backup-Dateien via Telegram."""
-    now_str = datetime.now().strftime("%d.%m.%Y %H:%M")
-    sent = []
-    missing = []
-
-    for filepath in [TRADES_CSV, STATE_FILE]:
-        if os.path.isfile(filepath):
-            telegram_file(filepath, caption=f"📦 Backup {os.path.basename(filepath)} — {now_str}")
-            sent.append(os.path.basename(filepath))
-        else:
-            missing.append(os.path.basename(filepath))
-
-    summary = f"✅ Backup gesendet: {', '.join(sent)}" if sent else ""
-    if missing:
-        summary += f"\n⚠️ Nicht gefunden: {', '.join(missing)}"
-    if summary:
-        telegram(summary.strip())
 
 
 def poll_telegram_commands():
@@ -2760,8 +2979,8 @@ def poll_telegram_commands():
             cmd_refresh(parts)
         elif cmd == "/report":
             cmd_report()
-        elif cmd == "/backup":
-            cmd_backup()
+        elif cmd == "/alarm":
+            cmd_alarm(parts)
         elif cmd == "/hilfe" or cmd == "/start" or cmd == "/help":
             cmd_hilfe()
         else:
@@ -3243,6 +3462,17 @@ def start_webhook_server():
             f"Total2: {links['total2']}",
         ]
         telegram("\n".join(msg_parts))
+
+        # ── v4.8: HARSI in Extremzone → kopierbare Alarm-3/3b-Vorlage mitschicken ──
+        # Spart dem User den Weg ins HTML-Handbuch: die Message-JSON, der Alarm-Name
+        # und die Webhook-URL kommen hier schon fertig zum Copy-Paste in TV.
+        # Die Fenster-Logik ist in build_alarm_harsi_exit() eingebaut und prüft
+        # last_h2_signal_time[symbol_direction] (wurde oben in diesem Handler gesetzt).
+        if harsi_warn_val == 1:
+            try:
+                telegram(build_alarm_harsi_exit(symbol, direction))
+            except Exception as _alarm_err:
+                log(f"[alarm-inline] Fehler: {_alarm_err}")
         return jsonify({"status": "ok", "symbol": symbol,
                         "direction": direction}), 200
 
@@ -3285,8 +3515,7 @@ def save_state():
             "trade_data":              trade_data,
             "trailing_sl_level":       trailing_sl_level,
             "closed_trades":           [t for t in closed_trades if t.get("ts", 0) >= time.time() - 90*86400],
-            "daily_report_sent_date":   daily_report_sent_date,
-            "weekly_report_sent_week":  weekly_report_sent_week,
+            "daily_report_sent_date":  daily_report_sent_date,
             "harsi_sl":                harsi_sl,
             "last_h2_signal_time":     h2_ts_serialized,
             "btc_dir":                 btc_dir,
@@ -3300,7 +3529,7 @@ def save_state():
 
 def load_state():
     """Lädt den gespeicherten State aus der JSON-Datei beim Start."""
-    global daily_report_sent_date, weekly_report_sent_week
+    global daily_report_sent_date
     if not os.path.exists(STATE_FILE):
         return
     try:
@@ -3313,8 +3542,7 @@ def load_state():
         trade_data.update(s.get("trade_data", {}))
         trailing_sl_level.update(s.get("trailing_sl_level", {}))
         closed_trades.extend(s.get("closed_trades", []))
-        daily_report_sent_date  = s.get("daily_report_sent_date",  "")
-        weekly_report_sent_week = s.get("weekly_report_sent_week", "")
+        daily_report_sent_date = s.get("daily_report_sent_date", "")
         harsi_sl.update(s.get("harsi_sl", {}))
         # last_h2_signal_time: ISO-Strings → datetime (nur Einträge < 30 Min laden)
         now_utc = datetime.utcnow()
@@ -4146,7 +4374,7 @@ def main():
             poll_telegram_commands()
 
             # ── 0a. Auto Daily Report um 23:59 ─────────────
-            global daily_report_sent_date, weekly_report_sent_week
+            global daily_report_sent_date
             _now   = datetime.now()
             _today = _now.strftime("%Y-%m-%d")
             if _now.hour == 23 and _now.minute == 59 and daily_report_sent_date != _today:
@@ -4158,18 +4386,6 @@ def main():
                     log("[Auto-Report] ✓ Report gesendet")
                 except Exception as _re:
                     log(f"[Auto-Report] ✗ Fehler: {_re}")
-
-            # ── 0b. Auto Weekly Report jeden Montag um 08:00 ────
-            _week = _now.strftime("%Y-W%W")
-            if _now.weekday() == 0 and _now.hour == 8 and _now.minute < 1 and weekly_report_sent_week != _week:
-                log("[Auto-Report] Wöchentlicher P&L Report wird gesendet (Mo 08:00)...")
-                try:
-                    telegram(build_weekly_report())
-                    weekly_report_sent_week = _week
-                    save_state()
-                    log("[Auto-Report] ✓ Wochen-Report gesendet")
-                except Exception as _re:
-                    log(f"[Auto-Report] ✗ Wochen-Report Fehler: {_re}")
 
             # ── 0b. H4 Puffer flushen wenn Zeitfenster abgelaufen ──
             # Lock für den ganzen Check — verhindert Race mit Webhook-Thread
