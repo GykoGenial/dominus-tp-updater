@@ -1,5 +1,5 @@
 """
-DOMINUS Trade-Automatisierung v4.16
+DOMINUS Trade-Automatisierung v4.17
 ══════════════════════════════════════════════════════════════
 Vollautomatisches Setup nach DOMINUS-Strategie (Handbuch März 2026)
 Finanzmathematische Optimierungen:
@@ -10,6 +10,22 @@ Finanzmathematische Optimierungen:
   ⑤ Telegram Polling  — /berechnen /trade /status /hilfe /alarm
   ⑥ Sling-SL Trailing — Swing-Pivot-basierter SL (nur protektiv)
   ⑦ Exposure-Cap 25%  — max. Gesamt-Einsatz inkl. Hebel pro Trade
+
+Changelog v4.17 — Bitget-Feldname: takeProfit → stopSurplus (Root-Cause-Fix):
+  F1: Root-Cause für TP4-Verschwinden gefunden — Bitget v2 `place-pos-tpsl`
+      erwartet `stopSurplusTriggerPrice` / `stopSurplusTriggerType` (NICHT
+      `takeProfitTriggerPrice`, das ist der Parameter von `place-tpsl-order`).
+      Bitget akzeptiert den Request mit code=00000 (weil SL-Felder gültig
+      sind), ignoriert aber das unbekannte TP-Feld → TP4 wurde nie persistiert.
+  F2: Alle 6 place-pos-tpsl-Aufrufe umgestellt (place_tp_orders TP4-Initial,
+      TP4-Retry mit reduzierten Dezimalen, set_sl_at_entry, set_sl_trailing,
+      set_sl_harsi, set_sl_sling, Phase-0-SL-Nachzug im Monitor).
+  F3: _get_pos_tp_price() liest TP4 jetzt aus erweiterter Feldliste
+      (presetStopSurplusPrice, stopSurplusPrice, stopSurplusTriggerPrice +
+      Legacy-Namen als Fallback) — Bitget retourniert den TP je nach Variante
+      unterschiedlich.
+  F4: Startup-Banner Version (hartkodiert "v4.35") auf dynamische Version
+      umgestellt — zeigt ab jetzt korrekt die aktive Version im Log.
 
 Changelog v4.16 — TP4-Persistenz (Hotfix: TP4 verschwindet nach SL-Update):
   K1: Ursache: Bitget `place-pos-tpsl` speichert SL im single-position-Response
@@ -1378,8 +1394,8 @@ def place_tp_orders(symbol: str, avg: float, size: float,
             "productType":            PRODUCT_TYPE,
             "marginCoin":             MARGIN_COIN,
             "holdSide":               direction,
-            "takeProfitTriggerPrice": tp4_str,
-            "takeProfitTriggerType":  "mark_price",
+            "stopSurplusTriggerPrice": tp4_str,
+            "stopSurplusTriggerType":  "mark_price",
         }
         # SL mitschicken wenn vorhanden — verhindert Überschreiben
         if current_sl > 0:
@@ -1412,8 +1428,8 @@ def place_tp_orders(symbol: str, avg: float, size: float,
                     "productType":            PRODUCT_TYPE,
                     "marginCoin":             MARGIN_COIN,
                     "holdSide":               direction,
-                    "takeProfitTriggerPrice": tp4_str2,
-                    "takeProfitTriggerType":  "mark_price",
+                    "stopSurplusTriggerPrice": tp4_str2,
+                    "stopSurplusTriggerType":  "mark_price",
                 }
                 if current_sl > 0:
                     body4b["stopLossTriggerPrice"] = sl_for_tp4
@@ -1731,8 +1747,11 @@ def _get_pos_tp_price(symbol: str, direction: str) -> float:
     if result.get("code") == "00000":
         for pos in (result.get("data") or []):
             if pos.get("holdSide") == direction:
-                for field in ("takeProfitPrice", "takeProfit", "tpPrice",
-                              "takeProfitTriggerPrice"):
+                # v4.17 — Bitget gibt den TP teils gar nicht, teils unter
+                # diversen Namen zurück. Liste defensiv, alle Varianten prüfen.
+                for field in ("presetStopSurplusPrice", "stopSurplusTriggerPrice",
+                              "stopSurplusPrice", "takeProfitPrice", "takeProfit",
+                              "tpPrice", "takeProfitTriggerPrice"):
                     tp = float(pos.get(field, 0) or 0)
                     if tp > 0:
                         log(f"  TP4 aus Position.{field}: {tp}")
@@ -1787,8 +1806,8 @@ def set_sl_at_entry(symbol: str, direction: str, entry_price: float,
     }
     if existing_tp4 > 0:
         decimals_sl = get_price_decimals(symbol)
-        body_sl["takeProfitTriggerPrice"] = round_price(existing_tp4, decimals_sl)
-        body_sl["takeProfitTriggerType"]  = "mark_price"
+        body_sl["stopSurplusTriggerPrice"] = round_price(existing_tp4, decimals_sl)
+        body_sl["stopSurplusTriggerType"]  = "mark_price"
         log(f"  TP4 @ {existing_tp4} wird mitgeführt")
 
     result = api_post("/api/v2/mix/order/place-pos-tpsl", body_sl)
@@ -1875,8 +1894,8 @@ def set_sl_trailing(symbol: str, direction: str, sl_price: float, level: int,
         "stopLossTriggerType":  "mark_price",
     }
     if existing_tp4 > 0:
-        body_sl["takeProfitTriggerPrice"] = round_price(existing_tp4, decimals)
-        body_sl["takeProfitTriggerType"]  = "mark_price"
+        body_sl["stopSurplusTriggerPrice"] = round_price(existing_tp4, decimals)
+        body_sl["stopSurplusTriggerType"]  = "mark_price"
         log(f"  TP4 @ {existing_tp4} wird mitgeführt")
 
     tp_label   = {2: "TP2", 3: "TP3"}.get(level, "?")
@@ -1945,8 +1964,8 @@ def set_sl_harsi(symbol: str, direction: str, harsi_price: float, cur_size: floa
         "stopLossTriggerType":  "mark_price",
     }
     if existing_tp4 > 0:
-        body_sl["takeProfitTriggerPrice"] = round_price(existing_tp4, decimals)
-        body_sl["takeProfitTriggerType"]  = "mark_price"
+        body_sl["stopSurplusTriggerPrice"] = round_price(existing_tp4, decimals)
+        body_sl["stopSurplusTriggerType"]  = "mark_price"
 
     result = api_post("/api/v2/mix/order/place-pos-tpsl", body_sl)
     if result.get("code") == "00000":
@@ -2126,8 +2145,8 @@ def set_sl_sling(symbol: str, direction: str, pivot_price: float,
         "stopLossTriggerType":  "mark_price",
     }
     if existing_tp4 > 0:
-        body_sl["takeProfitTriggerPrice"] = round_price(existing_tp4, decimals)
-        body_sl["takeProfitTriggerType"]  = "mark_price"
+        body_sl["stopSurplusTriggerPrice"] = round_price(existing_tp4, decimals)
+        body_sl["stopSurplusTriggerType"]  = "mark_price"
 
     result = api_post("/api/v2/mix/order/place-pos-tpsl", body_sl)
     if result.get("code") == "00000":
@@ -4451,7 +4470,7 @@ def start_webhook_server():
     @app.route("/", methods=["GET"])
     @app.route("/health", methods=["GET"])
     def health():
-        return jsonify({"status": "running", "version": "v4.16"}), 200
+        return jsonify({"status": "running", "version": "v4.17"}), 200
 
     port = _env_int("PORT", 8080)
     log(f"Webhook-Server gestartet auf Port {port}")
@@ -4861,8 +4880,8 @@ def check_and_repair_position(pos: dict):
                     "stopLossTriggerType":  "mark_price",
                 }
                 if existing_tp4 > 0:
-                    body_sl["takeProfitTriggerPrice"] = round_price(existing_tp4, decimals)
-                    body_sl["takeProfitTriggerType"]  = "mark_price"
+                    body_sl["stopSurplusTriggerPrice"] = round_price(existing_tp4, decimals)
+                    body_sl["stopSurplusTriggerType"]  = "mark_price"
                 res = api_post("/api/v2/mix/order/place-pos-tpsl", body_sl)
                 if res.get("code") == "00000":
                     sl_price    = avg
@@ -5333,7 +5352,7 @@ def main():
         log("In Railway → Variables eintragen.")
         return
 
-    log("DOMINUS Trade-Automatisierung v4.35 gestartet — mit finanzmathematischen Optimierungen")
+    log("DOMINUS Trade-Automatisierung v4.17 gestartet — mit finanzmathematischen Optimierungen")
     log(f"Intervall: {POLL_INTERVAL}s")
     log("Warte auf neue Trades...")
     log("─" * 55)
