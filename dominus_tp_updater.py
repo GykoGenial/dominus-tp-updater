@@ -1,5 +1,5 @@
 """
-DOMINUS Trade-Automatisierung v4.15
+DOMINUS Trade-Automatisierung v4.16
 ══════════════════════════════════════════════════════════════
 Vollautomatisches Setup nach DOMINUS-Strategie (Handbuch März 2026)
 Finanzmathematische Optimierungen:
@@ -10,6 +10,20 @@ Finanzmathematische Optimierungen:
   ⑤ Telegram Polling  — /berechnen /trade /status /hilfe /alarm
   ⑥ Sling-SL Trailing — Swing-Pivot-basierter SL (nur protektiv)
   ⑦ Exposure-Cap 25%  — max. Gesamt-Einsatz inkl. Hebel pro Trade
+
+Changelog v4.16 — TP4-Persistenz (Hotfix: TP4 verschwindet nach SL-Update):
+  K1: Ursache: Bitget `place-pos-tpsl` speichert SL im single-position-Response
+      (Feld `stopLoss`), aber NICHT den TP (kein `takeProfitPrice`-Feld).
+      Fallback via Plan-Orders (`pos_profit`) ist unzuverlässig — bei gerade
+      fehlschlagenden Endpoints liefert `_get_pos_tp_price()` dann 0 → bei
+      SL-Updates wird TP4 nicht mitgeschickt → Bitget löscht ihn still.
+  K2: trade_data[symbol]["tp4"] speichert jede erfolgreiche TP4-Platzierung
+      lokal. Wird bei Restart aus dominus_state.json rekonstruiert.
+  K3: _get_pos_tp_price() prüft Quellen in Reihenfolge: (1) trade_data["tp4"],
+      (2) Position-Felder (takeProfitPrice, …), (3) Plan-Orders (pos_profit).
+      Damit ist TP4 immer verfügbar, auch wenn Bitget-API hängt.
+  K4: cache_invalidate() wird nach jedem erfolgreichen SL+TP4-Update
+      aufgerufen, damit der nächste Read garantiert frische Daten sieht.
 
 Changelog v4.15 — TP-Stornierung: Einzelcall mit planType (Hotfix):
   T1: cancel_all_tp_orders() — Bitget v2 Batch-Mode (orderIdList) liefert
@@ -1379,6 +1393,13 @@ def place_tp_orders(symbol: str, avg: float, size: float,
                 f"(schliesst gesamte Restposition)")
             count += 1
             prices.append(f"TP4 Full Close: {tp4_str}")
+            # v4.16 — TP4-Preis im lokalen State speichern (Quelle 1 für
+            # _get_pos_tp_price). Garantiert, dass folgende SL-Updates den
+            # TP4 mitführen können, auch wenn Bitget-Read-API hängt.
+            _td = trade_data.setdefault(symbol, {})
+            _td["tp4"] = float(tp4_str)
+            save_state()
+            cache_invalidate()
         else:
             msg4 = res4.get("msg", str(res4))
             log(f"    ✗ TP4 FEHLER: {msg4}")
@@ -1402,6 +1423,11 @@ def place_tp_orders(symbol: str, avg: float, size: float,
                     log(f"    ✓ TP4 Full Close @ {tp4_str2} USDT [retry OK]")
                     count += 1
                     prices.append(f"TP4 Full Close: {tp4_str2}")
+                    # v4.16 — auch im Retry-Pfad State speichern
+                    _td = trade_data.setdefault(symbol, {})
+                    _td["tp4"] = float(tp4_str2)
+                    save_state()
+                    cache_invalidate()
 
     return count, prices
 
@@ -1675,10 +1701,28 @@ def handle_position_closed(symbol: str, reason: str = ""):
 
 def _get_pos_tp_price(symbol: str, direction: str) -> float:
     """
-    Liest den TP4-Preis für eine Position — zwei Wege:
-    Methode 1: takeProfitPrice aus Positionsdaten (place-pos-tpsl).
-    Methode 2: pos_profit aus orders-plan-pending (Bitget-UI "SL/TP"-Button).
+    Liest den TP4-Preis für eine Position.
+
+    v4.16 — drei Quellen in Reihenfolge:
+      Quelle 1: trade_data[symbol]["tp4"] (lokaler State, verlässlich)
+      Quelle 2: takeProfitPrice etc. aus single-position (meist nicht populated)
+      Quelle 3: pos_profit aus orders-plan-pending (unzuverlässig)
+
+    Hintergrund: Bitget `place-pos-tpsl` speichert zwar den SL im
+    single-position-Response (Feld `stopLoss`), aber KEINEN TP. Fällt
+    Quelle 3 gleichzeitig aus (Plan-Order-Endpoints scheitern regelmässig
+    mit "Parameter verification failed"), wurde TP4 fälschlich als "nicht
+    vorhanden" gewertet — und bei SL-Updates dann gelöscht (weil
+    place-pos-tpsl SL UND TP kombiniert verwaltet).
     """
+    # Quelle 1: Lokaler State (wird in place_tp_orders() gesetzt)
+    td = trade_data.get(symbol, {})
+    if td.get("direction") == direction:
+        tp4_state = float(td.get("tp4", 0) or 0)
+        if tp4_state > 0:
+            return tp4_state
+
+    # Quelle 2: single-position (meistens leer für TP — trotzdem prüfen)
     result = api_get("/api/v2/mix/position/single-position", {
         "symbol":      symbol,
         "productType": PRODUCT_TYPE,
@@ -1694,16 +1738,20 @@ def _get_pos_tp_price(symbol: str, direction: str) -> float:
                         log(f"  TP4 aus Position.{field}: {tp}")
                         return tp
 
-    orders = _get_plan_orders(symbol)
-    for o in orders:
-        if o.get("planType") == "pos_profit":
-            hold = o.get("holdSide", direction)
-            if hold != direction:
-                continue
-            price = float(o.get("triggerPrice", 0) or 0)
-            if price > 0:
-                log(f"  TP4 aus plan-orders (pos_profit): {price}")
-                return price
+    # Quelle 3: Plan-Orders (pos_profit). Kann fehlschlagen → dann 0.
+    try:
+        orders = _get_plan_orders(symbol)
+        for o in orders:
+            if o.get("planType") == "pos_profit":
+                hold = o.get("holdSide", direction)
+                if hold != direction:
+                    continue
+                price = float(o.get("triggerPrice", 0) or 0)
+                if price > 0:
+                    log(f"  TP4 aus plan-orders (pos_profit): {price}")
+                    return price
+    except Exception as _e:
+        log(f"  _get_pos_tp_price: plan-orders Fehler: {_e}")
 
     return 0.0
 
@@ -4403,7 +4451,7 @@ def start_webhook_server():
     @app.route("/", methods=["GET"])
     @app.route("/health", methods=["GET"])
     def health():
-        return jsonify({"status": "running", "version": "v4.15"}), 200
+        return jsonify({"status": "running", "version": "v4.16"}), 200
 
     port = _env_int("PORT", 8080)
     log(f"Webhook-Server gestartet auf Port {port}")
@@ -5059,6 +5107,7 @@ def check_and_repair_position(pos: dict):
     _prev_td   = trade_data.get(symbol, {})
     _prev_peak = _prev_td.get("peak_size", 0)
     _prev_ts   = _prev_td.get("open_ts", int(time.time() * 1000))
+    _prev_tp4  = _prev_td.get("tp4", 0)                                 # v4.16 — TP4 erhalten
     trade_data[symbol] = {
         "entry":        avg,
         "direction":    direction,
@@ -5067,6 +5116,7 @@ def check_and_repair_position(pos: dict):
         "peak_size":    max(_prev_peak, _reconstructed_peak, size),   # nie reduzieren
         "open_ts":      _prev_ts,                                      # Öffnungszeit erhalten
         "tp_order_ids": _prev_td.get("tp_order_ids", []),
+        "tp4":          _prev_tp4,                                     # v4.16 — TP4-Preis persistent
     }
 
     # ── 2. TPs prüfen ─────────────────────────────────────────────────────
@@ -5222,6 +5272,7 @@ def report_position_startup(pos: dict):
     tp1_done = state["tp1_price_hit"] or fill_tp1
 
     # Trade-Daten für Polling-Loop speichern
+    _prev_td_p = trade_data.get(symbol, {})
     trade_data[symbol] = {
         "entry":     avg,
         "direction": direction,
@@ -5229,6 +5280,7 @@ def report_position_startup(pos: dict):
         "sl":        0,   # nicht lesbar via API
         "peak_size": size,
         "open_ts":   int(time.time() * 1000),
+        "tp4":       _prev_td_p.get("tp4", 0),   # v4.16 — TP4 erhalten
     }
     # sl_at_entry nur zurücksetzen wenn trailing_sl_level NOCH NICHT gesetzt
     # (d.h. Script hat SL noch nie selbst gesetzt). Wenn trailing Level >= 1
