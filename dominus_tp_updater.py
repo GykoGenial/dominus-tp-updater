@@ -3204,8 +3204,8 @@ def enqueue_entry(entry: dict) -> None:
 
 def flush_entries() -> None:
     """Timer-Callback nach Ablauf des Sammelfensters. Scored alle Signale,
-    sortiert in einer einzigen Liste (Premium zuerst, dann Score DESC)
-    und sendet konsolidierte Nachricht."""
+    sortiert in einer einzigen Liste rein nach Score absteigend und sendet
+    konsolidierte Nachricht. Premium wird per Stern-Badge markiert."""
     global _entry_flush_timer
     with pending_entries_lock:
         if not pending_entries:
@@ -3219,14 +3219,12 @@ def flush_entries() -> None:
         for e in batch:
             e["_scored"] = score_entry(e)
 
-        # Eine einzige Liste — Premium-Kandidaten zuerst (Tiebreaker),
-        # innerhalb Premium/Regular nach Score absteigend
+        # Eine einzige Liste — rein nach Score absteigend.
+        # Premium-Faktoren (Makro +30, BTC/T2 je +20) sind bereits
+        # im Score enthalten; ein Stern-Badge markiert Premium visuell.
         ranked = sorted(
             batch,
-            key=lambda x: (
-                1 if x["_scored"]["is_premium"] else 0,
-                x["_scored"]["score"],
-            ),
+            key=lambda x: x["_scored"]["score"],
             reverse=True,
         )
         n_premium = sum(1 for e in ranked if e["_scored"]["is_premium"])
@@ -3267,7 +3265,7 @@ def format_ranked_list(ranked: list, balance: float, total: int) -> str:
         confirms = e.get("confirm_count", 1)
         is_prem  = bool(s.get("is_premium"))
 
-        badge    = "🎯 " if is_prem else ""
+        badge    = "⭐ " if is_prem else ""
         conf_str = f" ⚡{confirms}x" if confirms > 1 else ""
         out = [f"<b>{idx}. {badge}{icon} {sym} {dr}{conf_str}</b>  ·  "
                f"Score <b>{s['score']}/100</b>"]
@@ -3299,7 +3297,7 @@ def format_ranked_list(ranked: list, balance: float, total: int) -> str:
         "━━━━━━━━━━━━",
         f"{total} Signal{'e' if total != 1 else ''} "
         f"im {ENTRY_QUEUE_WINDOW_SEC}s-Fenster"
-        + (f"  ·  🎯 {n_premium} Premium" if n_premium else ""),
+        + (f"  ·  ⭐ {n_premium} Premium" if n_premium else ""),
     ]
     if balance > 0:
         lines.append(f"💰 Balance: {balance:.2f} USDT | "
@@ -3315,8 +3313,9 @@ def format_ranked_list(ranked: list, balance: float, total: int) -> str:
         lines.append("")
 
     lines.append("━━━━━━━━━━━━")
-    lines.append("💡 <i>Top-Eintrag zuerst traden. 🎯 = Macro-Premium. "
-                 "Kelly + Exposure-Cap bestimmen Slot-Anzahl.</i>")
+    lines.append("💡 <i>Top-Eintrag zuerst traden. ⭐ = Macro-Premium "
+                 "(Makro + BTC/T2 bestätigt). Kelly + Exposure-Cap "
+                 "bestimmen Slot-Anzahl.</i>")
     _anker = "sec-alarm3"
     lines.append(_doc_link(_anker, "Alarm 3/3b — HARSI Exit"))
     return "\n".join(lines)
