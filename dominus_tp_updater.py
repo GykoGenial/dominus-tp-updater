@@ -3204,7 +3204,8 @@ def enqueue_entry(entry: dict) -> None:
 
 def flush_entries() -> None:
     """Timer-Callback nach Ablauf des Sammelfensters. Scored alle Signale,
-    sortiert nach Premium/Regular + Score und sendet konsolidierte Nachricht."""
+    sortiert in einer einzigen Liste (Premium zuerst, dann Score DESC)
+    und sendet konsolidierte Nachricht."""
     global _entry_flush_timer
     with pending_entries_lock:
         if not pending_entries:
@@ -3218,20 +3219,27 @@ def flush_entries() -> None:
         for e in batch:
             e["_scored"] = score_entry(e)
 
-        premium = [e for e in batch if e["_scored"]["is_premium"]]
-        regular = [e for e in batch if not e["_scored"]["is_premium"]]
-        premium.sort(key=lambda x: x["_scored"]["score"], reverse=True)
-        regular.sort(key=lambda x: x["_scored"]["score"], reverse=True)
+        # Eine einzige Liste — Premium-Kandidaten zuerst (Tiebreaker),
+        # innerhalb Premium/Regular nach Score absteigend
+        ranked = sorted(
+            batch,
+            key=lambda x: (
+                1 if x["_scored"]["is_premium"] else 0,
+                x["_scored"]["score"],
+            ),
+            reverse=True,
+        )
+        n_premium = sum(1 for e in ranked if e["_scored"]["is_premium"])
 
         try:
             balance = get_futures_balance()
         except Exception:
             balance = 0.0
 
-        msg = format_ranked_list(premium, regular, balance, len(batch))
+        msg = format_ranked_list(ranked, balance, len(batch))
         telegram(msg)
-        log(f"  ENTRY-QUEUE: Flush gesendet — {len(premium)} Premium, "
-            f"{len(regular)} Regular")
+        log(f"  ENTRY-QUEUE: Flush gesendet — {len(ranked)} Signale "
+            f"({n_premium} Premium)")
     except Exception as ex:
         log(f"[flush_entries] Fehler: {ex}")
         try:
@@ -3240,10 +3248,10 @@ def flush_entries() -> None:
             pass
 
 
-def format_ranked_list(premium: list, regular: list,
-                        balance: float, total: int) -> str:
-    """Baut die konsolidierte Telegram-Rangliste (Premium + Regular, je Bucket
-    absteigend nach Score) inkl. kopierbarer /trade-Befehle."""
+def format_ranked_list(ranked: list, balance: float, total: int) -> str:
+    """Baut die konsolidierte Telegram-Rangliste als EINE einzige Liste
+    (Premium zuerst, dann nach Score absteigend) inkl. kopierbarer
+    /trade-Befehle. Premium-Kandidaten tragen ein 🎯-Badge."""
 
     def _render(idx: int, e: dict) -> list:
         s        = e["_scored"]
@@ -3257,9 +3265,11 @@ def format_ranked_list(premium: list, regular: list,
         lev      = sugg.get("leverage", 0) or 0
         per_ord  = sugg.get("per_order", 0) or 0
         confirms = e.get("confirm_count", 1)
+        is_prem  = bool(s.get("is_premium"))
 
+        badge    = "🎯 " if is_prem else ""
         conf_str = f" ⚡{confirms}x" if confirms > 1 else ""
-        out = [f"<b>{idx}. {icon} {sym} {dr}{conf_str}</b>  ·  "
+        out = [f"<b>{idx}. {badge}{icon} {sym} {dr}{conf_str}</b>  ·  "
                f"Score <b>{s['score']}/100</b>"]
 
         if entry_px and sl and lev:
@@ -3282,36 +3292,30 @@ def format_ranked_list(premium: list, regular: list,
                        f"{entry_px:.5f} {sl:.5f}</code>")
         return out
 
+    n_premium = sum(1 for e in ranked if e["_scored"].get("is_premium"))
+
     lines = [
         "🏁 <b>DOMINUS — Entry-Rangliste</b>",
         "━━━━━━━━━━━━",
         f"{total} Signal{'e' if total != 1 else ''} "
-        f"im {ENTRY_QUEUE_WINDOW_SEC}s-Fenster",
+        f"im {ENTRY_QUEUE_WINDOW_SEC}s-Fenster"
+        + (f"  ·  🎯 {n_premium} Premium" if n_premium else ""),
     ]
     if balance > 0:
         lines.append(f"💰 Balance: {balance:.2f} USDT | "
                      f"Exposure-Cap {MAX_EXPOSURE_PCT*100:.0f}%")
     lines.append("")
 
-    if premium:
-        lines.append(f"🎯 <b>PREMIUM ({len(premium)})</b>")
-        for i, e in enumerate(premium, 1):
+    if ranked:
+        for i, e in enumerate(ranked, 1):
             lines.extend(_render(i, e))
             lines.append("")
     else:
-        lines.append("🎯 <b>PREMIUM</b> — keine")
+        lines.append("<i>Keine gültigen Kandidaten.</i>")
         lines.append("")
 
-    if regular:
-        lines.append(f"📋 <b>REGULAR ({len(regular)})</b>")
-        for i, e in enumerate(regular, 1):
-            lines.extend(_render(i, e))
-            lines.append("")
-    else:
-        lines.append("📋 <b>REGULAR</b> — keine")
-
     lines.append("━━━━━━━━━━━━")
-    lines.append("💡 <i>Top-Eintrag jeder Gruppe zuerst traden. "
+    lines.append("💡 <i>Top-Eintrag zuerst traden. 🎯 = Macro-Premium. "
                  "Kelly + Exposure-Cap bestimmen Slot-Anzahl.</i>")
     _anker = "sec-alarm3"
     lines.append(_doc_link(_anker, "Alarm 3/3b — HARSI Exit"))
