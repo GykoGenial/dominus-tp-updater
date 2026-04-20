@@ -1,5 +1,5 @@
 """
-DOMINUS Trade-Automatisierung v4.17
+DOMINUS Trade-Automatisierung v4.18
 ══════════════════════════════════════════════════════════════
 Vollautomatisches Setup nach DOMINUS-Strategie (Handbuch März 2026)
 Finanzmathematische Optimierungen:
@@ -10,6 +10,16 @@ Finanzmathematische Optimierungen:
   ⑤ Telegram Polling  — /berechnen /trade /status /hilfe /alarm
   ⑥ Sling-SL Trailing — Swing-Pivot-basierter SL (nur protektiv)
   ⑦ Exposure-Cap 25%  — max. Gesamt-Einsatz inkl. Hebel pro Trade
+
+Changelog v4.18 — /refresh Telegram-Anzeige inkl. TP4:
+  R1: /refresh-Nachricht zeigte "TPs gesetzt: 3" obwohl 4 TPs auf Bitget
+      gesetzt waren. Ursache: get_existing_tps() liest nur profit_plan-Orders
+      (TP1/TP2/TP3). TP4 lebt als Full-Close via place-pos-tpsl in einem
+      separaten Slot und wurde deshalb nicht mitgezählt.
+  R2: Im /refresh-Report wird TP4-Preis zusätzlich via _get_pos_tp_price()
+      ermittelt und zum Count addiert. Anzeige jetzt "TPs gesetzt: 4/4
+      (inkl. TP4 @ <Preis>)" bzw. "(ohne TP4)" wenn nicht gesetzt —
+      deckt sich mit dem, was Bitget tatsächlich im GUI zeigt.
 
 Changelog v4.17 — Bitget-Feldname: takeProfit → stopSurplus (Root-Cause-Fix):
   F1: Root-Cause für TP4-Verschwinden gefunden — Bitget v2 `place-pos-tpsl`
@@ -3639,6 +3649,14 @@ def cmd_refresh(parts: list):
         sl       = get_sl_price(sym, pos.get("holdSide", "long"))
         tps      = get_existing_tps(sym)
         n_tp     = len(tps)
+        # v4.18 — TP4 (Full-Close via place-pos-tpsl) ist KEIN profit_plan
+        # und erscheint NICHT in get_existing_tps(). Wir ermitteln ihn separat
+        # und zählen ihn zur Anzeige hinzu, damit Telegram die tatsächliche
+        # Anzahl TPs auf Bitget reflektiert (erwartet max. 4: TP1+TP2+TP3+TP4).
+        tp4_price = _get_pos_tp_price(sym, pos.get("holdSide", "long"))
+        tp4_set   = tp4_price > 0
+        n_tp_total = n_tp + (1 if tp4_set else 0)
+        tp4_info  = f" (inkl. TP4 @ {tp4_price})" if tp4_set else " (ohne TP4)"
         secured  = sl_at_entry.get(sym, False)
         base     = get_base_coin(sym)
         qty_dec  = get_qty_decimals(sym)
@@ -3649,7 +3667,7 @@ def cmd_refresh(parts: list):
             f"\n📍 <b>{sym}</b> {drct} {lev}x\n"
             f"   Qty: {qty_str}\n"
             f"   Entry={avg:.4f} | Mark={mark}\n"
-            f"   {lock} | TPs gesetzt: {n_tp}"
+            f"   {lock} | TPs gesetzt: {n_tp_total}/4{tp4_info}"
         )
     lines += ["", "📋 /status | /makro | /report"]
     reply("\n".join(lines))
@@ -4470,7 +4488,7 @@ def start_webhook_server():
     @app.route("/", methods=["GET"])
     @app.route("/health", methods=["GET"])
     def health():
-        return jsonify({"status": "running", "version": "v4.17"}), 200
+        return jsonify({"status": "running", "version": "v4.18"}), 200
 
     port = _env_int("PORT", 8080)
     log(f"Webhook-Server gestartet auf Port {port}")
@@ -5352,7 +5370,7 @@ def main():
         log("In Railway → Variables eintragen.")
         return
 
-    log("DOMINUS Trade-Automatisierung v4.17 gestartet — mit finanzmathematischen Optimierungen")
+    log("DOMINUS Trade-Automatisierung v4.18 gestartet — mit finanzmathematischen Optimierungen")
     log(f"Intervall: {POLL_INTERVAL}s")
     log("Warte auf neue Trades...")
     log("─" * 55)
