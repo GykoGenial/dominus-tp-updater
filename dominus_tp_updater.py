@@ -25,6 +25,10 @@ Changelog v4.13 — Webhook-Async + Bitget-Cache (TradingView-Timeout-Fix):
   W4: cache_invalidate() — nach jedem erfolgreichen Order-Placement werden die
       Positions- + Balance-Caches geleert, damit Folge-Checks frische Daten sehen.
   W5: /health-Endpoint liefert jetzt korrekt "v4.13" (vorher hartkodiert v4.35).
+  W6: Robuste Env-Parser _env_int/_env_float — Railway-Variablen mit Leerstring
+      ("" statt fehlend) crashen nicht mehr den Container-Start (betraf
+      H4_BUFFER_SEC, EXTREME_COOLDOWN_H, MAX_LEVERAGE, PORT, WINRATE, MIN_RR,
+      MAX_EXPOSURE_PCT, SLING_ATR_MULT, SLING_PCT_FLOOR).
 
 Changelog v4.12 — Sling-SL Universal + /trade-Vorschlag + Exposure-Cap:
   S1: SLING_SL-Webhook akzeptiert direction="auto" — Richtung wird aus
@@ -222,20 +226,41 @@ GOOGLE_CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS", "")  # Service Account
 GOOGLE_SHEET_ID    = os.environ.get("GOOGLE_SHEET_ID",    "")  # Spreadsheet ID aus URL
 TRADES_CSV         = os.environ.get("TRADES_CSV", "/app/data/trades.csv")  # Persistentes Trade-Archiv auf Railway Volume
 
+
+# v4.13: Robuste Env-Parser — Railway-Variablen können "" statt fehlend sein,
+# darum NICHT einfach int(os.environ.get(..., "300")) verwenden — ein leerer
+# String wird sonst an int() weitergereicht und crasht den Container-Start.
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "")
+    try:
+        return int(raw) if raw.strip() else default
+    except (ValueError, TypeError):
+        print(f"[WARN] {name}='{raw}' ungültig, nutze Default {default}")
+        return default
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name, "")
+    try:
+        return float(raw) if raw.strip() else default
+    except (ValueError, TypeError):
+        print(f"[WARN] {name}='{raw}' ungültig, nutze Default {default}")
+        return default
+
+
 # Finanzmathematische Parameter
-WINRATE = float(os.environ.get("WINRATE", "0.55"))  # eigene Winrate (historisch)
-MIN_RR  = float(os.environ.get("MIN_RR", "1.5"))    # Mindest R:R Ratio
+WINRATE = _env_float("WINRATE", 0.55)  # eigene Winrate (historisch)
+MIN_RR  = _env_float("MIN_RR", 1.5)    # Mindest R:R Ratio
 
 # v4.12: Max-Exposure-Cap pro Trade (Van Tharp 1% regulär → hier Gesamt-Einsatz
 # inkl. Hebel bei vollem DCA-Setup). Default 25% = 10%-Margin × Hebel-Cap 25x /
 # Aufteilung entspricht dem DOMINUS-25%-Max-Loss-Framework.
-MAX_EXPOSURE_PCT = float(os.environ.get("MAX_EXPOSURE_PCT", "0.25"))
-MAX_LEVERAGE     = int(os.environ.get("MAX_LEVERAGE", "25"))
+MAX_EXPOSURE_PCT = _env_float("MAX_EXPOSURE_PCT", 0.25)
+MAX_LEVERAGE     = _env_int("MAX_LEVERAGE", 25)
 
 # v4.12: Sling-SL Fallback-Puffer (wenn Pivot < pct_floor vom Preis entfernt,
 # wird mindestens max(pct_floor%, atr_mult × ATR) als Puffer gewahrt).
-SLING_ATR_MULT  = float(os.environ.get("SLING_ATR_MULT",  "0.5"))
-SLING_PCT_FLOOR = float(os.environ.get("SLING_PCT_FLOOR", "0.8"))  # % vom Preis
+SLING_ATR_MULT  = _env_float("SLING_ATR_MULT",  0.5)
+SLING_PCT_FLOOR = _env_float("SLING_PCT_FLOOR", 0.8)  # % vom Preis
 
 BASE_URL = "https://api.bitget.com"
 
@@ -259,7 +284,7 @@ trade_data: dict = {}
 # H4 Trigger-Puffer: sammelt Alerts, sendet gebündelt nach Zeitfenster
 h4_buffer:     list = []
 h4_buffer_lock = __import__("threading").Lock()
-H4_BUFFER_SEC  = int(os.environ.get("H4_BUFFER_SEC", "300"))  # 5 Min
+H4_BUFFER_SEC  = _env_int("H4_BUFFER_SEC", 300)  # 5 Min
 
 trailing_sl_level: dict = {}  # {symbol: int} — 0=initial, 1=Entry, 2=TP1-Preis, 3=TP2-Preis
 
@@ -310,7 +335,7 @@ t2_dir:   str = ""   # aktuelle Total2 Impuls-Richtung
 #           Sliding Window: ein neuer Alarm verlängert die Zone.
 #           Nach Ablauf: state bleibt, aber extreme_warn() gibt keinen
 #           Premium-/Warn-Text mehr aus.
-EXTREME_COOLDOWN_H = int(os.environ.get("EXTREME_COOLDOWN_H", "4"))
+EXTREME_COOLDOWN_H = _env_int("EXTREME_COOLDOWN_H", 4)
 
 macro_extreme: dict = {
     "btc":    {"state": 0, "until_ts": 0.0},
@@ -4315,7 +4340,7 @@ def start_webhook_server():
     def health():
         return jsonify({"status": "running", "version": "v4.13"}), 200
 
-    port = int(os.environ.get("PORT", 8080))
+    port = _env_int("PORT", 8080)
     log(f"Webhook-Server gestartet auf Port {port}")
     log(f"Endpoint: /webhook?token={WEBHOOK_SECRET}")
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
