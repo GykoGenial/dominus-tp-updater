@@ -132,7 +132,7 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#111114;color:#de
 <div class="wrap">
 
 <div class="page-title">DOMINUS Alarm-Templates</div>
-<div class="page-sub">TradingView &rarr; Railway Webhook &rarr; Telegram &middot; DOM-ORC v2.1 &middot; Railway v4.10 &mdash; Dark Mode &mdash; Stand April 2026</div>
+<div class="page-sub">TradingView &rarr; Railway Webhook &rarr; Telegram &middot; DOM-ORC v2.1 &middot; Railway v4.11 &mdash; Dark Mode &mdash; Stand April 2026</div>
 
 <!-- INHALTSVERZEICHNIS / TIMELINE -->
 <div class="card" id="sec-toc">
@@ -209,8 +209,9 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#111114;color:#de
       <a href="#sec-alarm2b"  style="font-size:12px;padding:4px 10px;border-radius:6px;background:#2e1616;color:#F07070;text-decoration:none;border:0.5px solid rgba(0,0,0,0.06)">2b Short Entry</a>
       <a href="#sec-alarm3"   style="font-size:12px;padding:4px 10px;border-radius:6px;background:#0d2820;color:#4ECBA0;text-decoration:none;border:0.5px solid rgba(0,0,0,0.06)">3 HARSI Exit Long</a>
       <a href="#sec-alarm3b"  style="font-size:12px;padding:4px 10px;border-radius:6px;background:#2e1616;color:#F07070;text-decoration:none;border:0.5px solid rgba(0,0,0,0.06)">3b HARSI Exit Short</a>
-      <a href="#sec-alarm4"   style="font-size:12px;padding:4px 10px;border-radius:6px;background:#0d2820;color:#4ECBA0;text-decoration:none;border:0.5px solid rgba(0,0,0,0.06)">4 HARSI SL Long</a>
-      <a href="#sec-alarm4b"  style="font-size:12px;padding:4px 10px;border-radius:6px;background:#2e1616;color:#F07070;text-decoration:none;border:0.5px solid rgba(0,0,0,0.06)">4b HARSI SL Short</a>
+      <a href="#sec-alarm4c"  style="font-size:12px;padding:4px 10px;border-radius:6px;background:#2a1b3d;color:#C28AF5;text-decoration:none;border:0.5px solid rgba(194,138,245,0.25)">&#x1F3AF; 4c HARSI SL Universal (NEU v4.11)</a>
+      <a href="#sec-alarm4"   style="font-size:12px;padding:4px 10px;border-radius:6px;background:#252528;color:#888;text-decoration:none;border:0.5px solid rgba(0,0,0,0.06)">4 HARSI SL Long (legacy)</a>
+      <a href="#sec-alarm4b"  style="font-size:12px;padding:4px 10px;border-radius:6px;background:#252528;color:#888;text-decoration:none;border:0.5px solid rgba(0,0,0,0.06)">4b HARSI SL Short (legacy)</a>
       <a href="#sec-alarm1"   style="font-size:12px;padding:4px 10px;border-radius:6px;background:#252528;color:#888;text-decoration:none;border:0.5px solid rgba(0,0,0,0.09)">1 H4 Long (optional)</a>
       <a href="#sec-alarm1b"  style="font-size:12px;padding:4px 10px;border-radius:6px;background:#252528;color:#888;text-decoration:none;border:0.5px solid rgba(0,0,0,0.09)">1b H4 Short (optional)</a>
       <a href="#sec-alarm5"   style="font-size:12px;padding:4px 10px;border-radius:6px;background:#0e1f33;color:#7BB8F5;text-decoration:none;border:0.5px solid rgba(0,0,0,0.06)">5 BTC Makro</a>
@@ -1096,6 +1097,113 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#111114;color:#de
     <div class="notif-card"><div class="notif-label">Ausl&ouml;sung</div><div class="notif-val">Einmal pro Bar</div></div>
     <div class="notif-card"><div class="notif-label">Ablauf</div><div class="notif-val">Unbefristet</div></div>
     <div class="notif-card"><div class="notif-label">Typ</div><div class="notif-val">Technisch</div></div>
+  </div>
+</div>
+
+<!-- ALARM 4c: HARSI SL UNIVERSAL (Watchlist-Auto, v4.11) -->
+<div class="card" id="sec-alarm4c" style="border-left:3px solid #C28AF5">
+  <div class="card-head">
+    <div class="step-badge" style="background:#2a1b3d;color:#C28AF5">4c</div>
+    <div>
+      <div class="h2">HARSI SL &mdash; Universal <span class="new-badge" style="background:#2a1b3d;color:#C28AF5;border-color:rgba(194,138,245,0.3)">VOLLAUTOMATIK v4.11</span></div>
+      <div class="sub">Ein einziger Watchlist-Alarm ersetzt Alarm 4/4b f&uuml;r alle Symbole &mdash; Railway ermittelt die Richtung aus der offenen Position.</div>
+    </div>
+  </div>
+
+  <div style="background:#1a1322;border:1px solid rgba(194,138,245,0.25);border-radius:8px;padding:12px 14px;margin-bottom:14px;font-size:12px;line-height:1.65">
+    <strong style="color:#C28AF5">&#x1F3AF; Was dieser Alarm l&ouml;st</strong><br>
+    <span style="color:#B8B8C0">Statt Alarm 4 (Long) + Alarm 4b (Short) pro Symbol manuell einzurichten, gen&uuml;gt <strong>1 einziger</strong> Watchlist-Alarm vom Typ <code>Any alert() function call</code>. Die Pine feuert bei jedem H2-Close mit HARSI-Kreuzung und embedded den Preis direkt im JSON-Body &mdash; das bekannte <code>{{plot(...)}}</code>-Problem bei Watchlist-Alarmen ist umgangen. Railway filtert stumm alle Symbole ohne offene Position.</span>
+  </div>
+
+  <!-- Voraussetzung: Pine-Snippet -->
+  <div style="background:#0d1f2d;border:1px solid rgba(123,184,245,0.25);border-radius:8px;padding:12px 14px;margin-bottom:14px;font-size:12px;line-height:1.65">
+    <strong style="color:#7BB8F5">&#x26A0; Voraussetzung: Pine-Snippet einf&uuml;gen</strong><br>
+    <span style="color:#B8B8C0">Im <b>DOMINUS Orchestrator</b> Pine am Ende (nach den bestehenden alertcondition-Zeilen) folgenden Code einf&uuml;gen:</span>
+    <div style="background:#0a0a0e;border-radius:6px;padding:10px 12px;margin-top:8px;font-family:'SF Mono','Fira Mono',monospace;font-size:11px;color:#e0e0e0;line-height:1.6;overflow-x:auto">
+<pre style="margin:0;white-space:pre-wrap">// v4.11 HARSI_SL Universal-Emitter &mdash; feuert direkt via alert()
+// HARSI ist rsi_overlay (RSI Overlay plot). Ausstiegslinien &plusmn;20.
+if barstate.isconfirmed
+    if ta.crossover(rsi_overlay, -20)   // Long-Stop: HARSI verl&auml;sst Oversold aufw&auml;rts
+        alert('{"symbol":"' + syminfo.ticker + '","side":"long","signal":"HARSI_SL","price":' + str.tostring(close, "#.########") + ',"timeframe":"' + timeframe.period + '"}', alert.freq_once_per_bar_close)
+    if ta.crossunder(rsi_overlay, 20)   // Short-Stop: HARSI verl&auml;sst Overbought abw&auml;rts
+        alert('{"symbol":"' + syminfo.ticker + '","side":"short","signal":"HARSI_SL","price":' + str.tostring(close, "#.########") + ',"timeframe":"' + timeframe.period + '"}', alert.freq_once_per_bar_close)</pre>
+    </div>
+    <div style="margin-top:8px;color:#888;font-size:11px">
+      <strong style="color:#B8B8C0">Alternative:</strong> Falls du <code>side</code> nicht mitsenden willst (z.B. wenn Pine die Richtung nicht sauber trennen kann), setze stattdessen <code>"side":"auto"</code>. Railway ermittelt die Richtung dann selbst aus der offenen Position.
+    </div>
+  </div>
+
+  <!-- Alarm-Einstellungen -->
+  <div class="label">Alarmname</div>
+  <div class="field">
+    <div style="display:flex;justify-content:space-between;align-items:center">
+      <button class="copy-btn" onclick="copyText('&#x1F3AF; DOMINUS HARSI SL Universal',this)">Kopieren</button>
+    </div>
+    <div class="field-value">&#x1F3AF; DOMINUS HARSI SL Universal</div>
+  </div>
+
+  <div class="label">Bedingung</div>
+  <div class="field">
+    <div class="field-value">
+      Indikator: <b>DOMINUS Orchestrator</b> (mit v4.11-Snippet)<br>
+      Bedingung: <b>Any alert() function call</b> (NICHT eine einzelne Bedingung w&auml;hlen!)<br>
+      Intervall: <b>H2</b> &middot; Ausl&ouml;sung: <b>Einmal pro Bar Close</b><br>
+      Typ: <b>Watchlist</b> (deine komplette DOMINUS-Watchlist)
+    </div>
+    <div class="warn" style="margin-top:6px"><strong>&#x26A0; Wichtig:</strong> In der TradingView-Alarm-Maske unter <em>"Bedingung"</em> <b>"Any alert() function call"</b> ausw&auml;hlen (erscheint ganz unten im Dropdown) &mdash; <b>nicht</b> eine Plot- oder Kreuzungsbedingung. Nur so werden die Pine-<code>alert()</code>-Aufrufe durchgereicht.</div>
+  </div>
+
+  <div class="label">JSON-Message</div>
+  <div class="field">
+    <div style="display:flex;justify-content:space-between;align-items:center">
+      <button class="copy-btn" onclick="copyText('',this)" disabled style="opacity:0.5">Leer lassen</button>
+    </div>
+    <div class="field-value mono" style="color:#888">(leer lassen &mdash; die Pine erzeugt die JSON-Nachricht selbst via <code>alert()</code>)</div>
+  </div>
+
+  <div class="label">Webhook-URL</div>
+  <div class="field">
+    <div style="display:flex;justify-content:space-between;align-items:center">
+      <button class="copy-btn" onclick="copyText(document.getElementById('harsi-sl-universal-url').textContent,this)">Kopieren</button>
+    </div>
+    <div class="field-value mono" id="harsi-sl-universal-url">https://dominus-tp-updater-production.up.railway.app/webhook?token=DEIN_WEBHOOK_SECRET</div>
+    <div class="info" style="margin-top:6px">Gleiche Webhook-URL wie alle anderen Alarme &mdash; das Script routet intern nach <code>signal</code>-Feld.</div>
+  </div>
+
+  <div class="label">Railway reagiert</div>
+  <div style="margin-bottom:14px">
+    <div style="background:#0d0d10;border-radius:10px;padding:12px 14px;font-family:'SF Mono','Fira Mono',monospace;font-size:12px;color:#e0e0e0;line-height:1.7">
+      <span style="color:#C28AF5">&#x1F3AF; HARSI_SL Universal &mdash; ETHUSDT</span><br>
+      &#x1F50E; Auto-Direction: <b>LONG</b> (aus offener Position)<br>
+      &#x1F4C9; SL &rarr; <b>3140.00 USDT</b> (HARSI-Ausstiegslinie)<br>
+      &#x2501;&#x2501;&#x2501;&#x2501;&#x2501;&#x2501;&#x2501;&#x2501;&#x2501;&#x2501;<br>
+      &#x1F4E6; Restposition: <b>0.125 ETH</b><br>
+      &#x1F6E1; Min. Gewinn: <b>+287.50 USDT</b><br>
+      &#x2705; SL-Anpassung via set_sl_harsi() ausgef&uuml;hrt
+    </div>
+  </div>
+
+  <!-- Vorteile -->
+  <div style="background:#0d2820;border:1px solid rgba(78,203,160,0.25);border-radius:8px;padding:12px 14px;margin-bottom:14px;font-size:12px;line-height:1.7">
+    <strong style="color:#4ECBA0">&#x2705; Warum dieser Alarm besser ist als Alarm 4/4b</strong><br>
+    <span style="color:#B8B8C0">
+      <b>1 Alarm-Slot statt N</b> &mdash; du sparst TradingView-Limits massiv.<br>
+      <b>Null manuelle Arbeit bei neuem Trade</b> &mdash; Pine feuert auf jeder H2-Bar automatisch f&uuml;r alle Watchlist-Symbole.<br>
+      <b>Keine <code>{{plot()}}</code>-Probleme</b> &mdash; der Preis steht als String im JSON, kein Platzhalter mehr.<br>
+      <b>Vollautomatische Direction</b> &mdash; Railway erkennt selbst, ob Long oder Short-Position offen ist.<br>
+      <b>Silent-Filter</b> &mdash; Symbole ohne offene Position werden stumm ignoriert.
+    </span>
+  </div>
+
+  <div class="notif-row">
+    <div class="notif-card"><div class="notif-label">Benachrichtigung</div><div class="notif-val">App + Ton (optional)</div></div>
+    <div class="notif-card"><div class="notif-label">Ausl&ouml;sung</div><div class="notif-val">Einmal pro Bar</div></div>
+    <div class="notif-card"><div class="notif-label">Ablauf</div><div class="notif-val">Unbefristet</div></div>
+    <div class="notif-card"><div class="notif-label">Typ</div><div class="notif-val">Watchlist</div></div>
+  </div>
+
+  <div class="info" style="margin-top:12px;font-size:12px">
+    <strong>Migration von Alarm 4/4b:</strong> Sobald Alarm 4c aktiv ist, k&ouml;nnen die alten Alarme 4/4b pro Symbol in TradingView gel&ouml;scht werden. Sie werden durch den Universal-Alarm vollst&auml;ndig ersetzt. Railway ist backward-kompatibel &mdash; falls du parallel testen willst, st&ouml;ren sich beide Varianten nicht.
   </div>
 </div>
 

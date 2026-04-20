@@ -1,5 +1,5 @@
 """
-DOMINUS Trade-Automatisierung v4.10
+DOMINUS Trade-Automatisierung v4.11
 ══════════════════════════════════════════════════════════════
 Vollautomatisches Setup nach DOMINUS-Strategie (Handbuch März 2026)
 Finanzmathematische Optimierungen:
@@ -8,6 +8,19 @@ Finanzmathematische Optimierungen:
   ③ Kelly-Kriterium   — optimale Positionsgrösse
   ④ Asymm. TPs        — 15/20/25/40% statt 25/25/25/25%
   ⑤ Telegram Polling  — /berechnen /trade /status /hilfe /alarm
+
+Changelog v4.11 — HARSI_SL Universal-Watchlist (Vollautomatik):
+  U1: HARSI_SL-Webhook akzeptiert direction="auto" (oder fehlend) —
+      Richtung wird automatisch aus der offenen Position abgeleitet.
+  U2: Ein einziger "Any alert() function call"-Watchlist-Alarm ersetzt
+      die bisherigen Alarm-4/4b Pro-Symbol-Einrichtungen. Pine feuert
+      bei jedem H2-Close mit HARSI-Kreuzung, Railway filtert stumm
+      Symbole ohne offene Position.
+  U3: Signal wird nur ausgeführt, wenn eine offene Position für das
+      Symbol existiert — alle anderen Events silent-ignoriert.
+  U4: Backward-kompatibel — bestehende Alarm 4/4b mit direction="long"/
+      "short" funktionieren weiter.
+  U5: HTML-Doku um "Alarm 4c — HARSI SL Universal" erweitert.
 
 Changelog v4.10 — DOMINUS-konforme Premium-Zonen (ersetzt v4.9 Hard-Block):
   P1: Extremzonen werden als Premium-Entry-Bestätigung behandelt (Handbuch-konform),
@@ -3289,11 +3302,17 @@ def start_webhook_server():
         entry      = float(data.get("entry", 0) or 0)
         timeframe  = data.get("timeframe", "H2").upper()
 
+        # v4.11: signal_type früh parsen — HARSI_SL darf direction="auto" haben.
+        signal_type = data.get("signal", "").upper()
+
         # Richtung: "direction" ODER "side" (beide Feldnamen akzeptieren)
         # Alarm-Templates senden "side":"long"/"short" — Script liest beide.
         direction = data.get("direction", "").lower()
         if direction not in ("long", "short"):
             direction = data.get("side", "").lower()
+        # "auto" → leer (Auto-Direction kommt unten, nur für HARSI_SL)
+        if direction == "auto":
+            direction = ""
         if direction not in ("long", "short"):
             buy_val  = float(data.get("buy",  0) or 0)
             sell_val = float(data.get("sell", 0) or 0)
@@ -3310,6 +3329,22 @@ def start_webhook_server():
         if not symbol.endswith("USDT"):
             symbol += "USDT"
 
+        # v4.11: HARSI_SL Universal — falls direction fehlt/auto, aus offener
+        # Position ableiten. Ein einziger Watchlist-Alarm feuert dann für alle
+        # DOMINUS-Symbole und Railway filtert stumm Symbole ohne offene Position.
+        if signal_type == "HARSI_SL" and direction not in ("long", "short") and symbol:
+            for _p in get_all_positions():
+                _psym = (_p.get("symbol") or "").upper()
+                _psize = float(_p.get("total", 0) or 0)
+                if _psym == symbol and _psize > 0:
+                    direction = (_p.get("holdSide") or "").lower()
+                    if direction in ("long", "short"):
+                        log(f"🔎 HARSI_SL Auto-Direction: {symbol} → {direction.upper()} (aus offener Position)")
+                        break
+            if direction not in ("long", "short"):
+                # Kein offener Trade → silent ignore, Watchlist-Rauschen unterdrücken
+                return jsonify({"status": "ignored", "reason": "no open position"}), 200
+
         if not symbol or direction not in ("long", "short"):
             log(f"⚠ Webhook ignoriert: kein Signal "
                 f"(buy={data.get('buy',0)} sell={data.get('sell',0)} "
@@ -3323,7 +3358,6 @@ def start_webhook_server():
         if entry == 0:
             entry = get_mark_price(symbol)
 
-        signal_type = data.get("signal", "").upper()
         log(f"\U0001f4e1 Alert: {symbol} {direction.upper()} @ {entry} [{timeframe}]")
 
         # ─────────────────────────────────────────────────────────────
