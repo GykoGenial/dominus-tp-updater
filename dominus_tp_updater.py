@@ -1,5 +1,5 @@
 """
-DOMINUS Trade-Automatisierung v4.14
+DOMINUS Trade-Automatisierung v4.15
 ══════════════════════════════════════════════════════════════
 Vollautomatisches Setup nach DOMINUS-Strategie (Handbuch März 2026)
 Finanzmathematische Optimierungen:
@@ -10,6 +10,17 @@ Finanzmathematische Optimierungen:
   ⑤ Telegram Polling  — /berechnen /trade /status /hilfe /alarm
   ⑥ Sling-SL Trailing — Swing-Pivot-basierter SL (nur protektiv)
   ⑦ Exposure-Cap 25%  — max. Gesamt-Einsatz inkl. Hebel pro Trade
+
+Changelog v4.15 — TP-Stornierung: Einzelcall mit planType (Hotfix):
+  T1: cancel_all_tp_orders() — Bitget v2 Batch-Mode (orderIdList) liefert
+      für profit_plan-Orders silent `code=00000` mit leeren success/fail-
+      Listen zurück → Orders werden NICHT storniert. v4.14 hat das als
+      Erfolg interpretiert → 6 alte + 4 neue TPs = 10 Duplikate.
+  T2: Migration auf Einzelstornierung mit explizitem `planType=profit_plan`
+      (analog python-bitget `mix_cancel_plan_order`). Jeder Cancel-Response
+      wird einzeln geprüft, Gesamtstatistik am Ende geloggt.
+  T3: Robuster gegen Orders ohne orderId (clientOid-Fallback), jeder echte
+      Fehler wird jetzt mit Code+Msg geloggt — kein stilles No-Op mehr.
 
 Changelog v4.14 — Bitget-v2 Plan-Order-Endpoints (TP-Duplikate-Fix):
   P1: _get_plan_orders() — nutzt jetzt den v2-Pflichtparameter `planType`
@@ -1129,21 +1140,27 @@ def kelly_recommendation(balance: float, winrate: float) -> dict:
 
 def cancel_all_tp_orders(symbol: str):
     """
-    Storniert alle Einzel-TP-Orders (profit_plan) für ein Symbol via
-    Bitget-v2 Batch-Cancel.
+    Storniert alle Einzel-TP-Orders (profit_plan) für ein Symbol.
 
-    Bitget v2 hat KEINEN `/api/v2/mix/order/cancel-all-plan-order`-Endpoint
-    (gibt "Request URL NOT FOUND" zurück). Korrekter Weg:
+    v4.15 — Einzelstornierung mit explizitem planType
+    ─────────────────────────────────────────────────
+    Bitget v2 `/api/v2/mix/order/cancel-plan-order` akzeptiert zwar laut Doku
+    einen `orderIdList`-Batch-Mode, aber für TP/SL-Orders (profit_plan) gibt
+    Bitget in diesem Modus `code=00000` mit LEEREM successList+failureList
+    zurück — die Orders werden tatsächlich NICHT storniert (stilles No-Op).
+    Die python-bitget Referenz-Implementierung (`mix_cancel_plan_order`)
+    nutzt deshalb die Einzel-Form MIT `planType` — das funktioniert für
+    profit_plan zuverlässig.
 
-      1. orders-plan-pending lesen (per planType=profit_loss → holt TPs+SL)
-      2. profit_plan-Einträge filtern (SL und TP4/pos_profit nicht anfassen!)
-      3. `/api/v2/mix/order/cancel-plan-order` mit `orderIdList` aufrufen —
-         dieser Endpoint unterstützt Batch-Cancel in einem Call.
-      4. Fehlgeschlagene IDs werden nochmal einzeln probiert (Resilienz).
+    Ablauf:
+      1. orders-plan-pending lesen (planType=profit_loss liefert TPs+SL)
+      2. Nur profit_plan-Einträge auswählen (SL/TP4 nicht anfassen!)
+      3. Pro Order: POST cancel-plan-order mit {orderId, planType, …}
+      4. Jede Response einzeln prüfen — echte Fehler werden geloggt,
+         der Gesamt-Status wird am Ende zusammengefasst.
 
-    SL-Typen (loss_plan, pos_loss) und TP4 (pos_profit via place-pos-tpsl)
-    werden NIE angefasst — diese werden bei Bedarf durch place-pos-tpsl
-    überschrieben, nicht gelöscht.
+    SL (loss_plan, pos_loss) und TP4 (pos_profit via place-pos-tpsl)
+    werden NIE angefasst — diese werden per place-pos-tpsl überschrieben.
     """
     orders = _get_plan_orders(symbol)
     tp_orders = [o for o in orders if o.get("planType") == "profit_plan"]
@@ -1152,61 +1169,42 @@ def cancel_all_tp_orders(symbol: str):
         log(f"  Keine TP-Orders (profit_plan) gefunden")
         return
 
-    log(f"  {len(tp_orders)} TP(s) stornieren (Batch-Cancel)...")
+    log(f"  {len(tp_orders)} TP(s) einzeln stornieren (planType=profit_plan)...")
 
-    # ── Stufe 1: Batch-Cancel via orderIdList ────────────────
-    order_id_list = [
-        {"orderId": (o.get("orderId") or ""),
-         "clientOid": (o.get("clientOid") or "")}
-        for o in tp_orders if (o.get("orderId") or o.get("clientOid"))
-    ]
-
-    pending_orders = list(tp_orders)  # wird auf Fails reduziert
-
-    if order_id_list:
-        batch_res = api_post("/api/v2/mix/order/cancel-plan-order", {
-            "symbol":      symbol,
-            "productType": PRODUCT_TYPE,
-            "marginCoin":  MARGIN_COIN,
-            "orderIdList": order_id_list,
-        })
-        if batch_res.get("code") == "00000":
-            data = batch_res.get("data") or {}
-            succ = data.get("successList") or []
-            fail = data.get("failureList") or []
-            log(f"    ✓ Batch-Cancel: {len(succ)} OK, {len(fail)} Fehler")
-            if not fail:
-                return
-            failed_ids = {(f.get("orderId") or f.get("clientOid"))
-                          for f in fail}
-            pending_orders = [
-                o for o in tp_orders
-                if (o.get("orderId") or o.get("clientOid")) in failed_ids
-            ]
-        else:
-            log(f"    ⚠ Batch-Cancel fehlgeschlagen "
-                f"({batch_res.get('msg','?')}) — Einzelstornierung...")
-
-    # ── Stufe 2: Einzelstornierung (Fallback) ────────────────
-    for order in pending_orders:
+    ok = 0
+    errs = 0
+    for order in tp_orders:
         oid = order.get("orderId") or ""
         coid = order.get("clientOid") or ""
         price = order.get("triggerPrice", "?")
-        res = api_post("/api/v2/mix/order/cancel-plan-order", {
+        pt = order.get("planType") or "profit_plan"
+
+        body = {
             "symbol":      symbol,
             "productType": PRODUCT_TYPE,
             "marginCoin":  MARGIN_COIN,
-            "orderIdList": [{"orderId": oid, "clientOid": coid}],
-        })
-        if res.get("code") == "00000":
-            data = res.get("data") or {}
-            if data.get("failureList"):
-                err = (data.get("failureList") or [{}])[0].get("errorMsg", "?")
-                log(f"    ✗ TP @ {price} ({oid}): {err}")
-            else:
-                log(f"    ✓ TP storniert @ {price}: {oid}")
+            "planType":    pt,
+        }
+        if oid:
+            body["orderId"] = oid
+        elif coid:
+            body["clientOid"] = coid
         else:
-            log(f"    ✗ Fehler @ {price} ({oid}): {res.get('msg', res)}")
+            log(f"    ⏭ Order ohne ID übersprungen @ {price}")
+            continue
+
+        res = api_post("/api/v2/mix/order/cancel-plan-order", body)
+        code = res.get("code")
+
+        if code == "00000":
+            log(f"    ✓ TP storniert @ {price}: {oid or coid}")
+            ok += 1
+        else:
+            log(f"    ✗ TP @ {price} ({oid or coid}): "
+                f"code={code} msg={res.get('msg','?')}")
+            errs += 1
+
+    log(f"  → {ok}/{len(tp_orders)} TPs storniert, {errs} Fehler")
 
 
 def calc_tp_price(avg: float, roi: float,
@@ -4405,7 +4403,7 @@ def start_webhook_server():
     @app.route("/", methods=["GET"])
     @app.route("/health", methods=["GET"])
     def health():
-        return jsonify({"status": "running", "version": "v4.14"}), 200
+        return jsonify({"status": "running", "version": "v4.15"}), 200
 
     port = _env_int("PORT", 8080)
     log(f"Webhook-Server gestartet auf Port {port}")
