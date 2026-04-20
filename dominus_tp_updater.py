@@ -1,5 +1,5 @@
 """
-DOMINUS Trade-Automatisierung v4.18
+DOMINUS Trade-Automatisierung v4.19
 ══════════════════════════════════════════════════════════════
 Vollautomatisches Setup nach DOMINUS-Strategie (Handbuch März 2026)
 Finanzmathematische Optimierungen:
@@ -10,6 +10,29 @@ Finanzmathematische Optimierungen:
   ⑤ Telegram Polling  — /berechnen /trade /status /hilfe /alarm
   ⑥ Sling-SL Trailing — Swing-Pivot-basierter SL (nur protektiv)
   ⑦ Exposure-Cap 25%  — max. Gesamt-Einsatz inkl. Hebel pro Trade
+  ⑧ Entry-Queue       — mehrere HARSI_EXIT-Signale als Rangliste (v4.19)
+
+Changelog v4.19 — Entry-Queue: Ranked Entry-Liste bei mehreren HARSI_EXIT:
+  Q1: Mehrere HARSI_EXIT-Signale innerhalb ENTRY_QUEUE_WINDOW_SEC (Standard
+      90s) werden gesammelt und als EINE konsolidierte Telegram-Rangliste
+      gesendet — keine separaten Pop-ups mehr pro Signal.
+  Q2: Zwei Buckets: 🎯 PREMIUM (Makro-Extremzone + BTC_DIR/T2_DIR konform,
+      Handbuch-Hard-Gate) und 📋 REGULAR. Innerhalb jeder Gruppe absteigend
+      nach Quality-Score (0-100).
+  Q3: score_entry() bewertet: Makro-Premium (+30), BTC/T2-Richtung (+20/+10),
+      SL-Abstand (+15), Hebel als ATR-Proxy (+10), historische Win-Rate aus
+      trades.csv (+15), harsi_warn=0 (+5), Timing-Frische (+5), Korrelations-
+      Malus (-10 bei ≥2 offenen Positionen gleicher Richtung).
+  Q4: symbol_win_rate() liest die letzten 20 Trades pro Symbol aus trades.csv,
+      cacht 1h und lernt damit über Zeit — je mehr Historie, desto präziser.
+  Q5: Dedup im Fenster: identisches symbol+direction erhöht confirm_count
+      (Pine re-trigger = Bestätigung), keine Doubletten in der Liste.
+  Q6: ENTRY_QUEUE_ENABLED (Default 1) — per Railway-Variable abschaltbar
+      für Rollback ohne Redeploy. Abgelaufene 30-Min-Fenster senden weiterhin
+      die bisherige Einzel-Warnung (nur frische HARSI_EXITs werden gequeued).
+  Q7: State-Persistenz NICHT nötig — die Queue ist transient (max. 90s).
+      Ein Railway-Restart während eines offenen Fensters verliert höchstens
+      einige noch nicht ausgelöste Einstiege.
 
 Changelog v4.18 — /refresh Telegram-Anzeige inkl. TP4:
   R1: /refresh-Nachricht zeigte "TPs gesetzt: 3" obwohl 4 TPs auf Bitget
@@ -330,6 +353,15 @@ MAX_LEVERAGE     = _env_int("MAX_LEVERAGE", 25)
 SLING_ATR_MULT  = _env_float("SLING_ATR_MULT",  0.5)
 SLING_PCT_FLOOR = _env_float("SLING_PCT_FLOOR", 0.8)  # % vom Preis
 
+# v4.19: Entry-Queue — mehrere HARSI_EXIT-Signale als Rangliste sammeln
+# ENTRY_QUEUE_ENABLED ("1"/"0"/"true"/"false") — default aktiv.
+# ENTRY_QUEUE_WINDOW_SEC — Sammelfenster in Sekunden (default 90).
+_raw_eq = os.environ.get("ENTRY_QUEUE_ENABLED", "1").strip().lower()
+if not _raw_eq:
+    _raw_eq = "1"
+ENTRY_QUEUE_ENABLED    = _raw_eq not in ("0", "false", "no", "off")
+ENTRY_QUEUE_WINDOW_SEC = _env_int("ENTRY_QUEUE_WINDOW_SEC", 90)
+
 BASE_URL = "https://api.bitget.com"
 
 # ═══════════════════════════════════════════════════════════════
@@ -409,6 +441,16 @@ macro_extreme: dict = {
     "btc":    {"state": 0, "until_ts": 0.0},
     "total2": {"state": 0, "until_ts": 0.0},
 }
+
+# v4.19: Entry-Queue State — transient (nicht persistiert, max. 90s Lebensdauer)
+pending_entries:      dict = {}           # {sig_key: entry_info_dict}
+pending_entries_lock       = threading.Lock()
+_entry_flush_timer         = None         # threading.Timer oder None
+_entry_flush_started_ts    = 0.0          # time.time() beim Start des aktuellen Fensters
+
+# v4.19: Win-Rate Cache pro Symbol — {symbol: (wr, n_trades, expire_ts)}
+_winrate_cache: dict = {}
+_WINRATE_CACHE_TTL   = 3600               # 1h TTL
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -2962,6 +3004,320 @@ def format_trade_suggestion(symbol: str, direction: str, sugg: dict) -> str:
     return "\n".join(lines)
 
 
+# ═══════════════════════════════════════════════════════════════
+# v4.19: ENTRY-QUEUE — Ranked Entry-Liste bei mehreren HARSI_EXIT
+# ═══════════════════════════════════════════════════════════════
+# Statt jedes HARSI_EXIT-Signal sofort an Telegram zu schicken, werden
+# Signale in einem ENTRY_QUEUE_WINDOW_SEC-Fenster gesammelt und danach
+# als eine einzige, nach Score sortierte Rangliste gesendet:
+#   🎯 PREMIUM  (Makro-Extremzone + BTC/T2-Richtung konform — Hard-Gate)
+#   📋 REGULAR  (alles andere)
+# innerhalb jeder Gruppe absteigend nach Quality-Score (0-100).
+
+def symbol_win_rate(symbol: str, n_last: int = 20) -> tuple:
+    """Liest TRADES_CSV (Railway Volume) und gibt (win_rate, n_trades) für die
+    letzten n_last Trades des Symbols zurück. Gecacht 1h. Rückgabe (0.5, 0)
+    wenn CSV leer/fehlt oder zu wenige Daten."""
+    now = time.time()
+    cached = _winrate_cache.get(symbol)
+    if cached and cached[2] > now:
+        return (cached[0], cached[1])
+
+    wr, n = 0.5, 0
+    try:
+        if not TRADES_CSV or not os.path.isfile(TRADES_CSV):
+            _winrate_cache[symbol] = (wr, n, now + _WINRATE_CACHE_TTL)
+            return (wr, n)
+
+        matched_rows: list = []
+        with open(TRADES_CSV, "r", encoding="utf-8") as f:
+            reader = csv.reader(f, delimiter=";")
+            next(reader, None)  # Header überspringen
+            for row in reader:
+                if len(row) < 12:
+                    continue
+                if row[2].strip().upper() == symbol.upper():
+                    matched_rows.append(row)
+
+        subset = matched_rows[-n_last:]
+        total  = len(subset)
+        wins   = sum(1 for r in subset
+                     if r[11].strip().lower() in ("ja", "yes", "true", "1"))
+        if total > 0:
+            wr = wins / total
+            n  = total
+    except Exception as e:
+        log(f"[symbol_win_rate] {symbol} Fehler: {e}")
+
+    _winrate_cache[symbol] = (wr, n, now + _WINRATE_CACHE_TTL)
+    return (wr, n)
+
+
+def score_entry(e: dict) -> dict:
+    """Quality-Score (0-100) für ein Entry-Signal. Rückgabe:
+      {"score": int, "is_premium": bool, "breakdown": [...], "warnings": [...]}
+
+    Gewichte (siehe Changelog v4.19):
+      +30  Makro-Premium aktiv (Extremzone richtungskonform)
+      +20  BTC_DIR + T2_DIR beide konform (nur eine: +10)
+      +15  enger SL-Abstand (0.5%=15pt, 2%=7pt, 5%=1pt, linear)
+      +10  Hebel-Qualität (Proxy für ATR-Range; 12x+ = volle Punkte)
+      +15  historische Win-Rate (0.40=0pt, 0.55=7pt, 0.70+=15pt)
+       +5  harsi_warn=0 (keine HARSI-Divergenz)
+       +5  Timing (<5 min ab H2 = 5pt, >30 min = 0pt)
+      -10  Korrelations-Malus (≥2 offene Positionen gleicher Richtung)
+    Premium-Gate: Makro-Premium UND BTC/T2 mindestens einmal konform.
+    """
+    direction = e.get("direction", "")
+    xinfo     = e.get("xinfo") or {}
+    premium_zones = xinfo.get("premium",  []) or []
+    warn_zones    = xinfo.get("warnings", []) or []
+    sugg      = e.get("sugg") or {}
+    sl_pct    = float(sugg.get("sl_dist_pct", 0) or 0)
+    leverage  = int(sugg.get("leverage", 0) or 0)
+    harsi_w   = int(e.get("harsi_warn", 0) or 0)
+    elapsed_m = int(e.get("timing_elapsed_min", 0) or 0)
+    symbol    = e.get("symbol", "")
+
+    score: int = 0
+    breakdown: list = []
+    warnings:  list = []
+
+    # 1) Makro-Premium-Zonen (+30 / Warnung)
+    has_premium = len(premium_zones) > 0
+    if has_premium:
+        score += 30
+        breakdown.append(f"+30 Makro-Premium ({len(premium_zones)}x)")
+    if warn_zones:
+        warnings.append(f"Makro-Gegensignal ({len(warn_zones)}x)")
+
+    # 2) BTC_DIR / T2_DIR Richtungs-Konsistenz
+    _btc = (btc_dir or "").lower()
+    _t2  = (t2_dir  or "").lower()
+
+    def _dir_matches(d: str) -> bool:
+        if direction == "long":
+            return d in ("long", "recovering")
+        if direction == "short":
+            return d in ("short", "recovering_short")
+        return False
+
+    m_btc = _dir_matches(_btc)
+    m_t2  = _dir_matches(_t2)
+    if m_btc and m_t2:
+        score += 20
+        breakdown.append("+20 BTC+T2 konform")
+    elif m_btc or m_t2:
+        score += 10
+        breakdown.append(f"+10 {'BTC' if m_btc else 'T2'} konform")
+    elif _btc or _t2:
+        warnings.append("Makro-Richtung nicht konform")
+
+    # 3) SL-Abstand → enger = bessere R:R (+15 bis 0)
+    if sl_pct > 0:
+        sl_pts = max(0, min(15, int(round(15 - (sl_pct - 0.5) * 3))))
+        score += sl_pts
+        breakdown.append(f"+{sl_pts} SL {sl_pct:.2f}%")
+
+    # 4) Hebel-Qualität (+10 bis 0)
+    if leverage > 0:
+        lev_pts = max(0, min(10, leverage - 2))
+        score += lev_pts
+        breakdown.append(f"+{lev_pts} {leverage}x Hebel")
+
+    # 5) Historische Win-Rate (+15 bis 0) — nur ab 3 Trades relevant
+    if symbol:
+        wr, n_tr = symbol_win_rate(symbol)
+        if n_tr >= 3:
+            wr_pts = max(0, min(15, int(round((wr - 0.40) / 0.30 * 15))))
+            score += wr_pts
+            breakdown.append(f"+{wr_pts} WR {wr*100:.0f}% ({n_tr}T)")
+        else:
+            breakdown.append(f"±0 WR n/a ({n_tr}T)")
+
+    # 6) HARSI-Divergenz-Flag (+5 / Warnung)
+    if harsi_w == 0:
+        score += 5
+        breakdown.append("+5 kein HARSI-warn")
+    else:
+        warnings.append("HARSI-Divergenz aktiv")
+
+    # 7) Timing-Frische (+5 bis 0)
+    if elapsed_m <= 30:
+        t_pts = max(0, min(5, int(round((30 - elapsed_m) / 30.0 * 5))))
+        score += t_pts
+        if t_pts > 0:
+            breakdown.append(f"+{t_pts} Timing {elapsed_m}min")
+
+    # 8) Korrelations-Malus (−10 bei ≥2 offenen Positionen gleicher Richtung)
+    try:
+        same_dir = 0
+        for pos in get_all_positions():
+            if float(pos.get("total", 0) or 0) <= 0:
+                continue
+            if (pos.get("holdSide") or "").lower() == direction:
+                same_dir += 1
+        if same_dir >= 2:
+            score -= 10
+            breakdown.append(f"-10 {same_dir}x {direction.upper()} offen")
+    except Exception:
+        pass
+
+    # Clamp auf 0..100
+    score = max(0, min(100, score))
+
+    # Premium-Bucket Hard-Gate
+    is_premium = has_premium and (m_btc or m_t2)
+
+    return {
+        "score":      score,
+        "is_premium": is_premium,
+        "breakdown":  breakdown,
+        "warnings":   warnings,
+    }
+
+
+def enqueue_entry(entry: dict) -> None:
+    """Fügt ein Entry-Signal zur Queue hinzu und startet den Flush-Timer
+    beim ersten Eintrag jeder Batch. Dubletten (gleicher sig_key) erhöhen
+    confirm_count und aktualisieren die Daten, ohne eine 2. Zeile zu erzeugen."""
+    global _entry_flush_timer, _entry_flush_started_ts
+    sig_key = f"{entry['symbol']}_{entry['direction']}"
+    with pending_entries_lock:
+        existing = pending_entries.get(sig_key)
+        if existing:
+            entry["confirm_count"] = existing.get("confirm_count", 1) + 1
+            log(f"  ENTRY-QUEUE: {sig_key} bestätigt ({entry['confirm_count']}x)")
+        else:
+            entry["confirm_count"] = 1
+        pending_entries[sig_key] = entry
+
+        timer_running = _entry_flush_timer is not None and _entry_flush_timer.is_alive()
+        if not timer_running:
+            _entry_flush_started_ts = time.time()
+            _entry_flush_timer = threading.Timer(ENTRY_QUEUE_WINDOW_SEC, flush_entries)
+            _entry_flush_timer.daemon = True
+            _entry_flush_timer.start()
+            log(f"  ENTRY-QUEUE: Fenster gestartet ({ENTRY_QUEUE_WINDOW_SEC}s) "
+                f"— 1. Signal: {sig_key}")
+
+
+def flush_entries() -> None:
+    """Timer-Callback nach Ablauf des Sammelfensters. Scored alle Signale,
+    sortiert nach Premium/Regular + Score und sendet konsolidierte Nachricht."""
+    global _entry_flush_timer
+    with pending_entries_lock:
+        if not pending_entries:
+            _entry_flush_timer = None
+            return
+        batch = list(pending_entries.values())
+        pending_entries.clear()
+        _entry_flush_timer = None
+
+    try:
+        for e in batch:
+            e["_scored"] = score_entry(e)
+
+        premium = [e for e in batch if e["_scored"]["is_premium"]]
+        regular = [e for e in batch if not e["_scored"]["is_premium"]]
+        premium.sort(key=lambda x: x["_scored"]["score"], reverse=True)
+        regular.sort(key=lambda x: x["_scored"]["score"], reverse=True)
+
+        try:
+            balance = get_futures_balance()
+        except Exception:
+            balance = 0.0
+
+        msg = format_ranked_list(premium, regular, balance, len(batch))
+        telegram(msg)
+        log(f"  ENTRY-QUEUE: Flush gesendet — {len(premium)} Premium, "
+            f"{len(regular)} Regular")
+    except Exception as ex:
+        log(f"[flush_entries] Fehler: {ex}")
+        try:
+            telegram(f"❌ <b>Entry-Queue Fehler</b>\n<code>{html.escape(str(ex))}</code>")
+        except Exception:
+            pass
+
+
+def format_ranked_list(premium: list, regular: list,
+                        balance: float, total: int) -> str:
+    """Baut die konsolidierte Telegram-Rangliste (Premium + Regular, je Bucket
+    absteigend nach Score) inkl. kopierbarer /trade-Befehle."""
+
+    def _render(idx: int, e: dict) -> list:
+        s        = e["_scored"]
+        sugg     = e.get("sugg") or {}
+        sym      = e["symbol"]
+        dr       = e["direction"].upper()
+        icon     = "🟢" if e["direction"] == "long" else "🔴"
+        entry_px = e.get("entry", 0) or 0
+        sl       = sugg.get("sl", 0) or 0
+        sl_pct   = sugg.get("sl_dist_pct", 0) or 0
+        lev      = sugg.get("leverage", 0) or 0
+        per_ord  = sugg.get("per_order", 0) or 0
+        confirms = e.get("confirm_count", 1)
+
+        conf_str = f" ⚡{confirms}x" if confirms > 1 else ""
+        out = [f"<b>{idx}. {icon} {sym} {dr}{conf_str}</b>  ·  "
+               f"Score <b>{s['score']}/100</b>"]
+
+        if entry_px and sl and lev:
+            out.append(f"   Entry {entry_px:.5f} | SL {sl:.5f} "
+                       f"({sl_pct:.2f}%) | {lev}x")
+        if per_ord > 0:
+            out.append(f"   ≈ {per_ord:.2f} USDT/Order")
+
+        bd_top = [b for b in (s.get("breakdown") or [])
+                  if b.startswith(("+", "-"))][:3]
+        if bd_top:
+            out.append(f"   {' · '.join(bd_top)}")
+
+        wn = s.get("warnings") or []
+        if wn:
+            out.append(f"   ⚠️ {'; '.join(wn)}")
+
+        if entry_px and sl and lev:
+            out.append(f"   <code>/trade {sym} {dr} {lev} "
+                       f"{entry_px:.5f} {sl:.5f}</code>")
+        return out
+
+    lines = [
+        "🏁 <b>DOMINUS — Entry-Rangliste</b>",
+        "━━━━━━━━━━━━",
+        f"{total} Signal{'e' if total != 1 else ''} "
+        f"im {ENTRY_QUEUE_WINDOW_SEC}s-Fenster",
+    ]
+    if balance > 0:
+        lines.append(f"💰 Balance: {balance:.2f} USDT | "
+                     f"Exposure-Cap {MAX_EXPOSURE_PCT*100:.0f}%")
+    lines.append("")
+
+    if premium:
+        lines.append(f"🎯 <b>PREMIUM ({len(premium)})</b>")
+        for i, e in enumerate(premium, 1):
+            lines.extend(_render(i, e))
+            lines.append("")
+    else:
+        lines.append("🎯 <b>PREMIUM</b> — keine")
+        lines.append("")
+
+    if regular:
+        lines.append(f"📋 <b>REGULAR ({len(regular)})</b>")
+        for i, e in enumerate(regular, 1):
+            lines.extend(_render(i, e))
+            lines.append("")
+    else:
+        lines.append("📋 <b>REGULAR</b> — keine")
+
+    lines.append("━━━━━━━━━━━━")
+    lines.append("💡 <i>Top-Eintrag jeder Gruppe zuerst traden. "
+                 "Kelly + Exposure-Cap bestimmen Slot-Anzahl.</i>")
+    _anker = "sec-alarm3"
+    lines.append(_doc_link(_anker, "Alarm 3/3b — HARSI Exit"))
+    return "\n".join(lines)
+
+
 def cmd_trade(parts: list):
     """
     /trade ETHUSDT LONG 10 2850 2700
@@ -4277,6 +4633,33 @@ def start_webhook_server():
 
             log(f"  HARSI_EXIT {symbol} {direction} | {warn_line[:60]}")
 
+            # v4.19: Wenn Entry-Queue aktiv UND Timing OK → in Queue statt
+            # direkt senden. Abgelaufene/unbekannte Timings liefern weiterhin
+            # die bisherige Einzel-Warnung, damit der User die Info sofort sieht.
+            if timing_ok and ENTRY_QUEUE_ENABLED:
+                _sugg = build_trade_suggestion(
+                    symbol, direction, entry,
+                    data.get("sling_sl"), data.get("atr"),
+                )
+                enqueue_entry({
+                    "symbol":             symbol,
+                    "direction":          direction,
+                    "entry":              entry,
+                    "warn_line":          warn_line,
+                    "timing_elapsed_min": elapsed_min or 0,
+                    "sugg":                _sugg,
+                    "harsi_warn":         int(data.get("harsi_warn", 0) or 0),
+                    "sling_sl":           data.get("sling_sl"),
+                    "atr":                data.get("atr"),
+                    "xinfo":              _xinfo,
+                    "ts":                 time.time(),
+                })
+                # Timestamp löschen — verhindert Doppel-Enqueue beim nächsten Re-Trigger
+                if sig_key in last_h2_signal_time:
+                    del last_h2_signal_time[sig_key]
+                return  # ok: HARSI_EXIT in Queue
+
+            # Fallback-Pfad (Queue disabled ODER Timing abgelaufen) → wie bisher
             msg_parts = [
                 f"{icon} <b>HARSI EXIT — {symbol} {direction.upper()}</b>",
                 "━" * 12,
@@ -4288,8 +4671,6 @@ def start_webhook_server():
             if timing_ok:
                 _e_anker = "sec-alarm2" if direction == "long" else "sec-alarm2b"
                 _e_lbl   = "Alarm 2 Long Entry" if direction == "long" else "Alarm 2b Short Entry"
-                # v4.12: /trade-Vorschlag mit Sling-SL + ATR (falls Pine sie mitsendet,
-                # sonst ATR-Fallback via SLING_PCT_FLOOR).
                 _sugg = build_trade_suggestion(
                     symbol, direction, entry,
                     data.get("sling_sl"), data.get("atr"),
