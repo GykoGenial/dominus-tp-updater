@@ -71,7 +71,7 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#111114;color:#de
 <div class="wrap">
 
 <div class="page-title">DOMINUS Alarm-Templates</div>
-<div class="page-sub">TradingView &rarr; Railway Webhook &rarr; Telegram &middot; DOM-ORC v2.1 &middot; Railway v4.35 &mdash; Dark Mode &mdash; Stand April 2026</div>
+<div class="page-sub">TradingView &rarr; Railway Webhook &rarr; Telegram &middot; DOM-ORC v2.1 &middot; Railway v4.9 &mdash; Dark Mode &mdash; Stand April 2026</div>
 
 <!-- INHALTSVERZEICHNIS / TIMELINE -->
 <div class="card" id="sec-toc">
@@ -499,7 +499,7 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#111114;color:#de
     <div class="field-label" style="margin-bottom:4px"><span>Webhook Message</span>
       <button class="copy-btn" onclick="copyField('btc-oversold',this)">Kopieren</button>
     </div>
-    <div class="field-value mono" id="btc-oversold">{"symbol":"BTCUSDT","side":"long","signal":"BTC_DIR","zone":"oversold","timeframe":"{{interval}}"}</div>
+    <div class="field-value mono" id="btc-oversold">{"symbol":"BTCUSDT","side":"long","signal":"BTC_OVERSOLD","timeframe":"{{interval}}"}</div>
   </div>
 
   <!-- ALARM D -->
@@ -529,7 +529,7 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#111114;color:#de
     <div class="field-label" style="margin-bottom:4px"><span>Webhook Message</span>
       <button class="copy-btn" onclick="copyField('btc-overbought',this)">Kopieren</button>
     </div>
-    <div class="field-value mono" id="btc-overbought">{"symbol":"BTCUSDT","side":"short","signal":"BTC_DIR","zone":"overbought","timeframe":"{{interval}}"}</div>
+    <div class="field-value mono" id="btc-overbought">{"symbol":"BTCUSDT","side":"short","signal":"BTC_OVERBOUGHT","timeframe":"{{interval}}"}</div>
   </div>
 
   <!-- ZUSAMMENFASSUNG ALARM-EINSTELLUNGEN -->
@@ -548,9 +548,10 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#111114;color:#de
     <strong>Railway reagiert automatisch auf alle 4 Alarme:</strong><br>
     🔴 BTC wird Rot → Telegram-Warnung für alle offenen Long-Positionen<br>
     🟢 BTC wird Grün → Telegram-Info (kein Handlungsbedarf bei Longs)<br>
-    📉 BTC Overbought → Warnung: Short-Umfeld verschlechtert sich<br>
-    📈 BTC Oversold → Info: Long-Umfeld verbessert sich<br>
-    <code>/berechnen</code> zeigt danach: <strong>🔴 BTC: SHORT</strong> oder <strong>🟢 BTC: LONG</strong>
+    📉 BTC Overbought → <strong style="color:#F07070">v4.9 Hard-Block für LONG-Entries</strong> (4h Cooldown)<br>
+    📈 BTC Oversold → <strong style="color:#4ECBA0">v4.9 Hard-Block für SHORT-Entries</strong> (4h Cooldown)<br>
+    <code>/berechnen</code> zeigt danach: <strong>🔴 BTC: SHORT</strong> oder <strong>🟢 BTC: LONG</strong><br>
+    <code>/status</code> zeigt aktive Extremzonen mit Rest-Cooldown-Zeit
   </div>
 </div>
 
@@ -644,7 +645,7 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#111114;color:#de
     <div class="field-label" style="margin-bottom:4px"><span>Webhook Message</span>
       <button class="copy-btn" onclick="copyField('t2-oversold',this)">Kopieren</button>
     </div>
-    <div class="field-value mono" id="t2-oversold">{"symbol":"TOTAL2","side":"long","signal":"T2_DIR","zone":"oversold","timeframe":"{{interval}}"}</div>
+    <div class="field-value mono" id="t2-oversold">{"symbol":"TOTAL2","side":"long","signal":"T2_OVERSOLD","timeframe":"{{interval}}"}</div>
   </div>
 
   <!-- ALARM D Total2 -->
@@ -672,7 +673,7 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#111114;color:#de
     <div class="field-label" style="margin-bottom:4px"><span>Webhook Message</span>
       <button class="copy-btn" onclick="copyField('t2-overbought',this)">Kopieren</button>
     </div>
-    <div class="field-value mono" id="t2-overbought">{"symbol":"TOTAL2","side":"short","signal":"T2_DIR","zone":"overbought","timeframe":"{{interval}}"}</div>
+    <div class="field-value mono" id="t2-overbought">{"symbol":"TOTAL2","side":"short","signal":"T2_OVERBOUGHT","timeframe":"{{interval}}"}</div>
   </div>
 
   <div class="notif-row">
@@ -683,7 +684,10 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#111114;color:#de
   </div>
 
   <div class="hint" style="margin-top:12px">
-    <strong>Total 8 Alarme</strong> (4× BTC + 4× Total2) auf je einem separaten H2 Chart. Jeder Alarm hat seine eigene Webhook-Message — Railway unterscheidet via <code>signal</code>-Feld (<code>BTC_DIR</code> vs. <code>T2_DIR</code>) und <code>zone</code>-Feld (<code>oversold</code> / <code>overbought</code>).
+    <strong>Total 8 Alarme</strong> (4× BTC + 4× Total2) auf je einem separaten H2 Chart. Jeder Alarm hat seine eigene Webhook-Message — Railway unterscheidet via <code>signal</code>-Feld:
+    <code>BTC_DIR</code> / <code>T2_DIR</code> (Richtungswechsel an der Nulllinie) vs.
+    <code>BTC_OVERSOLD</code> / <code>BTC_OVERBOUGHT</code> / <code>T2_OVERSOLD</code> / <code>T2_OVERBOUGHT</code>
+    (v4.9 Extremzonen-Trigger mit 4h Hard-Block).
   </div>
 </div>
 
