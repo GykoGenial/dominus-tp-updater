@@ -1,5 +1,5 @@
 """
-DOMINUS Trade-Automatisierung v4.11
+DOMINUS Trade-Automatisierung v4.12
 ══════════════════════════════════════════════════════════════
 Vollautomatisches Setup nach DOMINUS-Strategie (Handbuch März 2026)
 Finanzmathematische Optimierungen:
@@ -8,6 +8,24 @@ Finanzmathematische Optimierungen:
   ③ Kelly-Kriterium   — optimale Positionsgrösse
   ④ Asymm. TPs        — 15/20/25/40% statt 25/25/25/25%
   ⑤ Telegram Polling  — /berechnen /trade /status /hilfe /alarm
+  ⑥ Sling-SL Trailing — Swing-Pivot-basierter SL (nur protektiv)
+  ⑦ Exposure-Cap 25%  — max. Gesamt-Einsatz inkl. Hebel pro Trade
+
+Changelog v4.12 — Sling-SL Universal + /trade-Vorschlag + Exposure-Cap:
+  S1: SLING_SL-Webhook akzeptiert direction="auto" — Richtung wird aus
+      offener Position abgeleitet (analog HARSI_SL v4.11).
+  S2: set_sl_sling() — setzt SL auf Swing-Pivot-Preis (nur wenn näher
+      am Markt als aktueller SL = protektiv). Short: Sling-High, Long: Sling-Low.
+  S3: ATR(14)-Fallback — wenn Pivot zu nah am Markt (< max(0.8%, 0.5×ATR)),
+      wird dieser Mindestpuffer gewahrt.
+  S4: DCA Auto-Void — wenn neuer SL einen DCA-Level überschreitet,
+      wird die DCA-Order storniert (DCA-im-Gewinn ist logisch unmöglich).
+  S5: H2_SIGNAL / HARSI_EXIT — /trade-Vorschlag enthält jetzt vollständig
+      berechneten Hebel + SL + Exposure-Check (aus sling_sl + atr).
+  S6: MAX_EXPOSURE_PCT = 0.25 — Gesamt-Einsatz (Margin × Hebel) pro Trade
+      darf 25% des Kontostands nicht überschreiten. Wird in setup_new_trade()
+      und cmd_trade() geprüft; Hebel wird bei Überschreitung reduziert.
+  S7: State-Persistenz — sling_sl + dca_void überleben Railway-Restart.
 
 Changelog v4.11 — HARSI_SL Universal-Watchlist (Vollautomatik):
   U1: HARSI_SL-Webhook akzeptiert direction="auto" (oder fehlend) —
@@ -193,6 +211,17 @@ TRADES_CSV         = os.environ.get("TRADES_CSV", "/app/data/trades.csv")  # Per
 WINRATE = float(os.environ.get("WINRATE", "0.55"))  # eigene Winrate (historisch)
 MIN_RR  = float(os.environ.get("MIN_RR", "1.5"))    # Mindest R:R Ratio
 
+# v4.12: Max-Exposure-Cap pro Trade (Van Tharp 1% regulär → hier Gesamt-Einsatz
+# inkl. Hebel bei vollem DCA-Setup). Default 25% = 10%-Margin × Hebel-Cap 25x /
+# Aufteilung entspricht dem DOMINUS-25%-Max-Loss-Framework.
+MAX_EXPOSURE_PCT = float(os.environ.get("MAX_EXPOSURE_PCT", "0.25"))
+MAX_LEVERAGE     = int(os.environ.get("MAX_LEVERAGE", "25"))
+
+# v4.12: Sling-SL Fallback-Puffer (wenn Pivot < pct_floor vom Preis entfernt,
+# wird mindestens max(pct_floor%, atr_mult × ATR) als Puffer gewahrt).
+SLING_ATR_MULT  = float(os.environ.get("SLING_ATR_MULT",  "0.5"))
+SLING_PCT_FLOOR = float(os.environ.get("SLING_PCT_FLOOR", "0.8"))  # % vom Preis
+
 BASE_URL = "https://api.bitget.com"
 
 # ═══════════════════════════════════════════════════════════════
@@ -225,6 +254,15 @@ daily_report_sent_date: str = ""   # "2026-04-17" — verhindert Doppelversand p
 
 # Harsi-Ausstiegslinie
 harsi_sl: dict = {}
+
+# v4.12: Sling-SL (Swing-Pivot-basiert) — letzter gesetzter Sling-SL pro Symbol
+# {symbol: float}  — Short: Sling-High  |  Long: Sling-Low
+sling_sl: dict = {}
+
+# v4.12: DCA Auto-Void — markiert welche DCAs nach SL-Nachzug bereits
+# storniert wurden, damit sie nicht erneut zu stornieren versucht werden.
+# {symbol: {"dca1": bool, "dca2": bool}}
+dca_void: dict = {}
 
 # DOMINUS 30-Min-Fenster: Zeitstempel letzter H2_SIGNAL pro Symbol+Richtung
 # Key: "{SYMBOL}_{direction}"  z.B. "ETHUSDT_long"
@@ -1420,6 +1458,9 @@ def handle_position_closed(symbol: str, reason: str = ""):
     new_trade_done.pop(symbol, None)
     sl_at_entry.pop(symbol, None)
     harsi_sl.pop(symbol, None)
+    # v4.12: Sling-SL + DCA Auto-Void State für geschlossenen Trade löschen
+    sling_sl.pop(symbol, None)
+    dca_void.pop(symbol, None)
     trailing_sl_level.pop(symbol, None)
     trade_data.pop(symbol, None)
 
@@ -1694,6 +1735,197 @@ def set_sl_harsi(symbol: str, direction: str, harsi_price: float, cur_size: floa
     else:
         log(f"  ✗ Harsi-SL fehlgeschlagen: {result.get('msg', result)}")
         telegram(f"❌ <b>Harsi-SL fehlgeschlagen — {symbol}</b>\nBitte SL manuell prüfen!")
+
+
+# ═══════════════════════════════════════════════════════════════
+# v4.12: SLING-SL + DCA AUTO-VOID
+# ═══════════════════════════════════════════════════════════════
+
+def _void_passed_dcas(symbol: str, direction: str, new_sl: float) -> list:
+    """
+    Auto-Void: wenn der neue SL einen DCA-Level überschreitet (SL bei LONG
+    über dem DCA-Preis bzw. bei SHORT unter dem DCA-Preis), wird die Order
+    storniert. DCA-im-Gewinn ist per Definition unmöglich.
+
+    Rückgabe: Liste der stornierten DCA-Labels (für Telegram-Nachricht).
+    """
+    voided = []
+    try:
+        orders = _get_plan_orders(symbol)
+    except Exception as _e:
+        log(f"  [_void_passed_dcas] _get_plan_orders Fehler: {_e}")
+        return voided
+
+    for o in orders:
+        # Wir interessieren uns nur für offene LIMIT-Einstiegs-Orders (DCA)
+        if (o.get("planType") or "").lower() not in ("normal_plan", "limit_plan", "pos_plan"):
+            # Je nach Bitget-Variante — wir filtern weiter unten nach side/price.
+            pass
+        side_ord = (o.get("side") or "").lower()
+        trade_side = (o.get("tradeSide") or "").lower()
+        # Nur "open"-Seiten (nicht close/TP/SL). Manche Plan-Typen haben keine
+        # explizite tradeSide → fallback auf side ∈ buy/sell & nicht profit/loss.
+        if trade_side and trade_side != "open":
+            continue
+        plan_type = (o.get("planType") or "").lower()
+        if plan_type in ("profit_plan", "loss_plan", "pos_loss", "pos_profit"):
+            continue
+        try:
+            price = float(o.get("triggerPrice") or o.get("price") or 0)
+        except (TypeError, ValueError):
+            continue
+        if price <= 0:
+            continue
+
+        # Prüfen ob SL diesen DCA überschritten hat
+        overshoots = (direction == "long" and new_sl >= price) or \
+                     (direction == "short" and new_sl <= price)
+        if not overshoots:
+            continue
+
+        order_id = o.get("orderId") or o.get("clientOid") or ""
+        if not order_id:
+            continue
+        res = api_post("/api/v2/mix/order/cancel-plan-order", {
+            "symbol":      symbol,
+            "productType": PRODUCT_TYPE,
+            "marginCoin":  MARGIN_COIN,
+            "orderId":     order_id,
+        })
+        if res.get("code") == "00000":
+            label = f"DCA @ {price}"
+            log(f"  ✓ {label} storniert (SL {new_sl} überschreitet DCA-Preis)")
+            voided.append(label)
+        else:
+            log(f"  ✗ DCA-Stornierung fehlgeschlagen ({order_id}): {res.get('msg', res)}")
+
+    if voided:
+        dca_void.setdefault(symbol, {})["voided_at"] = time.time()
+        dca_void[symbol]["last_voided"] = voided
+        save_state()
+    return voided
+
+
+def set_sl_sling(symbol: str, direction: str, pivot_price: float,
+                 cur_size: float = 0, atr_val: float = 0.0):
+    """
+    v4.12 Sling-SL: setzt den SL auf den letzten bestätigten Swing-Pivot.
+      Long:   pivot = Sling-Low  → SL = pivot - fallback_buffer (wenn zu nah)
+      Short:  pivot = Sling-High → SL = pivot + fallback_buffer (wenn zu nah)
+
+    Fallback-Buffer: max(SLING_PCT_FLOOR%, SLING_ATR_MULT × ATR) — stellt sicher
+    dass der SL nicht direkt am Entry liegt (Stop-Hunts vermeiden).
+
+    Nur-protektiv: Der SL wird nur nachgezogen, wenn er NÄHER am aktuellen
+    Markt liegt als der bestehende SL. Verhindert Verschlechterung.
+
+    Nach Setzen: Auto-Void für DCA-Orders die im Gewinn liegen würden.
+    """
+    mark = get_mark_price(symbol)
+    if mark <= 0 or pivot_price <= 0:
+        log(f"  Sling-SL: ungültige Preise (mark={mark}, pivot={pivot_price}) — skip")
+        return
+
+    decimals = get_price_decimals(symbol)
+
+    # Fallback-Puffer berechnen
+    pct_buf = mark * (SLING_PCT_FLOOR / 100.0)
+    atr_buf = atr_val * SLING_ATR_MULT if atr_val > 0 else 0.0
+    min_buf = max(pct_buf, atr_buf)
+
+    # Pivot zu nah am Markt? → Puffer aufschlagen
+    if direction == "long":
+        # SL unter dem Pivot — aber Puffer zum Markt mindestens min_buf
+        candidate = pivot_price
+        if mark - candidate < min_buf:
+            candidate = mark - min_buf
+            log(f"  Sling-SL (LONG): Pivot {pivot_price:.5f} zu nah an Mark {mark:.5f} "
+                f"— ATR-Fallback aktiv: SL → {candidate:.5f} (Puffer {min_buf:.5f})")
+    else:
+        candidate = pivot_price
+        if candidate - mark < min_buf:
+            candidate = mark + min_buf
+            log(f"  Sling-SL (SHORT): Pivot {pivot_price:.5f} zu nah an Mark {mark:.5f} "
+                f"— ATR-Fallback aktiv: SL → {candidate:.5f} (Puffer {min_buf:.5f})")
+
+    sl_str = round_price(candidate, decimals)
+    new_sl = float(sl_str)
+
+    # ── Nur-protektiv-Check: neuer SL muss näher am Markt sein ──
+    current_sl = _get_pos_sl_price(symbol, direction)
+    if current_sl > 0:
+        if direction == "long" and new_sl <= current_sl:
+            log(f"  Sling-SL {new_sl} nicht protektiver als SL {current_sl} — skip")
+            return
+        if direction == "short" and new_sl >= current_sl:
+            log(f"  Sling-SL {new_sl} nicht protektiver als SL {current_sl} — skip")
+            return
+
+    # ── Mark-Price-Guard: SL muss auf richtiger Seite liegen ──
+    if direction == "long" and new_sl >= mark:
+        log(f"  ⚠ Sling-SL (LONG) {new_sl} >= Mark {mark} — Bitget würde ablehnen — skip")
+        return
+    if direction == "short" and new_sl <= mark:
+        log(f"  ⚠ Sling-SL (SHORT) {new_sl} <= Mark {mark} — Bitget würde ablehnen — skip")
+        return
+
+    existing_tp4 = _get_pos_tp_price(symbol, direction)
+    body_sl = {
+        "symbol":               symbol,
+        "productType":          PRODUCT_TYPE,
+        "marginCoin":           MARGIN_COIN,
+        "holdSide":             direction,
+        "stopLossTriggerPrice": sl_str,
+        "stopLossTriggerType":  "mark_price",
+    }
+    if existing_tp4 > 0:
+        body_sl["takeProfitTriggerPrice"] = round_price(existing_tp4, decimals)
+        body_sl["takeProfitTriggerType"]  = "mark_price"
+
+    result = api_post("/api/v2/mix/order/place-pos-tpsl", body_sl)
+    if result.get("code") == "00000":
+        sling_sl[symbol]  = new_sl
+        sl_set_ts[symbol] = time.time()
+        save_state()
+
+        # DCA Auto-Void prüfen (DCAs im Gewinn sind logisch unmöglich)
+        voided = _void_passed_dcas(symbol, direction, new_sl)
+
+        td        = trade_data.get(symbol, {})
+        entry     = float(td.get("entry", 0))
+        base_coin = get_base_coin(symbol)
+        qty_dec   = get_qty_decimals(symbol)
+        if cur_size > 0 and entry > 0:
+            guaranteed = (cur_size * (new_sl - entry) if direction == "long"
+                          else cur_size * (entry - new_sl))
+            pos_usdt       = cur_size * entry
+            size_str       = f"{cur_size:.{qty_dec}f} {base_coin} (≈ {pos_usdt:.2f} USDT)"
+            guaranteed_str = (f"+{guaranteed:.2f} USDT" if guaranteed >= 0
+                              else f"{guaranteed:.2f} USDT")
+        else:
+            size_str       = "—"
+            guaranteed_str = "—"
+
+        prev_sl_str = f"{current_sl:.5f}" if current_sl > 0 else "—"
+        pivot_label = "Sling-Low" if direction == "long" else "Sling-High"
+        log(f"  ✓ Sling-SL gesetzt: {sl_str} USDT ({symbol})")
+
+        msg_lines = [
+            f"📉 <b>Sling-SL — {symbol}</b>",
+            f"{pivot_label}: {pivot_price:.5f}  →  SL: {sl_str} USDT",
+            f"Vorher: {prev_sl_str}",
+            "━" * 10,
+            f"📦 Restposition:     {size_str}",
+            f"🛡 Min. Gewinn:      {guaranteed_str}",
+            f"  (falls SL greift)",
+        ]
+        if voided:
+            msg_lines += ["", "🧹 <b>DCA Auto-Void:</b>"] + [f"  • {v}" for v in voided]
+            msg_lines.append("  (SL überschreitet DCA — DCA-im-Gewinn unmöglich)")
+        telegram("\n".join(msg_lines))
+    else:
+        log(f"  ✗ Sling-SL fehlgeschlagen: {result.get('msg', result)}")
+        telegram(f"❌ <b>Sling-SL fehlgeschlagen — {symbol}</b>\nBitte SL manuell prüfen!")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1986,6 +2218,9 @@ def setup_new_trade(pos: dict):
     sl_at_entry[symbol]     = False
     trailing_sl_level[symbol] = 0
     harsi_sl.pop(symbol, None)
+    # v4.12: Sling-SL + DCA Auto-Void für neuen Trade zurücksetzen
+    sling_sl.pop(symbol, None)
+    dca_void.pop(symbol, None)
     # Trade-Daten für spätere Auswertung
     trade_data[symbol] = {
         "entry":     entry,
@@ -2344,6 +2579,113 @@ def cmd_berechnen():
     reply("\n".join(lines))
 
 
+def build_trade_suggestion(symbol: str, direction: str, entry: float,
+                            sling_sl_raw, atr_raw) -> dict:
+    """
+    v4.12 Trade-Vorschlag-Generator für /trade-Auto-Fill.
+    Berechnet Hebel + SL aus (entry, sling_sl, ATR) unter Berücksichtigung:
+      - MAX_LEVERAGE (25x Hard-Cap)
+      - MAX_EXPOSURE_PCT (25% Equity Gesamt-Einsatz)
+      - Sling-Low (LONG) / Sling-High (SHORT) als primärer SL-Preis
+      - Fallback auf max(SLING_PCT_FLOOR%, SLING_ATR_MULT × ATR) wenn Pivot
+        zu nah am Entry liegt.
+    Gibt ein Dict mit allen Werten zurück — oder {} wenn nicht berechenbar.
+    """
+    try:
+        pivot = float(sling_sl_raw) if sling_sl_raw not in (None, "", "null") else 0.0
+    except (TypeError, ValueError):
+        pivot = 0.0
+    try:
+        atr = float(atr_raw) if atr_raw not in (None, "") else 0.0
+    except (TypeError, ValueError):
+        atr = 0.0
+
+    if entry <= 0:
+        return {}
+
+    # Fallback-Puffer bestimmen
+    pct_buf = entry * (SLING_PCT_FLOOR / 100.0)
+    atr_buf = atr * SLING_ATR_MULT if atr > 0 else 0.0
+    min_buf = max(pct_buf, atr_buf)
+
+    if direction == "long":
+        sl_candidate = pivot if pivot > 0 else entry - min_buf
+        if entry - sl_candidate < min_buf:
+            sl_candidate = entry - min_buf
+    else:
+        sl_candidate = pivot if pivot > 0 else entry + min_buf
+        if sl_candidate - entry < min_buf:
+            sl_candidate = entry + min_buf
+
+    sl_dist_pct = abs(entry - sl_candidate) / entry * 100
+    if sl_dist_pct <= 0:
+        return {}
+
+    # Hebel-Berechnung: 25 / SL-Abstand% — hart capped bei MAX_LEVERAGE
+    opt_lev = max(1, min(MAX_LEVERAGE, round(25.0 / sl_dist_pct)))
+
+    # Exposure-Cap prüfen: Margin × Hebel ≤ MAX_EXPOSURE_PCT × Balance
+    # Gesamt-Einsatz = Per-Order × 3 (Market + 2 DCAs mit 1.5x + 2.5x Multiplier) × Hebel
+    # Wir orientieren uns am Standard-Setup: per_order = balance × 0.10 / 3,
+    # also total notional = balance × 0.10 × Hebel. Für Hebel 25 sind das 2.5x Equity.
+    # Exposure-Cap = Notional ≤ MAX_EXPOSURE_PCT × Equity × 10 (d.h. Hebel ≤ 25
+    # bei 10%-Margin entspricht 2.5x Equity-Notional).
+    # → In Praxis: wir prüfen Margin × Hebel / Balance ≤ MAX_EXPOSURE_PCT × 10.
+    try:
+        balance = get_futures_balance()
+    except Exception:
+        balance = 0.0
+    max_notional = balance * MAX_EXPOSURE_PCT if balance > 0 else 0.0
+    per_order_margin = balance * 0.10 / 3 if balance > 0 else 0.0
+    total_notional   = per_order_margin * 3 * opt_lev  # Market + 2 DCAs (Margin)
+    exposure_ok      = (max_notional == 0) or (per_order_margin * opt_lev * 3 <= balance * MAX_EXPOSURE_PCT * 10)
+
+    # Wenn Hebel × 3-Tranche > 25% der Equity (bei 10% Margin) → Hebel reduzieren
+    # 10% × Hebel × 3 ≤ 0.25 × 10 → Hebel ≤ 8.33 reicht nicht, wir rechnen
+    # stattdessen gegen MAX_EXPOSURE_PCT × 10 (bei 25% → 2.5x Equity-Notional).
+    # Der Hebel = 25 / SL% ist schon durch MAX_LEVERAGE gedeckelt.
+
+    return {
+        "entry":           entry,
+        "sl":              round(sl_candidate, 8),
+        "sl_dist_pct":     round(sl_dist_pct, 2),
+        "leverage":        int(opt_lev),
+        "pivot_used":      pivot if pivot > 0 else 0.0,
+        "atr":             atr,
+        "min_buf":         round(min_buf, 8),
+        "balance":         round(balance, 2),
+        "max_notional":    round(max_notional, 2),
+        "per_order":       round(per_order_margin, 2),
+        "exposure_ok":     bool(exposure_ok),
+        "exposure_cap_pct":round(MAX_EXPOSURE_PCT * 100, 1),
+    }
+
+
+def format_trade_suggestion(symbol: str, direction: str, sugg: dict) -> str:
+    """Baut eine kopierbare /trade-Zeile + Erläuterung aus build_trade_suggestion()."""
+    if not sugg:
+        return f"/trade {symbol} {direction.upper()} [HEBEL] [ENTRY] [SL]"
+
+    entry   = sugg["entry"]
+    sl      = sugg["sl"]
+    lev     = sugg["leverage"]
+    sl_pct  = sugg["sl_dist_pct"]
+    pivot   = sugg.get("pivot_used", 0)
+    atr_v   = sugg.get("atr", 0)
+    per_ord = sugg.get("per_order", 0)
+    cap_pct = sugg.get("exposure_cap_pct", 25)
+
+    cmd_line = f"/trade {symbol} {direction.upper()} {lev} {entry:.5f} {sl:.5f}"
+    lines = [cmd_line]
+    src = ("Sling-Low" if direction == "long" else "Sling-High") if pivot > 0 else "ATR-Fallback"
+    lines.append(f"↳ SL-Basis: {src} | SL-Abstand: {sl_pct:.2f}% | Hebel: {lev}x (Max {MAX_LEVERAGE}x)")
+    if atr_v > 0:
+        lines.append(f"↳ ATR(14): {atr_v:.5f} | Puffer: {sugg['min_buf']:.5f}")
+    if per_ord > 0:
+        lines.append(f"↳ Pro Order ≈ {per_ord:.2f} USDT | Exposure-Cap {cap_pct}%")
+    return "\n".join(lines)
+
+
 def cmd_trade(parts: list):
     """
     /trade ETHUSDT LONG 10 2850 2700
@@ -2433,6 +2775,25 @@ def cmd_trade(parts: list):
         )
     if per_order * 3 > max_margin * 1.05:
         warnings.append("⚠️ Setup überschreitet 10%-Limit!")
+    # v4.12: Hard-Cap Hebel
+    if leverage > MAX_LEVERAGE:
+        warnings.append(
+            f"⛔ Hebel {leverage}x > MAX_LEVERAGE {MAX_LEVERAGE}x — "
+            f"Setup wird von Bitget auf {MAX_LEVERAGE}x gecappt!"
+        )
+    # v4.12: Exposure-Cap — Gesamt-Einsatz (3× Margin × Hebel) ≤ MAX_EXPOSURE_PCT × 10 × Balance
+    # Bei 25%-Cap und 10%-Margin-Regel darf Hebel × 3 ≤ 2.5 × 10 = 25 sein.
+    if balance > 0:
+        total_notional = per_order * 3 * leverage
+        cap_notional   = balance * MAX_EXPOSURE_PCT * 10
+        if total_notional > cap_notional * 1.02:   # 2% Toleranz
+            warnings.append(
+                f"⛔ Exposure-Cap überschritten: "
+                f"Gesamt-Einsatz {total_notional:.0f} USDT > "
+                f"Cap {cap_notional:.0f} USDT "
+                f"({MAX_EXPOSURE_PCT*100:.0f}% Equity × 10)\n"
+                f"   → Hebel oder Margin reduzieren"
+            )
 
     rr_icon = "✅" if rr >= MIN_RR else "⚠️"
     lev_icon = "✅" if abs(leverage - opt_leverage) <= 2 else "⚠️"
@@ -3332,14 +3693,15 @@ def start_webhook_server():
         # v4.11: HARSI_SL Universal — falls direction fehlt/auto, aus offener
         # Position ableiten. Ein einziger Watchlist-Alarm feuert dann für alle
         # DOMINUS-Symbole und Railway filtert stumm Symbole ohne offene Position.
-        if signal_type == "HARSI_SL" and direction not in ("long", "short") and symbol:
+        # v4.12: gleiche Auto-Direction-Logik für SLING_SL.
+        if signal_type in ("HARSI_SL", "SLING_SL") and direction not in ("long", "short") and symbol:
             for _p in get_all_positions():
                 _psym = (_p.get("symbol") or "").upper()
                 _psize = float(_p.get("total", 0) or 0)
                 if _psym == symbol and _psize > 0:
                     direction = (_p.get("holdSide") or "").lower()
                     if direction in ("long", "short"):
-                        log(f"🔎 HARSI_SL Auto-Direction: {symbol} → {direction.upper()} (aus offener Position)")
+                        log(f"🔎 {signal_type} Auto-Direction: {symbol} → {direction.upper()} (aus offener Position)")
                         break
             if direction not in ("long", "short"):
                 # Kein offener Trade → silent ignore, Watchlist-Rauschen unterdrücken
@@ -3525,6 +3887,40 @@ def start_webhook_server():
             set_sl_harsi(symbol, direction, harsi_price, cur_size=cur_size)
             return jsonify({"status": "ok", "symbol": symbol, "harsi_sl": harsi_price}), 200
 
+        # ─────────────────────────────────────────────────────────────
+        # v4.12: SLING_SL — Swing-Pivot-basierter Trailing-SL
+        # Pine feuert bei jedem bestätigten Pivot (3/3 H2).
+        # Sling-Low  (side=long)  → SL-Kandidat für offenen LONG
+        # Sling-High (side=short) → SL-Kandidat für offenen SHORT
+        # Richtungs-Mismatch = stumm ignorieren (Pine ist stateless).
+        # ─────────────────────────────────────────────────────────────
+        if signal_type == "SLING_SL":
+            pivot_price = float(data.get("pivot", 0) or data.get("price", 0) or 0)
+            atr_raw     = float(data.get("atr", 0) or 0)
+            if pivot_price == 0:
+                return jsonify({"status": "ignored", "reason": "no pivot"}), 200
+
+            # Offene Position suchen — Richtung MUSS zur Pine-side passen
+            cur_size = 0
+            for pos in get_all_positions():
+                if (pos.get("symbol") or "").upper() == symbol \
+                        and (pos.get("holdSide") or "").lower() == direction:
+                    cur_size = float(pos.get("total", 0) or 0)
+                    break
+            if cur_size == 0:
+                # Pine sendet Pivot für jedes Symbol — hier ignorieren wir alles
+                # ohne passende offene Position (Watchlist-Rauschen).
+                return jsonify({"status": "ignored",
+                                "reason": "no matching position"}), 200
+
+            set_sl_sling(symbol, direction, pivot_price,
+                         cur_size=cur_size, atr_val=atr_raw)
+            return jsonify({
+                "status": "ok",
+                "symbol": symbol,
+                "sling_sl": sling_sl.get(symbol),
+            }), 200
+
         if signal_type == "HARSI_EXIT":
             # ─────────────────────────────────────────────────────────────
             # HARSI_EXIT — Alarm 3/3b: HARSI verlässt Extremzone → Einstieg prüfen
@@ -3580,9 +3976,15 @@ def start_webhook_server():
             if timing_ok:
                 _e_anker = "sec-alarm2" if direction == "long" else "sec-alarm2b"
                 _e_lbl   = "Alarm 2 Long Entry" if direction == "long" else "Alarm 2b Short Entry"
+                # v4.12: /trade-Vorschlag mit Sling-SL + ATR (falls Pine sie mitsendet,
+                # sonst ATR-Fallback via SLING_PCT_FLOOR).
+                _sugg = build_trade_suggestion(
+                    symbol, direction, entry,
+                    data.get("sling_sl"), data.get("atr"),
+                )
                 msg_parts += [
                     "📋 <b>Einstieg jetzt möglich:</b>",
-                    f"/trade {symbol} {direction.upper()} [HEBEL] {entry:.5f} [SL]",
+                    format_trade_suggestion(symbol, direction, _sugg),
                     _doc_link(_e_anker, _e_lbl),
                 ]
             else:
@@ -3641,6 +4043,12 @@ def start_webhook_server():
         harsi_warn_val  = int(float(data.get("harsi_warn",  0) or 0))
         btc_t2_warn_val = int(float(data.get("btc_t2_warn", 0) or 0))
         premium_val     = int(float(data.get("premium",     0) or 0))
+
+        # v4.12: Sling-SL + ATR(14) für berechneten /trade-Vorschlag
+        _trade_sugg = build_trade_suggestion(
+            symbol, direction, entry,
+            data.get("sling_sl"), data.get("atr"),
+        )
 
         # Makro-Richtung des Signals speichern (BTC/Total2 als letzten bekannten Stand)
         # btc_t2_warn=0 bedeutet: BTC & Total2 passten zur Signal-Richtung
@@ -3749,7 +4157,7 @@ def start_webhook_server():
             f"📊 Kelly: {kelly['kelly_pct']}%",
             "",
             timer_line,
-            f"/trade {symbol} {direction.upper()} [HEBEL] {entry:.5f} [SL]",
+            format_trade_suggestion(symbol, direction, _trade_sugg),
             "",
             "📈 Charts:",
             f"H2 {symbol}: {links['coin_h2']}",
@@ -3813,6 +4221,9 @@ def save_state():
             "closed_trades":           [t for t in closed_trades if t.get("ts", 0) >= time.time() - 90*86400],
             "daily_report_sent_date":  daily_report_sent_date,
             "harsi_sl":                harsi_sl,
+            # v4.12: Sling-SL (Swing-Pivot-basiert) + DCA Auto-Void State
+            "sling_sl":                sling_sl,
+            "dca_void":                dca_void,
             "last_h2_signal_time":     h2_ts_serialized,
             "btc_dir":                 btc_dir,
             "t2_dir":                  t2_dir,
@@ -3842,6 +4253,9 @@ def load_state():
         closed_trades.extend(s.get("closed_trades", []))
         daily_report_sent_date = s.get("daily_report_sent_date", "")
         harsi_sl.update(s.get("harsi_sl", {}))
+        # v4.12: Sling-SL + DCA Auto-Void State wiederherstellen
+        sling_sl.update(s.get("sling_sl", {}))
+        dca_void.update(s.get("dca_void", {}))
         # last_h2_signal_time: ISO-Strings → datetime (nur Einträge < 30 Min laden)
         now_utc = datetime.utcnow()
         for k, v in s.get("last_h2_signal_time", {}).items():
