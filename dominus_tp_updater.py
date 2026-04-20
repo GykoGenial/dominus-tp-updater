@@ -1,5 +1,5 @@
 """
-DOMINUS Trade-Automatisierung v4.9
+DOMINUS Trade-Automatisierung v4.10
 ══════════════════════════════════════════════════════════════
 Vollautomatisches Setup nach DOMINUS-Strategie (Handbuch März 2026)
 Finanzmathematische Optimierungen:
@@ -9,11 +9,22 @@ Finanzmathematische Optimierungen:
   ④ Asymm. TPs        — 15/20/25/40% statt 25/25/25/25%
   ⑤ Telegram Polling  — /berechnen /trade /status /hilfe /alarm
 
-Changelog v4.9 — Makro-Extremzonen-Block (Falling-Knife-Schutz):
+Changelog v4.10 — DOMINUS-konforme Premium-Zonen (ersetzt v4.9 Hard-Block):
+  P1: Extremzonen werden als Premium-Entry-Bestätigung behandelt (Handbuch-konform),
+      nicht mehr als Hard-Block
+  P2: extreme_block() → extreme_warn() — gibt nur noch Telegram-Warntext zurück,
+      blockiert keine Entries mehr
+  P3: BTC_OVERSOLD + grüne Richtung + HARSI_EXIT → "🎯 Long Premium aktiv"
+      BTC_OVERBOUGHT + rote Richtung + HARSI_EXIT → "🎯 Short Premium aktiv"
+  P4: HARSI_EXIT / H2_SIGNAL / cmd_trade erhalten Premium-Hinweis (Soft-Info),
+      aber der Trade wird wie üblich ausgeführt
+  P5: /status zeigt aktive Premium-Zonen mit Restzeit + Dominus-Kompatibilität
+
+Changelog v4.9 — Makro-Extremzonen (Hard-Block Variante, ersetzt durch v4.10):
   M1: macro_extreme-State + EXTREME_COOLDOWN_H (default 4h)
   M2: Webhook-Signale BTC_OVERSOLD/BTC_OVERBOUGHT/T2_OVERSOLD/T2_OVERBOUGHT
-      setzen Hard-Block für Entries in Gegen-Richtung (long↔oversold, short↔overbought)
-  M3: extreme_block() prüft beide Makros in H2_SIGNAL, HARSI_EXIT und /trade
+      setzen State + Telegram-Warnung (Block-Variante in v4.10 entfernt)
+  M3: Entry-Guards sind in v4.10 durch Soft-Warn-Hinweise ersetzt worden
   M4: /status zeigt aktuellen Makro-Extremzonen-Zustand + Restzeit
   M5: State persistiert (save_state/load_state), Cooldown überlebt Restart
 
@@ -220,15 +231,19 @@ btc_dir:  str = ""   # aktuelle BTC Impuls-Richtung
 t2_dir:   str = ""   # aktuelle Total2 Impuls-Richtung
 
 # ────────────────────────────────────────────────────────────────
-# v4.9: Makro-Extremzonen-Block (Falling-Knife-Schutz)
+# v4.10: Makro-Extremzonen als DOMINUS-Premium-Bestätigung
 # ────────────────────────────────────────────────────────────────
-# state:  -1 = OVERSOLD   (Impuls ≤ -10) → LONG-Entries werden blockiert
-#         +1 = OVERBOUGHT (Impuls ≥ +10) → SHORT-Entries werden blockiert
-#          0 = neutral (kein Block)
-# until_ts: UNIX-Zeit, bis wann der Block greift (gesetzt durch Oversold/Overbought-Alarm
-#           + EXTREME_COOLDOWN_H Stunden). Ein neuer Oversold-/Overbought-Alarm setzt
-#           den until_ts neu (Sliding Window). Nach Ablauf: state bleibt stehen, aber
-#           extreme_block() gibt keinen Block mehr zurück.
+# DOMINUS-Handbuch: Oversold (-10) + grüne Richtung = Long Premium
+#                   Overbought (+10) + rote Richtung = Short Premium
+# Wir blockieren nichts, sondern markieren die Zone als Premium-Kontext.
+# state:  -1 = OVERSOLD   (Impuls ≤ -10) → Long Premium aktiv
+#         +1 = OVERBOUGHT (Impuls ≥ +10) → Short Premium aktiv
+#          0 = neutral
+# until_ts: UNIX-Zeit, bis wann der Premium-Kontext gilt (gesetzt durch
+#           Oversold/Overbought-Alarm + EXTREME_COOLDOWN_H Stunden).
+#           Sliding Window: ein neuer Alarm verlängert die Zone.
+#           Nach Ablauf: state bleibt, aber extreme_warn() gibt keinen
+#           Premium-/Warn-Text mehr aus.
 EXTREME_COOLDOWN_H = int(os.environ.get("EXTREME_COOLDOWN_H", "4"))
 
 macro_extreme: dict = {
@@ -259,7 +274,7 @@ def _doc_link(anchor: str, label: str) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════
-# v4.9: MAKRO-EXTREMZONEN-BLOCK — Falling-Knife-Schutz
+# v4.10: MAKRO-EXTREMZONEN — DOMINUS-Premium-Bestätigung (Soft-Info)
 # ═══════════════════════════════════════════════════════════════
 
 def _set_macro_extreme(market: str, state_val: int) -> None:
@@ -280,42 +295,49 @@ def _reset_macro_extreme(market: str) -> None:
     macro_extreme[market]["until_ts"] = 0.0
 
 
-def extreme_block(direction: str) -> list:
+def extreme_warn(direction: str) -> dict:
     """
-    Gibt eine Liste von Block-Gründen zurück. Leere Liste = kein Block.
+    DOMINUS-konforme Auswertung der Makro-Extremzonen (v4.10 — kein Block!).
 
-    Regel:
-      • LONG  wird blockiert wenn BTC oder Total2 in OVERSOLD-Cooldown sind
-        (verhindert Falling-Knife in Extrem-Downtrend)
-      • SHORT wird blockiert wenn BTC oder Total2 in OVERBOUGHT-Cooldown sind
-        (verhindert Top-Selling in Extrem-Uptrend)
+    Zurückgegeben wird ein Dict mit zwei Listen:
+      • "premium"  → Extremzonen, die den Entry als DOMINUS-Premium bestätigen
+                     (LONG in Oversold, SHORT in Overbought)
+      • "warnings" → Extremzonen, die gegen den Entry sprechen
+                     (SHORT in Oversold = Top-Selling in bottoming Markt,
+                      LONG  in Overbought = Buying in toppping Markt)
 
-    Abgelaufene Cooldowns werden automatisch zurückgesetzt.
+    Abgelaufene Zonen werden automatisch zurückgesetzt. Kein Block, kein
+    Entry wird verhindert — die Information dient als Hinweis per Telegram.
     """
+    out: dict = {"premium": [], "warnings": []}
     if direction not in ("long", "short"):
-        return []
+        return out
     now = time.time()
-    reasons: list = []
     for market, label in (("btc", "BTC"), ("total2", "Total2")):
         s = macro_extreme.get(market, {})
         state    = int(s.get("state", 0))
         until_ts = float(s.get("until_ts", 0.0))
-        # Abgelaufen? → zurücksetzen
         if until_ts > 0 and until_ts <= now:
             _reset_macro_extreme(market)
             continue
         if state == 0 or until_ts == 0:
             continue
         remaining_h = max(0.0, (until_ts - now) / 3600.0)
+        # DOMINUS Premium: Impulsrichtung stimmt mit Entry-Richtung überein
         if direction == "long" and state == -1:
-            reasons.append(f"{label} OVERSOLD (noch {remaining_h:.1f}h)")
+            out["premium"].append(f"{label} OVERSOLD (noch {remaining_h:.1f}h) → Long Premium")
         elif direction == "short" and state == +1:
-            reasons.append(f"{label} OVERBOUGHT (noch {remaining_h:.1f}h)")
-    return reasons
+            out["premium"].append(f"{label} OVERBOUGHT (noch {remaining_h:.1f}h) → Short Premium")
+        # Gegenrichtung → nur Warnung, kein Block
+        elif direction == "long" and state == +1:
+            out["warnings"].append(f"{label} OVERBOUGHT (noch {remaining_h:.1f}h) → LONG gegen Top")
+        elif direction == "short" and state == -1:
+            out["warnings"].append(f"{label} OVERSOLD (noch {remaining_h:.1f}h) → SHORT gegen Boden")
+    return out
 
 
 def macro_extreme_status_lines() -> list:
-    """Lesbare Status-Zeilen für /status — zeigt ob aktuell geblockt wird."""
+    """Lesbare Status-Zeilen für /status — zeigt DOMINUS-Premium-Kontext (kein Block)."""
     now = time.time()
     lines: list = []
     for market, label in (("btc", "BTC"), ("total2", "Total2")):
@@ -331,31 +353,37 @@ def macro_extreme_status_lines() -> list:
         remaining_min = int((until_ts - now) / 60)
         h, m = divmod(remaining_min, 60)
         if state == -1:
-            lines.append(f"  {label}: 🔻 OVERSOLD (Long-Block noch {h}h {m}min)")
+            lines.append(f"  {label}: 🔻 OVERSOLD → 🎯 Long Premium aktiv (noch {h}h {m}min)")
         else:
-            lines.append(f"  {label}: 🔺 OVERBOUGHT (Short-Block noch {h}h {m}min)")
+            lines.append(f"  {label}: 🔺 OVERBOUGHT → 🎯 Short Premium aktiv (noch {h}h {m}min)")
     return lines
 
 
-def format_extreme_block_msg(symbol: str, direction: str, reasons: list, source: str) -> str:
-    """Standardisierte Telegram-Nachricht, wenn ein Entry wegen Makro-Extremzone abgelehnt wird."""
-    lines = [
-        f"🛑 <b>Entry BLOCKIERT — {symbol} {direction.upper()}</b>",
-        "━" * 12,
-        f"Quelle: {source}",
-        "",
-        "<b>Makro-Extremzonen aktiv:</b>",
-    ]
-    for r in reasons:
-        lines.append(f"  • {r}")
+def format_extreme_info_msg(symbol: str, direction: str, info: dict, source: str) -> str:
+    """DOMINUS-konforme Premium-/Warnmeldung (v4.10 — kein Block, nur Info)."""
+    premium  = info.get("premium",  []) or []
+    warnings = info.get("warnings", []) or []
+    if not premium and not warnings:
+        return ""
+    if premium and not warnings:
+        head = f"🎯 <b>DOMINUS Premium — {symbol} {direction.upper()}</b>"
+        body_intro = "Extremzone deckt sich mit Entry-Richtung (Handbuch-konform):"
+    elif warnings and not premium:
+        head = f"⚠️ <b>Makro-Warnung — {symbol} {direction.upper()}</b>"
+        body_intro = "Extremzone spricht GEGEN den Entry (antizyklisch):"
+    else:
+        head = f"⚠️ <b>Makro-gemischt — {symbol} {direction.upper()}</b>"
+        body_intro = "Premium- und Gegen-Signal gleichzeitig aktiv:"
+    lines = [head, "━" * 12, f"Quelle: {source}", "", body_intro]
+    for r in premium:
+        lines.append(f"  🎯 {r}")
+    for r in warnings:
+        lines.append(f"  ⚠️ {r}")
     lines += [
         "",
-        "Dieser Entry wird verworfen (v4.9 Falling-Knife-Schutz).",
-        f"Cooldown: {EXTREME_COOLDOWN_H}h je Oversold/Overbought-Alarm.",
-        "",
-        "Next Steps:",
-        "  • /status — zeigt verbleibende Cooldown-Zeit",
-        "  • Warte auf Gegen-Signal (Impuls → Grün/Rot) oder Ablauf",
+        "<i>Kein Block — Entry wird regulär ausgeführt. "
+        "Premium bestätigt DOMINUS-Handbuch; Warnung erinnert an "
+        "Gegenzyklik. Du entscheidest.</i>",
     ]
     return "\n".join(lines)
 
@@ -2332,13 +2360,11 @@ def cmd_trade(parts: list):
         reply("❌ Richtung muss LONG oder SHORT sein.")
         return
 
-    # v4.9: Makro-Extremzonen-Block — refuse BEFORE calculating anything.
-    # Ein LONG bei BTC-Oversold oder SHORT bei BTC-Overbought wird gar nicht erst
-    # gerechnet, damit der Nutzer nicht in Versuchung kommt die Warnung zu ignorieren.
-    _xblock = extreme_block(direction)
-    if _xblock:
-        reply(format_extreme_block_msg(symbol, direction, _xblock, "/trade"))
-        return
+    # v4.10: Makro-Extremzonen als DOMINUS-Premium-Info (kein Block mehr)
+    _xinfo = extreme_warn(direction)
+    _xmsg  = format_extreme_info_msg(symbol, direction, _xinfo, "/trade")
+    if _xmsg:
+        reply(_xmsg)
 
     # Validierungen
     if direction == "long" and sl >= entry:
@@ -2856,21 +2882,23 @@ def cmd_hilfe():
         "• TP1–TP4 (15/20/25/40% ROI)\n"
         "• SL → Entry nach TP1 | Trailing SL nach TP2/TP3\n"
         "\n"
-        "🛡️ <b>v4.9 Makro-Extremzonen-Block:</b>\n"
+        "🎯 <b>v4.10 DOMINUS Premium-Zonen (Handbuch-konform):</b>\n"
         "• TradingView-Alarme BTC_OVERSOLD / BTC_OVERBOUGHT\n"
-        "  + T2_OVERSOLD / T2_OVERBOUGHT aktivieren Hard-Block\n"
-        "• Cooldown 4h (EXTREME_COOLDOWN_H): LONG in Oversold\n"
-        "  bzw. SHORT in Overbought wird automatisch blockiert\n"
-        "• Status der Zonen sichtbar unter /status"
+        "  + T2_OVERSOLD / T2_OVERBOUGHT markieren Premium-Fenster\n"
+        "• Oversold + grüne Richtung → Long Premium\n"
+        "  Overbought + rote Richtung → Short Premium\n"
+        "• Dauer 4h (EXTREME_COOLDOWN_H) — kein Block, nur Info\n"
+        "• Gegenrichtung bekommt ⚠️ Warnung (antizyklisch)\n"
+        "• Status der Premium-Zonen sichtbar unter /status"
     )
 
 
 def cmd_status():
-    """Kurzer Positionsstatus + v4.9 Makro-Extremzonen."""
-    # v4.9: Makro-Extremzonen vorab auflisten (auch bei 0 offenen Positionen relevant)
+    """Kurzer Positionsstatus + v4.10 DOMINUS Premium-Zonen."""
+    # v4.10: Makro-Premium-Zonen vorab auflisten (auch ohne offene Positionen relevant)
     _extreme_lines = macro_extreme_status_lines()
-    _any_block     = any("Block" in l for l in _extreme_lines)
-    _macro_header  = "🌍 <b>Makro-Extremzonen:</b>" + (" ⚠️" if _any_block else "")
+    _any_premium   = any("Premium" in l for l in _extreme_lines)
+    _macro_header  = "🌍 <b>Makro-Premium-Zonen:</b>" + (" 🎯" if _any_premium else "")
 
     positions = get_all_positions()
     if not positions:
@@ -3299,8 +3327,9 @@ def start_webhook_server():
         log(f"\U0001f4e1 Alert: {symbol} {direction.upper()} @ {entry} [{timeframe}]")
 
         # ─────────────────────────────────────────────────────────────
-        # v4.9: BTC_OVERSOLD / BTC_OVERBOUGHT / T2_OVERSOLD / T2_OVERBOUGHT
-        # Makro-Extremzonen-Alarm — setzt Cooldown-Block für Entries in Gegenrichtung
+        # v4.10: BTC_OVERSOLD / BTC_OVERBOUGHT / T2_OVERSOLD / T2_OVERBOUGHT
+        # DOMINUS-Handbuch-konform: Extremzone = Premium-Entry-Bestätigung.
+        # Kein Entry-Block — nur Premium-Info + Soft-Warnung für Gegenposen.
         # ─────────────────────────────────────────────────────────────
         if signal_type in ("BTC_OVERSOLD", "BTC_OVERBOUGHT",
                             "T2_OVERSOLD",  "T2_OVERBOUGHT"):
@@ -3310,41 +3339,42 @@ def start_webhook_server():
                 _set_macro_extreme(_market, -1)
                 _state_txt   = "OVERSOLD"
                 _emoji       = "🔻"
-                _blocks      = "LONG"
+                _premium_dir = "LONG"   # DOMINUS: Oversold = Long Premium
+                _risk_dir    = "short"  # offene SHORTs sind jetzt gegen Reversal
             else:
                 _set_macro_extreme(_market, +1)
                 _state_txt   = "OVERBOUGHT"
                 _emoji       = "🔺"
-                _blocks      = "SHORT"
+                _premium_dir = "SHORT"  # DOMINUS: Overbought = Short Premium
+                _risk_dir    = "long"   # offene LONGs sind jetzt gegen Reversal
             save_state()
 
             _until_ts  = macro_extreme[_market]["until_ts"]
             _until_str = datetime.utcfromtimestamp(_until_ts).strftime("%d.%m.%Y %H:%M UTC")
-            log(f"📡 {_label} → {_state_txt} (Block bis {_until_str})")
+            log(f"📡 {_label} → {_state_txt} (Premium-Zone bis {_until_str})")
 
-            # Offene Gegenpositionen warnen (analog zu BTC_DIR)
-            _target_side = "long" if _blocks == "LONG" else "short"
+            # Offene Gegenpositionen: Hinweis, dass der Makro-Kontext umgeschlagen hat.
             _warn_trades = []
             for pos in get_all_positions():
-                if pos.get("holdSide", "").lower() == _target_side:
+                if pos.get("holdSide", "").lower() == _risk_dir:
                     _sym  = pos.get("symbol", "")
                     _pnl  = float(pos.get("unrealizedPL", 0))
-                    _warn_trades.append(f"  ⚠️ {_sym} {_target_side.upper()} | PnL={_pnl:+.2f} USDT")
+                    _warn_trades.append(f"  ⚠️ {_sym} {_risk_dir.upper()} | PnL={_pnl:+.2f} USDT")
 
             _msg_lines = [
                 f"{_emoji} <b>{_label} Impuls → {_state_txt}</b>",
                 "━" * 12,
-                f"🛑 <b>{_blocks}-Entry-Block aktiviert</b>",
-                f"Cooldown: {EXTREME_COOLDOWN_H}h",
-                f"Läuft ab: <b>{_until_str}</b>",
+                f"🎯 <b>{_premium_dir} Premium-Zone aktiv</b> (DOMINUS-Handbuch)",
+                f"Zeitraum: {EXTREME_COOLDOWN_H}h · bis <b>{_until_str}</b>",
                 "",
-                "→ Neue H2-Signale in Block-Richtung werden abgelehnt.",
+                f"→ Neue H2-Signale in {_premium_dir}-Richtung bekommen Premium-Tag.",
+                "→ Kein Entry-Block — alle regulären Checks laufen normal.",
                 "→ Bestehende Positionen laufen normal weiter (Trailing SL aktiv).",
             ]
             if _warn_trades:
                 _msg_lines += [
                     "",
-                    f"⚠️ <b>Offene {_target_side.upper()}-Positionen (entgegen Makro):</b>",
+                    f"⚠️ <b>Offene {_risk_dir.upper()}-Positionen (gegen Reversal):</b>",
                     *_warn_trades,
                     "",
                     "🔔 SL/Trailing prüfen!",
@@ -3355,7 +3385,7 @@ def start_webhook_server():
                 "status":   "ok",
                 "market":   _market,
                 "extreme":  _state_txt,
-                "blocks":   _blocks,
+                "premium":  _premium_dir,
                 "until":    _until_str,
             }), 200
 
@@ -3467,14 +3497,14 @@ def start_webhook_server():
             # Hier wird geprüft ob das 30-Min-Fenster nach dem letzten H2_SIGNAL
             # noch offen ist. Falls abgelaufen oder unbekannt → Warnung in Telegram.
             # ─────────────────────────────────────────────────────────────
-            # v4.9: Makro-Extremzonen-Block vor allem anderen prüfen.
-            # Wenn BTC oder Total2 gerade in Oversold/Overbought ist, wird der Entry
-            # verworfen (Hard-Block). Bestehende Positionen laufen normal weiter.
-            _xblock = extreme_block(direction)
-            if _xblock:
-                telegram(format_extreme_block_msg(symbol, direction, _xblock, "HARSI_EXIT"))
-                return jsonify({"status": "blocked", "reasons": _xblock,
-                                "source": "HARSI_EXIT"}), 200
+            # v4.10: Makro-Extremzonen als DOMINUS-Premium-Info (kein Block).
+            # Oversold + LONG bzw. Overbought + SHORT → 🎯 Premium-Hinweis;
+            # Gegenrichtung → ⚠️ Warnung. In beiden Fällen wird der Entry-Fluss
+            # regulär fortgesetzt — der User entscheidet.
+            _xinfo = extreme_warn(direction)
+            _xmsg  = format_extreme_info_msg(symbol, direction, _xinfo, "HARSI_EXIT")
+            if _xmsg:
+                telegram(_xmsg)
 
             sig_key = f"{symbol}_{direction}"
             h2_ts   = last_h2_signal_time.get(sig_key)
@@ -3555,15 +3585,14 @@ def start_webhook_server():
                     log(f"  H4 gepuffert ({len(h4_buffer)} im Puffer)")
             return jsonify({"status": "buffered", "symbol": symbol}), 200
 
-        # v4.9: Makro-Extremzonen-Block vor H2-Signal-Verarbeitung
-        # Wenn BTC/Total2 gerade in Oversold (für Long) oder Overbought (für Short) sind,
-        # wird der Entry verworfen. 30-Min-Fenster wird NICHT gestartet, damit ein späterer
-        # HARSI_EXIT-Alarm sauber ohne stale Timestamp ankommt.
-        _xblock = extreme_block(direction)
-        if _xblock:
-            telegram(format_extreme_block_msg(symbol, direction, _xblock, "H2_SIGNAL"))
-            return jsonify({"status": "blocked", "reasons": _xblock,
-                            "source": "H2_SIGNAL"}), 200
+        # v4.10: Makro-Extremzonen als DOMINUS-Premium-Info (kein Block).
+        # Oversold + LONG bzw. Overbought + SHORT → 🎯 Premium-Hinweis;
+        # Gegenrichtung → ⚠️ Warnung. Der H2-Signal-Fluss (inkl. 30-Min-Fenster)
+        # läuft regulär weiter — der User entscheidet beim HARSI_EXIT.
+        _xinfo = extreme_warn(direction)
+        _xmsg  = format_extreme_info_msg(symbol, direction, _xinfo, "H2_SIGNAL")
+        if _xmsg:
+            telegram(_xmsg)
 
         # H2 Signal → H4 Puffer flushen dann sofort senden
         # 30-Min-Fenster starten: Zeitstempel für HARSI_EXIT-Prüfung speichern

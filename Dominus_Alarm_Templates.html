@@ -132,7 +132,7 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#111114;color:#de
 <div class="wrap">
 
 <div class="page-title">DOMINUS Alarm-Templates</div>
-<div class="page-sub">TradingView &rarr; Railway Webhook &rarr; Telegram &middot; DOM-ORC v2.1 &middot; Railway v4.9 &mdash; Dark Mode &mdash; Stand April 2026</div>
+<div class="page-sub">TradingView &rarr; Railway Webhook &rarr; Telegram &middot; DOM-ORC v2.1 &middot; Railway v4.10 &mdash; Dark Mode &mdash; Stand April 2026</div>
 
 <!-- INHALTSVERZEICHNIS / TIMELINE -->
 <div class="card" id="sec-toc">
@@ -606,13 +606,14 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#111114;color:#de
   </div>
 
   <div class="success" style="margin-top:12px">
-    <strong>Railway reagiert automatisch auf alle 4 Alarme:</strong><br>
+    <strong>Railway reagiert automatisch auf alle 4 Alarme (v4.10 DOMINUS-konform):</strong><br>
     🔴 BTC wird Rot → Telegram-Warnung für alle offenen Long-Positionen<br>
     🟢 BTC wird Grün → Telegram-Info (kein Handlungsbedarf bei Longs)<br>
-    📉 BTC Overbought → <strong style="color:#F07070">v4.9 Hard-Block für LONG-Entries</strong> (4h Cooldown)<br>
-    📈 BTC Oversold → <strong style="color:#4ECBA0">v4.9 Hard-Block für SHORT-Entries</strong> (4h Cooldown)<br>
+    📈 BTC Oversold → <strong style="color:#4ECBA0">🎯 Long Premium-Zone aktiv</strong> (4h, DOMINUS-Handbuch)<br>
+    📉 BTC Overbought → <strong style="color:#F07070">🎯 Short Premium-Zone aktiv</strong> (4h, DOMINUS-Handbuch)<br>
     <code>/berechnen</code> zeigt danach: <strong>🔴 BTC: SHORT</strong> oder <strong>🟢 BTC: LONG</strong><br>
-    <code>/status</code> zeigt aktive Extremzonen mit Rest-Cooldown-Zeit
+    <code>/status</code> zeigt aktive Premium-Zonen mit Restzeit<br>
+    <em style="color:#888">v4.10 Soft-Info: kein Entry-Block, nur Premium-Tag + Gegen-Warnung</em>
   </div>
 </div>
 
@@ -748,7 +749,7 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#111114;color:#de
     <strong>Total 8 Alarme</strong> (4× BTC + 4× Total2) auf je einem separaten H2 Chart. Jeder Alarm hat seine eigene Webhook-Message — Railway unterscheidet via <code>signal</code>-Feld:
     <code>BTC_DIR</code> / <code>T2_DIR</code> (Richtungswechsel an der Nulllinie) vs.
     <code>BTC_OVERSOLD</code> / <code>BTC_OVERBOUGHT</code> / <code>T2_OVERSOLD</code> / <code>T2_OVERBOUGHT</code>
-    (v4.9 Extremzonen-Trigger mit 4h Hard-Block).
+    (v4.10 Premium-Zonen-Trigger — 4h Soft-Info, kein Block).
   </div>
 </div>
 
