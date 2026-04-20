@@ -244,7 +244,10 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#111114;color:#de
       <span>Webhook-URL (in jeden Alert einf&uuml;gen)</span>
       <button class="copy-btn" onclick="copyField('wh-url',this)">Kopieren</button>
     </div>
-    <div class="webhook-url" id="wh-url">https://dominus-tp-updater-production.up.railway.app/webhook?token=VAnpNHg7vnVf2BR5QQ1Tkk1mx3QIwHVt8LLsICzx2IAwKZwCyLvJIrxD2gKq</div>
+    <div class="webhook-url" id="wh-url">https://dominus-tp-updater-production.up.railway.app/webhook?token=DEIN_WEBHOOK_SECRET</div>
+    <div class="info" style="margin-top:6px;font-size:11.5px;color:#888;line-height:1.5">
+      &#x1F512; <strong>DEIN_WEBHOOK_SECRET</strong> vor dem Kopieren mit dem echten Token (Railway &rarr; Variables &rarr; <code>WEBHOOK_SECRET</code>) ersetzen. Niemals den echten Token in diese HTML einchecken.
+    </div>
   </div>
   <div class="success"><strong>Was passiert:</strong> TradingView sendet JSON &rarr; Railway empf&auml;ngt &rarr; Telegram sendet DOMINUS-Checkliste + Chart-Links in deinem Layout lX5eDAis.</div>
 </div>
