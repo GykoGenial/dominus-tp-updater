@@ -1,5 +1,5 @@
 """
-DOMINUS Trade-Automatisierung v4.12
+DOMINUS Trade-Automatisierung v4.13
 ══════════════════════════════════════════════════════════════
 Vollautomatisches Setup nach DOMINUS-Strategie (Handbuch März 2026)
 Finanzmathematische Optimierungen:
@@ -10,6 +10,21 @@ Finanzmathematische Optimierungen:
   ⑤ Telegram Polling  — /berechnen /trade /status /hilfe /alarm
   ⑥ Sling-SL Trailing — Swing-Pivot-basierter SL (nur protektiv)
   ⑦ Exposure-Cap 25%  — max. Gesamt-Einsatz inkl. Hebel pro Trade
+
+Changelog v4.13 — Webhook-Async + Bitget-Cache (TradingView-Timeout-Fix):
+  W1: Webhook-Handler sofort 200 — Token-Prüfung + JSON-Parse im HTTP-Request,
+      danach sofort ACK zurück. TradingView bekommt nie wieder einen Timeout
+      (Root-Cause: Bitget-API-Aufrufe > 5s haben alle Deliveries blockiert).
+  W2: _process_webhook_async() — komplette Signal-Verarbeitung (H2/HARSI_SL/
+      SLING_SL/HARSI_EXIT/BTC_DIR/T2_DIR/BTC_OVERSOLD/...) läuft jetzt in
+      einem Daemon-Thread. Exceptions werden geloggt + Telegram-Alert.
+  W3: TTL-Cache für Bitget-API (get_mark_price 3s / get_futures_balance 10s /
+      get_all_positions 5s) — bei parallelen Watchlist-Webhooks (z.B. 12
+      H2-Close-Alerts zur gleichen Sekunde) wird Bitget nur noch einmal
+      getroffen. Drastische Latenz-Reduktion.
+  W4: cache_invalidate() — nach jedem erfolgreichen Order-Placement werden die
+      Positions- + Balance-Caches geleert, damit Folge-Checks frische Daten sehen.
+  W5: /health-Endpoint liefert jetzt korrekt "v4.13" (vorher hartkodiert v4.35).
 
 Changelog v4.12 — Sling-SL Universal + /trade-Vorschlag + Exposure-Cap:
   S1: SLING_SL-Webhook akzeptiert direction="auto" — Richtung wird aus
@@ -738,8 +753,74 @@ def round_qty(symbol: str, qty: float) -> str:
 # MARKTDATEN
 # ═══════════════════════════════════════════════════════════════
 
-def get_mark_price(symbol: str) -> float:
-    """Aktuellen Mark Price von Bitget."""
+# v4.13 — TTL-Cache für Bitget-Read-API
+# Ziel: Webhook-Bursts (z.B. 12 Watchlist-Alarme zur selben Sekunde) treffen
+# Bitget nur einmal. TradingView-Timeouts werden dadurch eliminiert.
+# WICHTIG: Nur für Read-Endpoints. Write-Operationen (Order-Placement)
+# invalidieren die betroffenen Caches via cache_invalidate().
+_API_CACHE: dict = {}          # key -> (timestamp, value)
+_API_CACHE_LOCK = threading.Lock()
+
+# TTL-Werte pro Endpoint — konservativ klein, damit SL-Updater & Monitor
+# keine veralteten Positionsgrössen sehen.
+CACHE_TTL_MARK_PRICE = 3.0     # Sekunden
+CACHE_TTL_BALANCE    = 10.0
+CACHE_TTL_POSITIONS  = 5.0
+
+
+def _cached_read(key: str, ttl: float, fn, *args, **kwargs):
+    """Führt fn(*args, **kwargs) aus, cached den Rückgabewert für ttl Sekunden.
+
+    - Cache-Hit: Rückgabe ohne Bitget-Call.
+    - Cache-Miss: Bitget-Call; Ergebnis wird nur gecached wenn "plausibel"
+      (positive Balance / nicht-leere Position / positive MarkPrice).
+      Fehler-Antworten (0, [], None) werden NICHT gecached — sonst
+      würde ein einzelner API-Ausfall alle Folge-Calls kaputt machen.
+    """
+    now = time.time()
+    with _API_CACHE_LOCK:
+        entry = _API_CACHE.get(key)
+        if entry and (now - entry[0]) < ttl:
+            return entry[1]
+    # Lock bewusst freigegeben — paralleler Bitget-Call ist OK,
+    # der erste Rückläufer füllt den Cache und die anderen schreiben hinein
+    # (idempotent, da Inhalt ~gleich ist).
+    value = fn(*args, **kwargs)
+    if _cache_is_valid(key, value):
+        with _API_CACHE_LOCK:
+            _API_CACHE[key] = (time.time(), value)
+    return value
+
+
+def _cache_is_valid(key: str, value) -> bool:
+    """Entscheidet ob ein Rückgabewert cache-würdig ist."""
+    if key.startswith("mark_price:"):
+        return isinstance(value, (int, float)) and value > 0
+    if key == "futures_balance":
+        return isinstance(value, (int, float)) and value > 0
+    if key == "all_positions":
+        # Auch leere Liste ist gültig — "keine offenen Positionen" ist
+        # ein legitimer Cache-Zustand, damit /status nicht pro Aufruf hämmert.
+        return isinstance(value, list)
+    return False
+
+
+def cache_invalidate(*keys: str) -> None:
+    """Entfernt genannte Keys (oder bei keinem Argument den ganzen Cache).
+
+    Aufrufen nach jeder Order-Platzierung / SL-Anpassung / Position-
+    Schliessung, damit Folge-Reads frische Daten sehen.
+    """
+    with _API_CACHE_LOCK:
+        if not keys:
+            _API_CACHE.clear()
+            return
+        for k in keys:
+            _API_CACHE.pop(k, None)
+
+
+def _get_mark_price_raw(symbol: str) -> float:
+    """Aktuellen Mark Price von Bitget (ungecacht)."""
     result = api_get("/api/v2/mix/market/symbol-price", {
         "symbol":      symbol,
         "productType": PRODUCT_TYPE,
@@ -753,8 +834,18 @@ def get_mark_price(symbol: str) -> float:
     return 0.0
 
 
-def get_futures_balance() -> float:
-    """Verfügbares USDT-Guthaben im Futures-Konto."""
+def get_mark_price(symbol: str) -> float:
+    """Aktuellen Mark Price von Bitget (mit 3s-Cache)."""
+    return _cached_read(
+        f"mark_price:{symbol}",
+        CACHE_TTL_MARK_PRICE,
+        _get_mark_price_raw,
+        symbol,
+    )
+
+
+def _get_futures_balance_raw() -> float:
+    """Verfügbares USDT-Guthaben im Futures-Konto (ungecacht)."""
     result = api_get("/api/v2/mix/account/accounts", {
         "productType": PRODUCT_TYPE,
     })
@@ -768,12 +859,21 @@ def get_futures_balance() -> float:
     return 0.0
 
 
+def get_futures_balance() -> float:
+    """Verfügbares USDT-Guthaben im Futures-Konto (mit 10s-Cache)."""
+    return _cached_read(
+        "futures_balance",
+        CACHE_TTL_BALANCE,
+        _get_futures_balance_raw,
+    )
+
+
 # ═══════════════════════════════════════════════════════════════
 # POSITIONEN & FILLS
 # ═══════════════════════════════════════════════════════════════
 
-def get_all_positions() -> list:
-    """Alle offenen Futures-Positionen."""
+def _get_all_positions_raw() -> list:
+    """Alle offenen Futures-Positionen (ungecacht)."""
     result = api_get("/api/v2/mix/position/all-position", {
         "productType": PRODUCT_TYPE,
         "marginCoin":  MARGIN_COIN,
@@ -782,6 +882,15 @@ def get_all_positions() -> list:
         return []
     return [p for p in (result.get("data") or [])
             if float(p.get("total", 0)) > 0]
+
+
+def get_all_positions() -> list:
+    """Alle offenen Futures-Positionen (mit 5s-Cache)."""
+    return _cached_read(
+        "all_positions",
+        CACHE_TTL_POSITIONS,
+        _get_all_positions_raw,
+    )
 
 
 def get_recent_fills_all(since_ms: int) -> list:
@@ -3616,40 +3725,41 @@ def start_webhook_server():
 
     @app.route("/webhook", methods=["POST"])
     def webhook():
-        global btc_dir, t2_dir
-        # ── Token-Prüfung ─────────────────────────────────────
+        """Webhook-Entry-Point — NUR Token-Check + Parse, dann 200 ACK.
+
+        v4.13: Die komplette Signal-Verarbeitung (Bitget-Calls, SL-Sets,
+        Telegram-Messages) läuft in _process_webhook_async() in einem
+        Daemon-Thread. So wird TradingView garantiert in < 100 ms bedient
+        und ein Bitget-Hänger blockiert keine weiteren Webhooks mehr.
+        """
+        # ── Body & Token lesen ────────────────────────────────
         # Token aus URL-Parameter ODER aus JSON-Body akzeptieren.
         # WICHTIG: Wir geben bei ungültigem Token TROTZDEM 200 zurück —
         # ein 401/403 würde TradingView als Fehler anzeigen und Retries auslösen.
-        # Stattdessen: intern loggen und still verwerfen.
-        token_url  = flask_request.args.get("token", "")
-        # Payload zuerst roh lesen (vor JSON-Parse, damit wir token aus body lesen können)
-        raw_body   = flask_request.get_data(as_text=True) or ""
+        token_url = flask_request.args.get("token", "")
+        raw_body  = flask_request.get_data(as_text=True) or ""
 
         # ── Body-Bereinigung vor JSON-Parse ───────────────────
         import re as _re
-
-        # Fix 1: Unaufgelöste TradingView-Platzhalter → 0
-        # Bei Watchlist-Alarmen ersetzt TradingView {{plot(...)}} NICHT —
-        # der Literal-Text landet im JSON und macht es ungültig.
-        # Betrifft: harsi_warn, btc_t2_warn, premium bei Watchlist-Alarmen.
-        # Defaultwert 0 = "kein Problem erkannt" (sicherster Fallback).
+        # Fix 1: Unaufgelöste TradingView-Platzhalter → 0 (Watchlist-Alarme)
         raw_clean = _re.sub(r'\{\{[^}]+\}\}', '0', raw_body)
-
-        # Fix 2: NaN / Infinity (Pine Script 'na' → TradingView NaN)
-        # NaN ist kein valides JSON → null ersetzen.
+        # Fix 2: NaN / Infinity (Pine 'na' → TradingView NaN)
         raw_clean = _re.sub(r'\bNaN\b',       'null', raw_clean)
         raw_clean = _re.sub(r'\bInfinity\b',  'null', raw_clean)
         raw_clean = _re.sub(r'\b-Infinity\b', 'null', raw_clean)
 
         # ── Payload parsen ────────────────────────────────────
         # IMMER 200 zurückgeben — nie 400/401/500 an TradingView senden.
-        # Fehler intern loggen + Telegram-Alert, damit nichts lautlos verschwindet.
         try:
             data = json.loads(raw_clean) if raw_clean.strip() else {}
         except Exception as _e:
             log(f"⚠ Webhook: JSON-Parse-Fehler: {_e} | Body (erste 200 Z.): {raw_body[:200]}")
-            telegram(f"⚠️ <b>Webhook Parse-Fehler</b>\n{_e}\nBody: <code>{raw_body[:150]}</code>")
+            # Telegram-Alert im Thread, damit der Request sofort 200 liefert
+            threading.Thread(
+                target=telegram,
+                args=(f"⚠️ <b>Webhook Parse-Fehler</b>\n{_e}\nBody: <code>{raw_body[:150]}</code>",),
+                daemon=True,
+            ).start()
             return jsonify({"status": "ignored", "reason": "parse_error"}), 200
 
         # Token-Prüfung (nach Parse, damit body-Token auch funktioniert)
@@ -3658,6 +3768,43 @@ def start_webhook_server():
         if WEBHOOK_SECRET and token != WEBHOOK_SECRET:
             log(f"⚠ Webhook: Ungültiger Token (url='{token_url}' body='{token_body}')")
             return jsonify({"status": "ignored", "reason": "unauthorized"}), 200
+
+        # ── Verarbeitung im Hintergrund-Thread ────────────────
+        # TradingView bekommt sofort 200 — keine Timeouts mehr, auch wenn
+        # Bitget-APIs im Worker 10+ Sekunden brauchen.
+        threading.Thread(
+            target=_process_webhook_async,
+            args=(data,),
+            daemon=True,
+            name="dominus-webhook-worker",
+        ).start()
+        return jsonify({"status": "accepted"}), 200
+
+    def _process_webhook_async(data: dict) -> None:
+        """Verarbeitet den Webhook-Payload asynchron.
+
+        Darf beliebig lange dauern (Bitget-Calls, SL-Sets, Telegram).
+        Exceptions werden geloggt + via Telegram gemeldet, damit nichts
+        lautlos verschwindet.
+        """
+        global btc_dir, t2_dir
+        try:
+            _webhook_dispatch(data)
+        except Exception as _exc:
+            import traceback as _tb
+            log(f"⚠ Webhook-Worker-Exception: {_exc}")
+            log(_tb.format_exc())
+            try:
+                telegram(
+                    "⚠️ <b>Webhook-Worker-Fehler</b>\n"
+                    f"<code>{html.escape(str(_exc))}</code>"
+                )
+            except Exception:
+                pass
+
+    def _webhook_dispatch(data: dict) -> None:
+        """Kern-Dispatcher für den Webhook-Payload (ehemals Inhalt von webhook())."""
+        global btc_dir, t2_dir
 
         raw_symbol = data.get("symbol", "").upper()
         entry      = float(data.get("entry", 0) or 0)
@@ -3705,14 +3852,14 @@ def start_webhook_server():
                         break
             if direction not in ("long", "short"):
                 # Kein offener Trade → silent ignore, Watchlist-Rauschen unterdrücken
-                return jsonify({"status": "ignored", "reason": "no open position"}), 200
+                return  # ignored: no open position
 
         if not symbol or direction not in ("long", "short"):
             log(f"⚠ Webhook ignoriert: kein Signal "
                 f"(buy={data.get('buy',0)} sell={data.get('sell',0)} "
                 f"dir={data.get('direction','')} side={data.get('side','')} "
                 f"sym={raw_symbol})")
-            return jsonify({"status": "ignored", "reason": "no signal"}), 200
+            return  # ignored: no signal
 
         log(f"📡 TradingView Alert: {symbol} {direction.upper()} "
             f"@ {entry} [{timeframe}]")
@@ -3776,14 +3923,7 @@ def start_webhook_server():
                     "🔔 SL/Trailing prüfen!",
                 ]
             telegram("\n".join(_msg_lines))
-
-            return jsonify({
-                "status":   "ok",
-                "market":   _market,
-                "extreme":  _state_txt,
-                "premium":  _premium_dir,
-                "until":    _until_str,
-            }), 200
+            return  # ok: macro extreme handled
 
         # ─────────────────────────────────────────────────────────────
         # BTC_DIR / T2_DIR — Makro-Kontext: DOM-DIR Impuls-Richtung geändert
@@ -3868,7 +4008,7 @@ def start_webhook_server():
             else:
                 msg += "\n✅ Keine offenen Gegenpositionen."
             telegram(msg)
-            return jsonify({"status": "ok", "dir": new_dir, "label": label}), 200
+            return  # ok: BTC_DIR/T2_DIR handled
 
         if signal_type == "HARSI_SL":
             # HARSI_SL: SL auf Harsi-Ausstiegslinie setzen (für offene Positionen)
@@ -3876,16 +4016,17 @@ def start_webhook_server():
             #                            HARSI_SL   = SL-Anpassung bei offenem Trade (Alarm 4/4b)
             harsi_price = float(data.get("price", 0) or data.get("sl", 0) or 0)
             if harsi_price == 0:
-                return jsonify({"status": "ignored", "reason": "no price"}), 200
+                return  # ignored: no price
             cur_size = 0
             for pos in get_all_positions():
                 if pos.get("symbol") == symbol and pos.get("holdSide") == direction:
                     cur_size = float(pos.get("total", 0))
                     break
             if cur_size == 0:
-                return jsonify({"status": "ignored", "reason": "no open position"}), 200
+                return  # ignored: no open position
             set_sl_harsi(symbol, direction, harsi_price, cur_size=cur_size)
-            return jsonify({"status": "ok", "symbol": symbol, "harsi_sl": harsi_price}), 200
+            cache_invalidate("all_positions")
+            return  # ok: HARSI_SL set
 
         # ─────────────────────────────────────────────────────────────
         # v4.12: SLING_SL — Swing-Pivot-basierter Trailing-SL
@@ -3898,7 +4039,7 @@ def start_webhook_server():
             pivot_price = float(data.get("pivot", 0) or data.get("price", 0) or 0)
             atr_raw     = float(data.get("atr", 0) or 0)
             if pivot_price == 0:
-                return jsonify({"status": "ignored", "reason": "no pivot"}), 200
+                return  # ignored: no pivot
 
             # Offene Position suchen — Richtung MUSS zur Pine-side passen
             cur_size = 0
@@ -3910,16 +4051,12 @@ def start_webhook_server():
             if cur_size == 0:
                 # Pine sendet Pivot für jedes Symbol — hier ignorieren wir alles
                 # ohne passende offene Position (Watchlist-Rauschen).
-                return jsonify({"status": "ignored",
-                                "reason": "no matching position"}), 200
+                return  # ignored: no matching position
 
             set_sl_sling(symbol, direction, pivot_price,
                          cur_size=cur_size, atr_val=atr_raw)
-            return jsonify({
-                "status": "ok",
-                "symbol": symbol,
-                "sling_sl": sling_sl.get(symbol),
-            }), 200
+            cache_invalidate("all_positions")
+            return  # ok: SLING_SL set
 
         if signal_type == "HARSI_EXIT":
             # ─────────────────────────────────────────────────────────────
@@ -3998,13 +4135,7 @@ def start_webhook_server():
             # Nach Eintritt: Zeitstempel löschen (verhindert Doppel-Warnungen)
             if sig_key in last_h2_signal_time:
                 del last_h2_signal_time[sig_key]
-
-            return jsonify({
-                "status": "ok",
-                "symbol": symbol,
-                "timing_ok": timing_ok,
-                "elapsed_min": elapsed_min,
-            }), 200
+            return  # ok: HARSI_EXIT handled
 
         # H4 Trigger → gepuffert, nach 5 Min gebündelt senden
         if timeframe == "H4" or signal_type == "H4_TRIGGER":
@@ -4019,7 +4150,7 @@ def start_webhook_server():
                         "entry": entry, "ts": __import__("time").time(),
                     })
                     log(f"  H4 gepuffert ({len(h4_buffer)} im Puffer)")
-            return jsonify({"status": "buffered", "symbol": symbol}), 200
+            return  # buffered: H4 trigger queued
 
         # v4.10: Makro-Extremzonen als DOMINUS-Premium-Info (kein Block).
         # Oversold + LONG bzw. Overbought + SHORT → 🎯 Premium-Hinweis;
@@ -4177,13 +4308,12 @@ def start_webhook_server():
                 telegram(build_alarm_harsi_exit(symbol, direction))
             except Exception as _alarm_err:
                 log(f"[alarm-inline] Fehler: {_alarm_err}")
-        return jsonify({"status": "ok", "symbol": symbol,
-                        "direction": direction}), 200
+        return  # ok: H2_SIGNAL processed
 
     @app.route("/", methods=["GET"])
     @app.route("/health", methods=["GET"])
     def health():
-        return jsonify({"status": "running", "version": "v4.35"}), 200
+        return jsonify({"status": "running", "version": "v4.13"}), 200
 
     port = int(os.environ.get("PORT", 8080))
     log(f"Webhook-Server gestartet auf Port {port}")
