@@ -132,7 +132,7 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#111114;color:#de
 <div class="wrap">
 
 <div class="page-title">DOMINUS Alarm-Templates</div>
-<div class="page-sub">TradingView &rarr; Railway Webhook &rarr; Telegram &middot; DOM-ORC v2.3 &middot; Railway v4.18 &mdash; Dark Mode &mdash; Stand April 2026</div>
+<div class="page-sub">TradingView &rarr; Railway Webhook &rarr; Telegram &middot; DOM-ORC v2.4 &middot; Railway v4.21 &mdash; Dark Mode &mdash; Stand April 2026</div>
 
 <!-- INHALTSVERZEICHNIS / TIMELINE -->
 <div class="card" id="sec-toc">
@@ -244,9 +244,30 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#111114;color:#de
       <span>Webhook-URL (in jeden Alert einf&uuml;gen)</span>
       <button class="copy-btn" onclick="copyField('wh-url',this)">Kopieren</button>
     </div>
-    <div class="webhook-url" id="wh-url">https://dominus-tp-updater-production.up.railway.app/webhook?token=DEIN_WEBHOOK_SECRET</div>
-    <div class="info" style="margin-top:6px;font-size:11.5px;color:#888;line-height:1.5">
-      &#x1F512; <strong>DEIN_WEBHOOK_SECRET</strong> vor dem Kopieren mit dem echten Token (Railway &rarr; Variables &rarr; <code>WEBHOOK_SECRET</code>) ersetzen. Niemals den echten Token in diese HTML einchecken.
+    <div class="webhook-url" id="wh-url">https://dominus-tp-updater-production.up.railway.app/webhook</div>
+    <div style="margin-top:8px;font-size:11.5px;color:#888;line-height:1.5">
+      &#x1F512; <strong>Token liegt ab v4.21 im JSON-Body</strong>, nicht mehr in der URL &mdash; die obige URL enth&auml;lt <em>kein</em> <code>?token=</code> mehr. Je nach Alarm-Typ kommt der Token aus <strong>zwei</strong> verschiedenen Quellen:
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px">
+      <!-- Pfad A: Pine-basiert -->
+      <div style="background:#0d1a0d;border:1px solid #2a4a2a;border-radius:10px;padding:10px 12px">
+        <div style="font-size:11px;font-weight:700;color:#5EC45E;text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px">&#x2705; Pine-basiert &mdash; Token automatisch</div>
+        <div style="font-size:12px;color:#B8B8C0;line-height:1.55">
+          Alarme vom Typ <code>Any alert() function call</code> (z.&#8239;B. <b>4c</b>, <b>5c</b>, <b>Sling-SL Universal</b>): Der Token steht im <b>Indikator-Setting</b> <code>webhook_token</code> des <code>Dominus_Orchestrator_v2.4</code> und wird bei jedem Pine-<code>alert()</code>-Aufruf automatisch mitgesendet.
+        </div>
+        <div style="margin-top:6px;font-size:11px;color:#5EC45E">&rarr; Message-Feld in TV: <b>leer lassen</b>. Nichts zu tun.</div>
+      </div>
+      <!-- Pfad B: Standalone -->
+      <div style="background:#2a1c08;border:1px solid #4a3a00;border-radius:10px;padding:10px 12px">
+        <div style="font-size:11px;font-weight:700;color:#E09040;text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px">&#x26A0;&#xFE0F; Standalone &mdash; Token manuell ersetzen</div>
+        <div style="font-size:12px;color:#B8B8C0;line-height:1.55">
+          Alarme mit manuell eingef&uuml;gtem JSON (z.&#8239;B. <b>H4</b>, <b>BTC_DIR</b>, <b>T2_DIR</b>, <b>BTC/T2 Oversold/Overbought</b>, <b>Recovery</b>): Kein Zugriff auf Pine-Variablen m&ouml;glich. In jedem JSON-Block unten ist <code>"token":"DEIN_WEBHOOK_SECRET"</code> das erste Feld.
+        </div>
+        <div style="margin-top:6px;font-size:11px;color:#E09040">&rarr; Vor dem Kopieren <code>DEIN_WEBHOOK_SECRET</code> durch den echten Token aus Railway &rarr; Variables &rarr; <code>WEBHOOK_SECRET</code> ersetzen.</div>
+      </div>
+    </div>
+    <div style="margin-top:8px;font-size:11px;color:#666;line-height:1.5">
+      &#x1F6E1; <b>Niemals den echten Token in diese HTML einchecken.</b> TradingView speichert das Message-Feld serverseitig im jeweiligen Alarm &mdash; nicht &ouml;ffentlich sichtbar. In Railway-Logs taucht der Token ab v4.21 nicht mehr auf (<code>_TokenRedactFilter</code> im Werkzeug-Logger, Body-Redaction).
     </div>
   </div>
   <div class="success"><strong>Was passiert:</strong> TradingView sendet JSON &rarr; Railway empf&auml;ngt &rarr; Telegram sendet DOMINUS-Checkliste + Chart-Links in deinem Layout lX5eDAis.</div>
@@ -345,7 +366,8 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#111114;color:#de
     <div class="field-label"><span>Message-Feld in TradingView</span>
       <button class="copy-btn" onclick="copyField('h4-long',this)">Kopieren</button>
     </div>
-    <div class="field-value mono" id="h4-long">{"symbol":"{{ticker}}","side":"long","entry":{{close}},"timeframe":"{{interval}}","signal":"H4_TRIGGER"}</div>
+    <div class="field-value mono" id="h4-long">{"token":"DEIN_WEBHOOK_SECRET","symbol":"{{ticker}}","side":"long","entry":{{close}},"timeframe":"{{interval}}","signal":"H4_TRIGGER"}</div>
+    <div class="hint" style="margin-top:6px;font-size:11.5px"><strong>&#x1F511; Token:</strong> Vor dem Kopieren <code>DEIN_WEBHOOK_SECRET</code> durch den echten Token aus Railway &rarr; Variables &rarr; <code>WEBHOOK_SECRET</code> ersetzen. Kein Pine-Zugriff &mdash; dieser Alarm l&auml;uft standalone.</div>
   </div>
   <div class="notif-row">
     <div class="notif-card"><div class="notif-label">Benachrichtigung</div><div class="notif-val">App + Ton</div></div>
@@ -387,7 +409,8 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#111114;color:#de
     <div class="field-label"><span>Message-Feld in TradingView</span>
       <button class="copy-btn" onclick="copyField('h4-short',this)">Kopieren</button>
     </div>
-    <div class="field-value mono" id="h4-short">{"symbol":"{{ticker}}","side":"short","entry":{{close}},"timeframe":"{{interval}}","signal":"H4_TRIGGER"}</div>
+    <div class="field-value mono" id="h4-short">{"token":"DEIN_WEBHOOK_SECRET","symbol":"{{ticker}}","side":"short","entry":{{close}},"timeframe":"{{interval}}","signal":"H4_TRIGGER"}</div>
+    <div class="hint" style="margin-top:6px;font-size:11.5px"><strong>&#x1F511; Token:</strong> Vor dem Kopieren <code>DEIN_WEBHOOK_SECRET</code> durch den echten Token aus Railway &rarr; Variables &rarr; <code>WEBHOOK_SECRET</code> ersetzen. Kein Pine-Zugriff &mdash; dieser Alarm l&auml;uft standalone.</div>
   </div>
   <div class="notif-row">
     <div class="notif-card"><div class="notif-label">Benachrichtigung</div><div class="notif-val">App + Ton</div></div>
@@ -508,7 +531,8 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#111114;color:#de
     <div class="field-label" style="margin-bottom:4px"><span>Webhook Message</span>
       <button class="copy-btn" onclick="copyField('btc-dir-long',this)">Kopieren</button>
     </div>
-    <div class="field-value mono" id="btc-dir-long">{"symbol":"BTCUSDT","side":"long","signal":"BTC_DIR","timeframe":"{{interval}}"}</div>
+    <div class="field-value mono" id="btc-dir-long">{"token":"DEIN_WEBHOOK_SECRET","symbol":"BTCUSDT","side":"long","signal":"BTC_DIR","timeframe":"{{interval}}"}</div>
+    <div class="hint" style="margin-top:6px;font-size:11.5px"><strong>&#x1F511; Token:</strong> Vor dem Kopieren <code>DEIN_WEBHOOK_SECRET</code> durch den echten Token aus Railway &rarr; Variables &rarr; <code>WEBHOOK_SECRET</code> ersetzen. Kein Pine-Zugriff &mdash; dieser Alarm l&auml;uft standalone.</div>
   </div>
 
   <!-- ALARM B -->
@@ -535,7 +559,8 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#111114;color:#de
     <div class="field-label" style="margin-bottom:4px"><span>Webhook Message</span>
       <button class="copy-btn" onclick="copyField('btc-dir-short',this)">Kopieren</button>
     </div>
-    <div class="field-value mono" id="btc-dir-short">{"symbol":"BTCUSDT","side":"short","signal":"BTC_DIR","timeframe":"{{interval}}"}</div>
+    <div class="field-value mono" id="btc-dir-short">{"token":"DEIN_WEBHOOK_SECRET","symbol":"BTCUSDT","side":"short","signal":"BTC_DIR","timeframe":"{{interval}}"}</div>
+    <div class="hint" style="margin-top:6px;font-size:11.5px"><strong>&#x1F511; Token:</strong> Vor dem Kopieren <code>DEIN_WEBHOOK_SECRET</code> durch den echten Token aus Railway &rarr; Variables &rarr; <code>WEBHOOK_SECRET</code> ersetzen. Kein Pine-Zugriff &mdash; dieser Alarm l&auml;uft standalone.</div>
   </div>
 
   <!-- ALARM C -->
@@ -565,7 +590,8 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#111114;color:#de
     <div class="field-label" style="margin-bottom:4px"><span>Webhook Message</span>
       <button class="copy-btn" onclick="copyField('btc-oversold',this)">Kopieren</button>
     </div>
-    <div class="field-value mono" id="btc-oversold">{"symbol":"BTCUSDT","side":"long","signal":"BTC_OVERSOLD","timeframe":"{{interval}}"}</div>
+    <div class="field-value mono" id="btc-oversold">{"token":"DEIN_WEBHOOK_SECRET","symbol":"BTCUSDT","side":"long","signal":"BTC_OVERSOLD","timeframe":"{{interval}}"}</div>
+    <div class="hint" style="margin-top:6px;font-size:11.5px"><strong>&#x1F511; Token:</strong> Vor dem Kopieren <code>DEIN_WEBHOOK_SECRET</code> durch den echten Token aus Railway &rarr; Variables &rarr; <code>WEBHOOK_SECRET</code> ersetzen. Kein Pine-Zugriff &mdash; dieser Alarm l&auml;uft standalone.</div>
   </div>
 
   <!-- ALARM D -->
@@ -595,7 +621,8 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#111114;color:#de
     <div class="field-label" style="margin-bottom:4px"><span>Webhook Message</span>
       <button class="copy-btn" onclick="copyField('btc-overbought',this)">Kopieren</button>
     </div>
-    <div class="field-value mono" id="btc-overbought">{"symbol":"BTCUSDT","side":"short","signal":"BTC_OVERBOUGHT","timeframe":"{{interval}}"}</div>
+    <div class="field-value mono" id="btc-overbought">{"token":"DEIN_WEBHOOK_SECRET","symbol":"BTCUSDT","side":"short","signal":"BTC_OVERBOUGHT","timeframe":"{{interval}}"}</div>
+    <div class="hint" style="margin-top:6px;font-size:11.5px"><strong>&#x1F511; Token:</strong> Vor dem Kopieren <code>DEIN_WEBHOOK_SECRET</code> durch den echten Token aus Railway &rarr; Variables &rarr; <code>WEBHOOK_SECRET</code> ersetzen. Kein Pine-Zugriff &mdash; dieser Alarm l&auml;uft standalone.</div>
   </div>
 
   <!-- ZUSAMMENFASSUNG ALARM-EINSTELLUNGEN -->
@@ -607,7 +634,7 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#111114;color:#de
     <div class="notif-card"><div class="notif-label">Ausl&ouml;sung</div><div class="notif-val">Einmal pro Bar</div></div>
     <div class="notif-card"><div class="notif-label">Ablauf</div><div class="notif-val">Unbefristet</div></div>
     <div class="notif-card"><div class="notif-label">Typ</div><div class="notif-val">Einzelner Coin</div></div>
-    <div class="notif-card"><div class="notif-label">Webhook-URL</div><div class="notif-val">Railway URL + Token</div></div>
+    <div class="notif-card"><div class="notif-label">Webhook-URL</div><div class="notif-val">Railway URL (Token im Body)</div></div>
   </div>
 
   <div class="success" style="margin-top:12px">
@@ -659,7 +686,8 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#111114;color:#de
     <div class="field-label" style="margin-bottom:4px"><span>Webhook Message</span>
       <button class="copy-btn" onclick="copyField('t2-dir-long',this)">Kopieren</button>
     </div>
-    <div class="field-value mono" id="t2-dir-long">{"symbol":"TOTAL2","side":"long","signal":"T2_DIR","timeframe":"{{interval}}"}</div>
+    <div class="field-value mono" id="t2-dir-long">{"token":"DEIN_WEBHOOK_SECRET","symbol":"TOTAL2","side":"long","signal":"T2_DIR","timeframe":"{{interval}}"}</div>
+    <div class="hint" style="margin-top:6px;font-size:11.5px"><strong>&#x1F511; Token:</strong> Vor dem Kopieren <code>DEIN_WEBHOOK_SECRET</code> durch den echten Token aus Railway &rarr; Variables &rarr; <code>WEBHOOK_SECRET</code> ersetzen. Kein Pine-Zugriff &mdash; dieser Alarm l&auml;uft standalone.</div>
   </div>
 
   <!-- ALARM B Total2 -->
@@ -684,7 +712,8 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#111114;color:#de
     <div class="field-label" style="margin-bottom:4px"><span>Webhook Message</span>
       <button class="copy-btn" onclick="copyField('t2-dir-short',this)">Kopieren</button>
     </div>
-    <div class="field-value mono" id="t2-dir-short">{"symbol":"TOTAL2","side":"short","signal":"T2_DIR","timeframe":"{{interval}}"}</div>
+    <div class="field-value mono" id="t2-dir-short">{"token":"DEIN_WEBHOOK_SECRET","symbol":"TOTAL2","side":"short","signal":"T2_DIR","timeframe":"{{interval}}"}</div>
+    <div class="hint" style="margin-top:6px;font-size:11.5px"><strong>&#x1F511; Token:</strong> Vor dem Kopieren <code>DEIN_WEBHOOK_SECRET</code> durch den echten Token aus Railway &rarr; Variables &rarr; <code>WEBHOOK_SECRET</code> ersetzen. Kein Pine-Zugriff &mdash; dieser Alarm l&auml;uft standalone.</div>
   </div>
 
   <!-- ALARM C Total2 -->
@@ -712,7 +741,8 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#111114;color:#de
     <div class="field-label" style="margin-bottom:4px"><span>Webhook Message</span>
       <button class="copy-btn" onclick="copyField('t2-oversold',this)">Kopieren</button>
     </div>
-    <div class="field-value mono" id="t2-oversold">{"symbol":"TOTAL2","side":"long","signal":"T2_OVERSOLD","timeframe":"{{interval}}"}</div>
+    <div class="field-value mono" id="t2-oversold">{"token":"DEIN_WEBHOOK_SECRET","symbol":"TOTAL2","side":"long","signal":"T2_OVERSOLD","timeframe":"{{interval}}"}</div>
+    <div class="hint" style="margin-top:6px;font-size:11.5px"><strong>&#x1F511; Token:</strong> Vor dem Kopieren <code>DEIN_WEBHOOK_SECRET</code> durch den echten Token aus Railway &rarr; Variables &rarr; <code>WEBHOOK_SECRET</code> ersetzen. Kein Pine-Zugriff &mdash; dieser Alarm l&auml;uft standalone.</div>
   </div>
 
   <!-- ALARM D Total2 -->
@@ -740,7 +770,8 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#111114;color:#de
     <div class="field-label" style="margin-bottom:4px"><span>Webhook Message</span>
       <button class="copy-btn" onclick="copyField('t2-overbought',this)">Kopieren</button>
     </div>
-    <div class="field-value mono" id="t2-overbought">{"symbol":"TOTAL2","side":"short","signal":"T2_OVERBOUGHT","timeframe":"{{interval}}"}</div>
+    <div class="field-value mono" id="t2-overbought">{"token":"DEIN_WEBHOOK_SECRET","symbol":"TOTAL2","side":"short","signal":"T2_OVERBOUGHT","timeframe":"{{interval}}"}</div>
+    <div class="hint" style="margin-top:6px;font-size:11.5px"><strong>&#x1F511; Token:</strong> Vor dem Kopieren <code>DEIN_WEBHOOK_SECRET</code> durch den echten Token aus Railway &rarr; Variables &rarr; <code>WEBHOOK_SECRET</code> ersetzen. Kein Pine-Zugriff &mdash; dieser Alarm l&auml;uft standalone.</div>
   </div>
 
   <div class="notif-row">
@@ -791,7 +822,8 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#111114;color:#de
     <div class="field-label"><span>Message-Feld in TradingView</span>
       <button class="copy-btn" onclick="copyField('h2-long',this)">Kopieren</button>
     </div>
-    <div class="field-value mono" id="h2-long">{"symbol":"{{ticker}}","side":"long","entry":{{close}},"timeframe":"{{interval}}","signal":"H2_SIGNAL","premium":{{plot("Premium Long")}},"harsi_warn":{{plot("Long HARSI Warnung")}},"btc_t2_warn":{{plot("Long BTC/Total2 Warn")}}}</div>
+    <div class="field-value mono" id="h2-long">{"token":"DEIN_WEBHOOK_SECRET","symbol":"{{ticker}}","side":"long","entry":{{close}},"timeframe":"{{interval}}","signal":"H2_SIGNAL","premium":{{plot("Premium Long")}},"harsi_warn":{{plot("Long HARSI Warnung")}},"btc_t2_warn":{{plot("Long BTC/Total2 Warn")}}}</div>
+    <div class="hint" style="margin-top:6px;font-size:11.5px"><strong>&#x1F511; Token:</strong> Vor dem Kopieren <code>DEIN_WEBHOOK_SECRET</code> durch den echten Token aus Railway &rarr; Variables &rarr; <code>WEBHOOK_SECRET</code> ersetzen. Kein Pine-Zugriff &mdash; dieser Alarm l&auml;uft standalone.</div>
   </div>
   <div class="success">
     <strong>harsi_warn: 0</strong> = HARSI OK &rarr; ✅ sofort einsteigen<br>
@@ -852,7 +884,8 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#111114;color:#de
     <div class="field-label"><span>Message-Feld in TradingView</span>
       <button class="copy-btn" onclick="copyField('h2-short',this)">Kopieren</button>
     </div>
-    <div class="field-value mono" id="h2-short">{"symbol":"{{ticker}}","side":"short","entry":{{close}},"timeframe":"{{interval}}","signal":"H2_SIGNAL","premium":{{plot("Premium Short")}},"harsi_warn":{{plot("Short HARSI Warnung")}},"btc_t2_warn":{{plot("Short BTC/Total2 Warn")}}}</div>
+    <div class="field-value mono" id="h2-short">{"token":"DEIN_WEBHOOK_SECRET","symbol":"{{ticker}}","side":"short","entry":{{close}},"timeframe":"{{interval}}","signal":"H2_SIGNAL","premium":{{plot("Premium Short")}},"harsi_warn":{{plot("Short HARSI Warnung")}},"btc_t2_warn":{{plot("Short BTC/Total2 Warn")}}}</div>
+    <div class="hint" style="margin-top:6px;font-size:11.5px"><strong>&#x1F511; Token:</strong> Vor dem Kopieren <code>DEIN_WEBHOOK_SECRET</code> durch den echten Token aus Railway &rarr; Variables &rarr; <code>WEBHOOK_SECRET</code> ersetzen. Kein Pine-Zugriff &mdash; dieser Alarm l&auml;uft standalone.</div>
   </div>
   <div class="success">
     <strong>harsi_warn: 0</strong> = HARSI OK &rarr; ✅ sofort einsteigen<br>
@@ -924,7 +957,8 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#111114;color:#de
     <div class="field-label"><span>Message-Feld in TradingView</span>
       <button class="copy-btn" onclick="copyField('harsi-exit-long',this)">Kopieren</button>
     </div>
-    <div class="field-value mono" id="harsi-exit-long">{"symbol":"{{ticker}}","side":"long","entry":{{close}},"timeframe":"{{interval}}","signal":"HARSI_EXIT"}</div>
+    <div class="field-value mono" id="harsi-exit-long">{"token":"DEIN_WEBHOOK_SECRET","symbol":"{{ticker}}","side":"long","entry":{{close}},"timeframe":"{{interval}}","signal":"HARSI_EXIT"}</div>
+    <div class="hint" style="margin-top:6px;font-size:11.5px"><strong>&#x1F511; Token:</strong> Vor dem Kopieren <code>DEIN_WEBHOOK_SECRET</code> durch den echten Token aus Railway &rarr; Variables &rarr; <code>WEBHOOK_SECRET</code> ersetzen. Kein Pine-Zugriff &mdash; dieser Alarm l&auml;uft standalone.</div>
   </div>
   <div class="notif-row">
     <div class="notif-card"><div class="notif-label">Benachrichtigung</div><div class="notif-val">App + Ton</div></div>
@@ -978,7 +1012,8 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#111114;color:#de
     <div class="field-label"><span>Message-Feld in TradingView</span>
       <button class="copy-btn" onclick="copyField('harsi-exit-short',this)">Kopieren</button>
     </div>
-    <div class="field-value mono" id="harsi-exit-short">{"symbol":"{{ticker}}","side":"short","entry":{{close}},"timeframe":"{{interval}}","signal":"HARSI_EXIT"}</div>
+    <div class="field-value mono" id="harsi-exit-short">{"token":"DEIN_WEBHOOK_SECRET","symbol":"{{ticker}}","side":"short","entry":{{close}},"timeframe":"{{interval}}","signal":"HARSI_EXIT"}</div>
+    <div class="hint" style="margin-top:6px;font-size:11.5px"><strong>&#x1F511; Token:</strong> Vor dem Kopieren <code>DEIN_WEBHOOK_SECRET</code> durch den echten Token aus Railway &rarr; Variables &rarr; <code>WEBHOOK_SECRET</code> ersetzen. Kein Pine-Zugriff &mdash; dieser Alarm l&auml;uft standalone.</div>
   </div>
   <div class="notif-row">
     <div class="notif-card"><div class="notif-label">Benachrichtigung</div><div class="notif-val">App + Ton</div></div>
@@ -1024,7 +1059,8 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#111114;color:#de
     <div class="field-label"><span>Message-Feld in TradingView</span>
       <button class="copy-btn" onclick="copyField('harsi-sl-long',this)">Kopieren</button>
     </div>
-    <div class="field-value mono" id="harsi-sl-long">{"symbol":"{{ticker}}","direction":"long","signal":"HARSI_SL","price":{{plot("RSI Overlay")}}}</div>
+    <div class="field-value mono" id="harsi-sl-long">{"token":"DEIN_WEBHOOK_SECRET","symbol":"{{ticker}}","direction":"long","signal":"HARSI_SL","price":{{plot("RSI Overlay")}}}</div>
+    <div class="hint" style="margin-top:6px;font-size:11.5px"><strong>&#x1F511; Token:</strong> Vor dem Kopieren <code>DEIN_WEBHOOK_SECRET</code> durch den echten Token aus Railway &rarr; Variables &rarr; <code>WEBHOOK_SECRET</code> ersetzen. Kein Pine-Zugriff &mdash; dieser Alarm l&auml;uft standalone.</div>
   </div>
   <div class="info"><strong>RSI Overlay</strong> = der HARSI-Wert auf die Preisskala projiziert &mdash; entspricht dem echten Preisniveau der Ausstiegslinie auf dem Chart. <strong>RSI Histogram</strong> wäre falsch (liefert den 0-zentrierten RSI-Wert, nicht den Preis). Der SL wird nur gesetzt wenn der neue Preis schützender (höher) als der aktuelle SL ist.</div>
   <div style="margin-top:12px">
@@ -1082,7 +1118,8 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#111114;color:#de
     <div class="field-label"><span>Message-Feld in TradingView</span>
       <button class="copy-btn" onclick="copyField('harsi-sl-short',this)">Kopieren</button>
     </div>
-    <div class="field-value mono" id="harsi-sl-short">{"symbol":"{{ticker}}","direction":"short","signal":"HARSI_SL","price":{{plot("RSI Overlay")}}}</div>
+    <div class="field-value mono" id="harsi-sl-short">{"token":"DEIN_WEBHOOK_SECRET","symbol":"{{ticker}}","direction":"short","signal":"HARSI_SL","price":{{plot("RSI Overlay")}}}</div>
+    <div class="hint" style="margin-top:6px;font-size:11.5px"><strong>&#x1F511; Token:</strong> Vor dem Kopieren <code>DEIN_WEBHOOK_SECRET</code> durch den echten Token aus Railway &rarr; Variables &rarr; <code>WEBHOOK_SECRET</code> ersetzen. Kein Pine-Zugriff &mdash; dieser Alarm l&auml;uft standalone.</div>
   </div>
   <div class="info"><strong>RSI Overlay</strong> = der HARSI-Wert auf die Preisskala projiziert &mdash; entspricht dem echten Preisniveau der Ausstiegslinie auf dem Chart. <strong>RSI Histogram</strong> wäre falsch (liefert den 0-zentrierten RSI-Wert, nicht den Preis). Der SL wird nur gesetzt wenn der neue Preis schützender (tiefer) als der aktuelle SL ist.</div>
   <div style="margin-top:12px">
@@ -1128,9 +1165,9 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#111114;color:#de
 // HARSI ist rsi_overlay (RSI Overlay plot). Ausstiegslinien &plusmn;20.
 if barstate.isconfirmed
     if ta.crossover(rsi_overlay, -20)   // Long-Stop: HARSI verl&auml;sst Oversold aufw&auml;rts
-        alert('{"symbol":"' + syminfo.ticker + '","side":"long","signal":"HARSI_SL","price":' + str.tostring(close, "#.########") + ',"timeframe":"' + timeframe.period + '"}', alert.freq_once_per_bar_close)
+        alert('{"token":"' + webhook_token + '","symbol":"' + syminfo.ticker + '","side":"long","signal":"HARSI_SL","price":' + str.tostring(close, "#.########") + ',"timeframe":"' + timeframe.period + '"}', alert.freq_once_per_bar_close)
     if ta.crossunder(rsi_overlay, 20)   // Short-Stop: HARSI verl&auml;sst Overbought abw&auml;rts
-        alert('{"symbol":"' + syminfo.ticker + '","side":"short","signal":"HARSI_SL","price":' + str.tostring(close, "#.########") + ',"timeframe":"' + timeframe.period + '"}', alert.freq_once_per_bar_close)</pre>
+        alert('{"token":"' + webhook_token + '","symbol":"' + syminfo.ticker + '","side":"short","signal":"HARSI_SL","price":' + str.tostring(close, "#.########") + ',"timeframe":"' + timeframe.period + '"}', alert.freq_once_per_bar_close)</pre>
     </div>
     <div style="margin-top:8px;color:#888;font-size:11px">
       <strong style="color:#B8B8C0">Alternative:</strong> Falls du <code>side</code> nicht mitsenden willst (z.B. wenn Pine die Richtung nicht sauber trennen kann), setze stattdessen <code>"side":"auto"</code>. Railway ermittelt die Richtung dann selbst aus der offenen Position.
@@ -1163,6 +1200,7 @@ if barstate.isconfirmed
       <button class="copy-btn" onclick="copyText('',this)" disabled style="opacity:0.5">Leer lassen</button>
     </div>
     <div class="field-value mono" style="color:#888">(leer lassen &mdash; die Pine erzeugt die JSON-Nachricht selbst via <code>alert()</code>)</div>
+    <div class="success" style="margin-top:6px;font-size:11.5px"><strong>&#x1F511; Token:</strong> wird aus dem Indikator-Setting <code>webhook_token</code> des DOM-ORC v2.4 automatisch in den JSON-Body eingebaut &mdash; hier <b>nichts</b> zu tun.</div>
   </div>
 
   <div class="label">Webhook-URL</div>
@@ -1170,8 +1208,8 @@ if barstate.isconfirmed
     <div style="display:flex;justify-content:space-between;align-items:center">
       <button class="copy-btn" onclick="copyText(document.getElementById('harsi-sl-universal-url').textContent,this)">Kopieren</button>
     </div>
-    <div class="field-value mono" id="harsi-sl-universal-url">https://dominus-tp-updater-production.up.railway.app/webhook?token=DEIN_WEBHOOK_SECRET</div>
-    <div class="info" style="margin-top:6px">Gleiche Webhook-URL wie alle anderen Alarme &mdash; das Script routet intern nach <code>signal</code>-Feld.</div>
+    <div class="field-value mono" id="harsi-sl-universal-url">https://dominus-tp-updater-production.up.railway.app/webhook</div>
+    <div class="info" style="margin-top:6px">Gleiche Webhook-URL wie alle anderen Alarme &mdash; das Script routet intern nach <code>signal</code>-Feld. <b>Kein</b> <code>?token=</code> mehr in der URL.</div>
   </div>
 
   <div class="label">Railway reagiert</div>
@@ -1223,24 +1261,24 @@ if barstate.isconfirmed
 
   <div style="background:#141f14;border:1px solid rgba(138,230,106,0.25);border-radius:8px;padding:12px 14px;margin-bottom:14px;font-size:12px;line-height:1.65">
     <strong style="color:#8AE66A">&#x1F3AF; Was dieser Alarm l&ouml;st</strong><br>
-    <span style="color:#B8B8C0">Die DOM-ORC v2.3 erkennt <b>Sling-Pivots</b> (Swing-High/Low mit 3 Bars links &amp; 3 Bars rechts) und feuert bei jedem best&auml;tigten Pivot einen <code>SLING_SL</code>-Alarm. Sling-High &rarr; SL f&uuml;r <b>Shorts</b>, Sling-Low &rarr; SL f&uuml;r <b>Longs</b>. Railway zieht den SL nur <b>protektiv</b> nach (nie in Richtung Verlust) und verwendet einen <b>ATR-Fallback</b>: <code>max(0.8 %, 0.5 &middot; ATR(14))</code> &mdash; zu enge Stops werden automatisch auf diesen Puffer aufgeweitet.</span>
+    <span style="color:#B8B8C0">Die DOM-ORC v2.4 erkennt <b>Sling-Pivots</b> (Swing-High/Low mit 3 Bars links &amp; 3 Bars rechts) und feuert bei jedem best&auml;tigten Pivot einen <code>SLING_SL</code>-Alarm. Sling-High &rarr; SL f&uuml;r <b>Shorts</b>, Sling-Low &rarr; SL f&uuml;r <b>Longs</b>. Railway zieht den SL nur <b>protektiv</b> nach (nie in Richtung Verlust) und verwendet einen <b>ATR-Fallback</b>: <code>max(0.8 %, 0.5 &middot; ATR(14))</code> &mdash; zu enge Stops werden automatisch auf diesen Puffer aufgeweitet.</span>
   </div>
 
   <!-- Voraussetzung: Pine-Snippet -->
   <div style="background:#0d1f2d;border:1px solid rgba(123,184,245,0.25);border-radius:8px;padding:12px 14px;margin-bottom:14px;font-size:12px;line-height:1.65">
-    <strong style="color:#7BB8F5">&#x26A0; Voraussetzung: DOM-ORC v2.3 im Chart</strong><br>
-    <span style="color:#B8B8C0">Der Sling-SL-Emitter ist bereits <b>fester Bestandteil</b> der <code>Dominus_Orchestrator_v2.3.pine</code>. Kein zus&auml;tzliches Snippet n&ouml;tig &mdash; einfach die neue Pine-Version laden und den bestehenden DOM-ORC im Chart ersetzen.</span>
+    <strong style="color:#7BB8F5">&#x26A0; Voraussetzung: DOM-ORC v2.4 im Chart</strong><br>
+    <span style="color:#B8B8C0">Der Sling-SL-Emitter ist bereits <b>fester Bestandteil</b> der <code>Dominus_Orchestrator_v2.4.pine</code>. Kein zus&auml;tzliches Snippet n&ouml;tig &mdash; einfach die neue Pine-Version laden und den bestehenden DOM-ORC im Chart ersetzen.</span>
     <div style="background:#0a0a0e;border-radius:6px;padding:10px 12px;margin-top:8px;font-family:'SF Mono','Fira Mono',monospace;font-size:11px;color:#e0e0e0;line-height:1.6;overflow-x:auto">
-<pre style="margin:0;white-space:pre-wrap">// v2.3 Sling-SL Emitter (bereits in Dominus_Orchestrator_v2.3 enthalten)
+<pre style="margin:0;white-space:pre-wrap">// v2.4 Sling-SL Emitter (bereits in Dominus_Orchestrator_v2.4 enthalten)
 ph = ta.pivothigh(high, sling_left, sling_right)   // Sling-High (Short-SL)
 pl = ta.pivotlow (low,  sling_left, sling_right)   // Sling-Low  (Long-SL)
 atr_val = ta.atr(sling_atr_len)
 
 if barstate.isconfirmed and not na(ph)
-    alert('{"symbol":"' + syminfo.ticker + '","side":"short","signal":"SLING_SL","pivot":' + str.tostring(ph) + ',"price":' + str.tostring(close) + ',"atr":' + str.tostring(atr_val) + ',"timeframe":"' + timeframe.period + '"}', alert.freq_once_per_bar_close)
+    alert('{"token":"' + webhook_token + '","symbol":"' + syminfo.ticker + '","side":"short","signal":"SLING_SL","pivot":' + str.tostring(ph) + ',"price":' + str.tostring(close) + ',"atr":' + str.tostring(atr_val) + ',"timeframe":"' + timeframe.period + '"}', alert.freq_once_per_bar_close)
 
 if barstate.isconfirmed and not na(pl)
-    alert('{"symbol":"' + syminfo.ticker + '","side":"long","signal":"SLING_SL","pivot":' + str.tostring(pl) + ',"price":' + str.tostring(close) + ',"atr":' + str.tostring(atr_val) + ',"timeframe":"' + timeframe.period + '"}', alert.freq_once_per_bar_close)</pre>
+    alert('{"token":"' + webhook_token + '","symbol":"' + syminfo.ticker + '","side":"long","signal":"SLING_SL","pivot":' + str.tostring(pl) + ',"price":' + str.tostring(close) + ',"atr":' + str.tostring(atr_val) + ',"timeframe":"' + timeframe.period + '"}', alert.freq_once_per_bar_close)</pre>
     </div>
     <div style="margin-top:8px;color:#888;font-size:11px">
       <strong style="color:#B8B8C0">Parameter (im DOM-ORC einstellbar):</strong>
@@ -1263,7 +1301,7 @@ if barstate.isconfirmed and not na(pl)
   <div class="label">Bedingung</div>
   <div class="field">
     <div class="field-value">
-      Indikator: <b>DOMINUS Orchestrator v2.3</b><br>
+      Indikator: <b>DOMINUS Orchestrator v2.4</b><br>
       Bedingung: <b>Any alert() function call</b> (ganz unten im Dropdown)<br>
       Intervall: <b>H2</b> &middot; Ausl&ouml;sung: <b>Einmal pro Bar Close</b><br>
       Typ: <b>Watchlist</b> (deine komplette DOMINUS-Watchlist)
@@ -1277,6 +1315,7 @@ if barstate.isconfirmed and not na(pl)
       <button class="copy-btn" onclick="copyText('',this)" disabled style="opacity:0.5">Leer lassen</button>
     </div>
     <div class="field-value mono" style="color:#888">(leer lassen &mdash; die Pine erzeugt die JSON-Nachricht selbst via <code>alert()</code>)</div>
+    <div class="success" style="margin-top:6px;font-size:11.5px"><strong>&#x1F511; Token:</strong> wird aus dem Indikator-Setting <code>webhook_token</code> des DOM-ORC v2.4 automatisch in den JSON-Body eingebaut &mdash; hier <b>nichts</b> zu tun.</div>
   </div>
 
   <div class="label">Webhook-URL</div>
@@ -1284,8 +1323,8 @@ if barstate.isconfirmed and not na(pl)
     <div style="display:flex;justify-content:space-between;align-items:center">
       <button class="copy-btn" onclick="copyText(document.getElementById('sling-sl-url').textContent,this)">Kopieren</button>
     </div>
-    <div class="field-value mono" id="sling-sl-url">https://dominus-tp-updater-production.up.railway.app/webhook?token=DEIN_WEBHOOK_SECRET</div>
-    <div class="info" style="margin-top:6px">Gleiche Webhook-URL wie alle anderen Alarme &mdash; Routing erfolgt intern &uuml;ber <code>signal=SLING_SL</code>.</div>
+    <div class="field-value mono" id="sling-sl-url">https://dominus-tp-updater-production.up.railway.app/webhook</div>
+    <div class="info" style="margin-top:6px">Gleiche Webhook-URL wie alle anderen Alarme &mdash; Routing erfolgt intern &uuml;ber <code>signal=SLING_SL</code>. <b>Kein</b> <code>?token=</code> mehr in der URL.</div>
   </div>
 
   <div class="label">JSON-Body Beispiel</div>
@@ -1430,7 +1469,8 @@ if barstate.isconfirmed and not na(pl)
     <div class="field-label"><span>Message-Feld in TradingView</span>
       <button class="copy-btn" onclick="copyField('btc-recovery',this)">Kopieren</button>
     </div>
-    <div class="field-value mono" id="btc-recovery">{"symbol":"BTCUSDT","side":"long","signal":"BTC_DIR","zone":"recovering"}</div>
+    <div class="field-value mono" id="btc-recovery">{"token":"DEIN_WEBHOOK_SECRET","symbol":"BTCUSDT","side":"long","signal":"BTC_DIR","zone":"recovering"}</div>
+    <div class="hint" style="margin-top:6px;font-size:11.5px"><strong>&#x1F511; Token:</strong> Vor dem Kopieren <code>DEIN_WEBHOOK_SECRET</code> durch den echten Token aus Railway &rarr; Variables &rarr; <code>WEBHOOK_SECRET</code> ersetzen. Kein Pine-Zugriff &mdash; dieser Alarm l&auml;uft standalone.</div>
   </div>
   <div class="info" style="margin-top:8px">
     <strong>zone: "recovering"</strong> teilt Railway mit, dass BTC noch zwischen &minus;10 und 0 liegt (nicht voll bestätigt).<br>
@@ -1480,7 +1520,8 @@ if barstate.isconfirmed and not na(pl)
     <div class="field-label"><span>Message-Feld in TradingView</span>
       <button class="copy-btn" onclick="copyField('t2-recovery',this)">Kopieren</button>
     </div>
-    <div class="field-value mono" id="t2-recovery">{"symbol":"TOTAL2","side":"long","signal":"T2_DIR","zone":"recovering"}</div>
+    <div class="field-value mono" id="t2-recovery">{"token":"DEIN_WEBHOOK_SECRET","symbol":"TOTAL2","side":"long","signal":"T2_DIR","zone":"recovering"}</div>
+    <div class="hint" style="margin-top:6px;font-size:11.5px"><strong>&#x1F511; Token:</strong> Vor dem Kopieren <code>DEIN_WEBHOOK_SECRET</code> durch den echten Token aus Railway &rarr; Variables &rarr; <code>WEBHOOK_SECRET</code> ersetzen. Kein Pine-Zugriff &mdash; dieser Alarm l&auml;uft standalone.</div>
   </div>
   <div class="info" style="margin-top:8px">
     Railway setzt <code>t2_dir = "recovering"</code>. Die Permission-Logik kombiniert dann btc_dir + t2_dir — genau wie in der Tabelle in Alarm 5c beschrieben.
@@ -1531,7 +1572,8 @@ if barstate.isconfirmed and not na(pl)
     <div class="field-label"><span>Message-Feld in TradingView</span>
       <button class="copy-btn" onclick="copyField('btc-short-recovery',this)">Kopieren</button>
     </div>
-    <div class="field-value mono" id="btc-short-recovery">{"symbol":"BTCUSDT","side":"short","signal":"BTC_DIR","zone":"recovering"}</div>
+    <div class="field-value mono" id="btc-short-recovery">{"token":"DEIN_WEBHOOK_SECRET","symbol":"BTCUSDT","side":"short","signal":"BTC_DIR","zone":"recovering"}</div>
+    <div class="hint" style="margin-top:6px;font-size:11.5px"><strong>&#x1F511; Token:</strong> Vor dem Kopieren <code>DEIN_WEBHOOK_SECRET</code> durch den echten Token aus Railway &rarr; Variables &rarr; <code>WEBHOOK_SECRET</code> ersetzen. Kein Pine-Zugriff &mdash; dieser Alarm l&auml;uft standalone.</div>
   </div>
   <div class="notif-row">
     <div class="notif-card"><div class="notif-label">Benachrichtigung</div><div class="notif-val">App + Ton</div></div>
@@ -1576,7 +1618,8 @@ if barstate.isconfirmed and not na(pl)
     <div class="field-label"><span>Message-Feld in TradingView</span>
       <button class="copy-btn" onclick="copyField('t2-short-recovery',this)">Kopieren</button>
     </div>
-    <div class="field-value mono" id="t2-short-recovery">{"symbol":"TOTAL2","side":"short","signal":"T2_DIR","zone":"recovering"}</div>
+    <div class="field-value mono" id="t2-short-recovery">{"token":"DEIN_WEBHOOK_SECRET","symbol":"TOTAL2","side":"short","signal":"T2_DIR","zone":"recovering"}</div>
+    <div class="hint" style="margin-top:6px;font-size:11.5px"><strong>&#x1F511; Token:</strong> Vor dem Kopieren <code>DEIN_WEBHOOK_SECRET</code> durch den echten Token aus Railway &rarr; Variables &rarr; <code>WEBHOOK_SECRET</code> ersetzen. Kein Pine-Zugriff &mdash; dieser Alarm l&auml;uft standalone.</div>
   </div>
   <div class="notif-row">
     <div class="notif-card"><div class="notif-label">Benachrichtigung</div><div class="notif-val">App + Ton</div></div>
