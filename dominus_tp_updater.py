@@ -4923,7 +4923,25 @@ def start_webhook_server():
             # ohne den (womöglich echten) falschen Token zu persistieren.
             _src = "url" if token_url else ("body" if token_body else "none")
             _len = len(token) if token else 0
-            log(f"⚠ Webhook: Ungültiger Token (quelle={_src}, len={_len})")
+            # Diagnose: bei quelle=none strukturelle Body-Info loggen.
+            # Token wird niemals geloggt, aber wir brauchen genug Struktur
+            # um zu sehen, welcher Alarm ohne Token sendet.
+            if _src == "none":
+                try:
+                    _keys = sorted((data or {}).keys()) if isinstance(data, dict) else []
+                except Exception:
+                    _keys = []
+                _sym = ""
+                if isinstance(data, dict):
+                    _sym = str(data.get("symbol", "") or data.get("ticker", ""))
+                _sig = str(data.get("signal", "")) if isinstance(data, dict) else ""
+                _body_len = len(raw_body)
+                _body_snip = raw_body[:200].replace("\n", " ")
+                log(f"⚠ Webhook: Ungültiger Token (quelle=none, len=0) | "
+                    f"body_len={_body_len} keys={_keys} symbol={_sym!r} signal={_sig!r} | "
+                    f"snippet={_body_snip!r}")
+            else:
+                log(f"⚠ Webhook: Ungültiger Token (quelle={_src}, len={_len})")
             return jsonify({"status": "ignored", "reason": "unauthorized"}), 200
 
         # ── Verarbeitung im Hintergrund-Thread ────────────────
