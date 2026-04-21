@@ -1911,6 +1911,18 @@ if barstate.isconfirmed and not na(pl)
         <div class="field-value mono">/status</div>
       </div>
       <div class="field">
+        <div class="field-label"><span>Makro-Richtung (BTC + Total2)</span>
+          <button class="copy-btn" onclick="copyText('/makro',this)">Kopieren</button>
+        </div>
+        <div class="field-value mono">/makro</div>
+      </div>
+      <div class="field">
+        <div class="field-label"><span>Watchlist neu laden</span>
+          <button class="copy-btn" onclick="copyText('/refresh',this)">Kopieren</button>
+        </div>
+        <div class="field-value mono">/refresh</div>
+      </div>
+      <div class="field">
         <div class="field-label"><span>Alle Befehle</span>
           <button class="copy-btn" onclick="copyText('/hilfe',this)">Kopieren</button>
         </div>
@@ -1934,9 +1946,31 @@ if barstate.isconfirmed and not na(pl)
 Beispiel:
 /trade ETHUSDT LONG 10 2850 2700</div>
       </div>
+      <div class="field">
+        <div class="field-label"><span>Alarm-Templates (klickbar) <span class="new-badge">v4.21</span></span>
+          <button class="copy-btn" onclick="copyText('/alarm',this)">Kopieren</button>
+        </div>
+        <div class="field-value mono">/alarm</div>
+        <div style="font-size:11px;color:#888;line-height:1.55;margin-top:4px;padding:0 2px">Zeigt aktive Positionen, H4-Richtung und HARSI-Fenster als <b>tappbare</b> Kommandos (z.&nbsp;B. <code>/alarm_harsi_BTC_LONG</code>) &mdash; kein Copy-Paste n&ouml;tig.</div>
+      </div>
+      <div class="field">
+        <div class="field-label"><span>CSV-Archiv: Dublettenpr&uuml;fung <span class="new-badge">NEU v4.21</span></span>
+          <button class="copy-btn" onclick="copyText('/dedup_trades',this)">Kopieren</button>
+        </div>
+        <div class="field-value mono">/dedup_trades</div>
+        <div style="font-size:11px;color:#888;line-height:1.55;margin-top:4px;padding:0 2px">Dry-Run: listet Dubletten in <code>trades.csv</code> (gleiche Symbol/Richtung/Entry/Close/PnL innerhalb 2&nbsp;h). Keine Änderung an der CSV. Am Ende erscheint <code>/dedup_apply</code> als Klick-Link.</div>
+      </div>
+      <div class="field">
+        <div class="field-label"><span>CSV-Archiv: Bereinigen</span>
+          <button class="copy-btn" onclick="copyText('/dedup_apply',this)">Kopieren</button>
+        </div>
+        <div class="field-value mono">/dedup_apply</div>
+        <div style="font-size:11px;color:#888;line-height:1.55;margin-top:4px;padding:0 2px">Apply-Modus: legt zuerst ein <b>Timestamp-Backup</b> an (<code>trades.csv.backup_YYYYMMDD-HHMMSS.csv</code>), schreibt dann die entdoppelte CSV &amp; bereinigt <code>closed_trades[]</code> im RAM.</div>
+      </div>
     </div>
   </div>
   <div class="info"><strong>/trade</strong> f&uuml;hrt nichts aus &mdash; zeigt R:R, empfohlenen Hebel, DCA-Preise, TPs, Kelly und Chart-Links in Layout lX5eDAis.</div>
+  <div class="success" style="margin-top:8px"><strong>&#x1F4A1; Klickbare Befehle:</strong> Alle Kommandos mit Unterstrichen (z.&nbsp;B. <code>/alarm_harsi_BTC_LONG</code>, <code>/dedup_apply</code>) sind in Telegram <b>direkt antippbar</b> &mdash; kein Copy-Paste, kein Tippfehler. Der Router zerlegt den Underscore-Suffix in Tokens und dispatcht wie ein normaler Befehl mit Argumenten.</div>
 </div>
 
 <!-- TELEGRAM VORSCHAU -->
@@ -1944,8 +1978,8 @@ Beispiel:
   <div class="card-head">
     <div class="step-badge" style="background:#0e1f33;color:#7BB8F5">&#x1F4F1;</div>
     <div>
-      <div class="h2">Telegram Nachricht &mdash; Vorschau <span class="new-badge">NEU</span></div>
-      <div class="sub">So sieht die H2-Signal Benachrichtigung aus &mdash; mit Buttons statt langen URLs</div>
+      <div class="h2">Telegram Nachricht &mdash; Vorschau <span class="upd-badge">v4.21</span></div>
+      <div class="sub">Neue 3-Button-Reihe: direkter Bitget-Sprung + Makro-Kontext (BTC H2, Total2)</div>
     </div>
   </div>
   <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
@@ -1965,11 +1999,9 @@ Beispiel:
         <span style="color:#666">/trade ETHUSDT LONG 10 2850.00 2137.50</span>
       </div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px;margin-top:6px">
-        <div style="background:#2b5278;color:#fff;border-radius:6px;padding:5px 8px;font-size:11px;text-align:center">📈 H2 ETHUSDT</div>
-        <div style="background:#2b5278;color:#fff;border-radius:6px;padding:5px 8px;font-size:11px;text-align:center">📊 H4 ETHUSDT</div>
-        <div style="background:#2b5278;color:#fff;border-radius:6px;padding:5px 8px;font-size:11px;text-align:center">₿ BTC H2</div>
-        <div style="background:#2b5278;color:#fff;border-radius:6px;padding:5px 8px;font-size:11px;text-align:center">🌐 Total2</div>
-        <div style="background:#2b5278;color:#fff;border-radius:6px;padding:5px 8px;font-size:11px;text-align:center;grid-column:span 2">📋 /trade kopieren</div>
+        <div style="background:#E09040;color:#0d0d10;border-radius:6px;padding:5px 8px;font-size:11px;text-align:center;grid-column:span 2;font-weight:600">🟠 Bitget ETH</div>
+        <div style="background:#2b5278;color:#fff;border-radius:6px;padding:5px 8px;font-size:11px;text-align:center">📈 BTC H2</div>
+        <div style="background:#2b5278;color:#fff;border-radius:6px;padding:5px 8px;font-size:11px;text-align:center">🔀 Total2</div>
       </div>
     </div>
     <div>
@@ -1989,18 +2021,18 @@ Beispiel:
         <span style="color:#666">/trade TRXUSDT LONG 10 0.32650 0.24488</span>
       </div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px;margin-top:6px">
-        <div style="background:#2b5278;color:#fff;border-radius:6px;padding:5px 8px;font-size:11px;text-align:center">📈 H2 TRXUSDT</div>
-        <div style="background:#2b5278;color:#fff;border-radius:6px;padding:5px 8px;font-size:11px;text-align:center">📊 H4 TRXUSDT</div>
-        <div style="background:#2b5278;color:#fff;border-radius:6px;padding:5px 8px;font-size:11px;text-align:center">₿ BTC H2</div>
-        <div style="background:#2b5278;color:#fff;border-radius:6px;padding:5px 8px;font-size:11px;text-align:center">🌐 Total2</div>
-        <div style="background:#2b5278;color:#fff;border-radius:6px;padding:5px 8px;font-size:11px;text-align:center;grid-column:span 2">📋 /trade kopieren</div>
+        <div style="background:#E09040;color:#0d0d10;border-radius:6px;padding:5px 8px;font-size:11px;text-align:center;grid-column:span 2;font-weight:600">🟠 Bitget TRX</div>
+        <div style="background:#2b5278;color:#fff;border-radius:6px;padding:5px 8px;font-size:11px;text-align:center">📈 BTC H2</div>
+        <div style="background:#2b5278;color:#fff;border-radius:6px;padding:5px 8px;font-size:11px;text-align:center">🔀 Total2</div>
       </div>
     </div>
   </div>
   <div class="info" style="margin-top:12px">
-    <strong>📋 /trade kopieren</strong>: Tippt drauf &rarr; Befehl mit Einstiegspreis &amp; SL (Entry &minus;25%) in Zwischenablage &rarr; direkt einfügen und Hebel/SL anpassen.<br>
-    <strong>SL Vorschlag</strong>: Entry &times; 0.75 (Long) &nbsp;/&nbsp; Entry &times; 1.25 (Short) &mdash; nur als Ausgangspunkt, immer manuell pr&uuml;fen.
+    <strong>🟠 Bitget COIN</strong>: springt direkt zum Futures-Chart des Coins auf <code>bitget.com/futures/usdt/SYMBOL</code> &mdash; Market Order + SL ohne Umweg.<br>
+    <strong>📈 BTC H2 / 🔀 Total2</strong>: Makro-Kontext im selben TradingView-Layout (lX5eDAis) &mdash; H2/H4 des Coins l&auml;sst sich in TV direkt umschalten, daher kein separater Button.<br>
+    <strong>/trade-Zeile</strong>: Die graue Zeile unten ist ein <b>Copy-Hint</b> (bereits mit Entry &amp; SL-Vorschlag gef&uuml;llt) &mdash; einfach antippen &amp; l&auml;nger halten &rarr; Kopieren.
   </div>
+  <div class="success" style="margin-top:8px"><strong>&#x1F4A1; Inline-Buttons erscheinen auch bei:</strong> Auto-SL-Meldungen, SL-auf-Entry-Bestätigung, <code>/trade</code>-Berechnung (<code>/berechnen</code>-Style), sowie der Close-Summary nach Positions-Abschluss.</div>
 </div>
 
 <!-- WORKFLOW -->
