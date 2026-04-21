@@ -748,14 +748,27 @@ def csv_log_trade(trade: dict):
     threading.Thread(target=_write, daemon=True).start()
 
 
-def telegram(msg: str):
-    """Sendet Telegram-Nachricht wenn konfiguriert."""
+def telegram(msg: str, reply_markup: dict = None):
+    """
+    Sendet Telegram-Nachricht wenn konfiguriert.
+
+    reply_markup: optional inline keyboard (dict mit {"inline_keyboard": [[...]]})
+                  — z.B. Ergebnis von build_setup_buttons(symbol).
+    """
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
     try:
+        payload = {
+            "chat_id":                  TELEGRAM_CHAT_ID,
+            "text":                     msg,
+            "parse_mode":               "HTML",
+            "disable_web_page_preview": True,
+        }
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"},
+            json=payload,
             timeout=5
         )
     except Exception:
@@ -1747,7 +1760,7 @@ def handle_position_closed(symbol: str, reason: str = ""):
         f"/berechnen für neuen Trade",
     ]
 
-    telegram("\n".join(msg_lines))
+    telegram("\n".join(msg_lines), reply_markup=build_setup_buttons(symbol))
 
     # Trade für Daily Report aufzeichnen + Google Sheets Archiv
     _trade_record = {
@@ -2368,12 +2381,18 @@ def place_dca_orders(symbol: str, entry: float, sl: float,
 
 def tv_chart_links(symbol: str) -> dict:
     """
-    Generiert TradingView Chart-Links mit gespeichertem Layout lX5eDAis.
-    Symbol wird automatisch getauscht, Timeframe angepasst.
+    Generiert TradingView Chart-Links mit gespeichertem Layout lX5eDAis
+    + direkten Bitget-Trading-Link. Symbol wird automatisch getauscht,
+    Timeframe angepasst.
     """
     tv_sym = symbol.upper()
     if not tv_sym.endswith(".P"):
         tv_sym = tv_sym + ".P"
+
+    # Bitget akzeptiert den Plain-USDT-Pair im /futures/usdt/-Pfad.
+    bitget_sym = symbol.upper().replace(".P", "")
+    if not bitget_sym.endswith("USDT"):
+        bitget_sym += "USDT"
 
     base = "https://www.tradingview.com/chart/lX5eDAis"
     return {
@@ -2381,7 +2400,32 @@ def tv_chart_links(symbol: str) -> dict:
         "coin_h4":  f"{base}/?symbol=BITGET:{tv_sym}&interval=240",
         "btc_h2":   f"{base}/?symbol=BITGET:BTCUSDT.P&interval=120",
         "total2":   f"{base}/?symbol=CRYPTOCAP:TOTAL2&interval=120",
+        "bitget":   f"https://www.bitget.com/futures/usdt/{bitget_sym}",
     }
+
+
+def build_setup_buttons(symbol: str = "") -> dict:
+    """
+    Baut das Telegram Inline-Keyboard für Trade-Setups und Auto-SL-Meldungen.
+
+    Layout (Wunsch Felix, 2026-04-21):
+      Row 1:  🟠 Bitget {COIN}          ← primäre Aktion
+      Row 2:  📈 BTC H2   🔀 Total2     ← Makro-Kontext
+
+    Die H2/H4-Buttons des eigenen Coins sind bewusst weggelassen — Timeframe
+    lässt sich in TradingView mit einem Klick umschalten. Wenn kein Symbol
+    übergeben wird, fehlt die Bitget-Zeile (z.B. für Macro-only-Reports).
+    """
+    links = tv_chart_links(symbol if symbol else "BTCUSDT")
+    rows = []
+    if symbol:
+        base_coin = symbol.upper().replace("USDT", "").replace(".P", "")
+        rows.append([{"text": f"🟠 Bitget {base_coin}", "url": links["bitget"]}])
+    rows.append([
+        {"text": "📈 BTC H2",  "url": links["btc_h2"]},
+        {"text": "🔀 Total2",  "url": links["total2"]},
+    ])
+    return {"inline_keyboard": rows}
 
 
 def send_deviation_warnings(
@@ -2516,9 +2560,8 @@ def setup_new_trade(pos: dict):
                 f"SL: {sl_str} USDT ({sl_dist:.1f}% Abstand)\n"
                 f"Hebel: {leverage}x | Entry: {entry}\n\n"
                 f"\u26a0\ufe0f Bitte pr\u00fcfen ob SL mit deiner\n"
-                f"Ausstiegslinie \u00fcbereinstimmt!\n\n"
-                f"H4 {symbol}: {links['coin_h4']}\n"
-                f"H2 {symbol}: {links['coin_h2']}"
+                f"Ausstiegslinie \u00fcbereinstimmt!",
+                reply_markup=build_setup_buttons(symbol),
             )
             sl_price = sl_auto
         else:
@@ -2526,8 +2569,8 @@ def setup_new_trade(pos: dict):
             telegram(
                 f"\u274c <b>Kein SL \u2014 {symbol}</b>\n"
                 f"Auto-SL fehlgeschlagen. Bitte manuell setzen!\n"
-                f"Empfehlung: {sl_str} USDT ({sl_dist:.1f}%)\n\n"
-                f"H4: {links['coin_h4']}"
+                f"Empfehlung: {sl_str} USDT ({sl_dist:.1f}%)",
+                reply_markup=build_setup_buttons(symbol),
             )
             cancel_all_tp_orders(symbol)
             time.sleep(1)
@@ -2644,15 +2687,10 @@ def setup_new_trade(pos: dict):
         + "\n".join(tp_prices) + "\n\n"
         f"💰 Margin/Order ≈ {order_margin:.2f} USDT\n"
         f"📊 Total ≈ {order_margin*3:.2f} USDT "
-        f"({order_margin*3/balance*100:.1f}% Kapital)\n\n"
-        f"📈 Charts:\n"
-        f"H2 {symbol}: {tv_chart_links(symbol)['coin_h2']}\n"
-        f"H4 {symbol}: {tv_chart_links(symbol)['coin_h4']}\n"
-        f"BTC H2: {tv_chart_links(symbol)['btc_h2']}\n"
-        f"Total2: {tv_chart_links(symbol)['total2']}"
+        f"({order_margin*3/balance*100:.1f}% Kapital)"
         if balance > 0 else ""
     )
-    telegram(msg)
+    telegram(msg, reply_markup=build_setup_buttons(symbol))
 
     # Abweichungs-Warnung (Hebel / Kelly / R:R) — separate Nachricht nach Haupt-Report
     send_deviation_warnings(
@@ -2850,9 +2888,9 @@ def get_telegram_updates() -> list:
         return []
 
 
-def reply(text: str):
-    """Sendet Antwort an den Telegram Chat."""
-    telegram(text)
+def reply(text: str, reply_markup: dict = None):
+    """Sendet Antwort an den Telegram Chat (optional mit Inline-Keyboard)."""
+    telegram(text, reply_markup=reply_markup)
 
 
 def cmd_berechnen():
@@ -4080,11 +4118,6 @@ def cmd_trade(parts: list):
     if warnings:
         lines += ["", "⚠️ <b>Warnungen:</b>"] + warnings
 
-    links       = tv_chart_links(symbol)
-    coin_h2_url = links["coin_h2"]
-    coin_h4_url = links["coin_h4"]
-    btc_url     = links["btc_h2"]
-    total2_url  = links["total2"]
     lines += [
         "",
         "✔︎ HARSI nicht in Extremzone?",
@@ -4093,14 +4126,8 @@ def cmd_trade(parts: list):
         "",
         "✅ Wenn ja: Market Order + SL auf Bitget setzen.",
         "Script setzt DCA + TPs automatisch.",
-        "",
-        "📈 Charts:",
-        f'H2 {symbol} (HARSI): {coin_h2_url}',
-        f'H4 {symbol} (Premium): {coin_h4_url}',
-        f'BTC H2 (Momentum): {btc_url}',
-        f'Total2 H2 (Altcoins): {total2_url}',
     ]
-    reply("\n".join(lines))
+    reply("\n".join(lines), reply_markup=build_setup_buttons(symbol))
 
 
 def cmd_makro():
@@ -4368,6 +4395,25 @@ def _list_active_harsi_windows() -> list:
     return out
 
 
+def _alarm_click_cmd(sub: str, symbol: str = "", direction: str = "") -> str:
+    """
+    Erzeugt einen Telegram-klickbaren Alias-Command für eine Alarm-Vorlage.
+    Telegram macht nur /wort_ohne_leerzeichen automatisch tippbar — daher
+    kodieren wir die Args mit Unterstrichen:
+
+        /alarm_harsi_BTCUSDT_LONG
+        /alarm_harsisl_ETHUSDT_SHORT
+        /alarm_h2_SOLUSDT_LONG
+        /alarm_h4_LONG
+    """
+    parts = ["/alarm", sub]
+    if symbol:
+        parts.append(symbol.upper())
+    if direction:
+        parts.append(direction.upper())
+    return "_".join(parts).replace("/_", "/")
+
+
 def cmd_alarm(parts: list):
     """
     Copy-Paste ready Alarm-Vorlagen für TradingView.
@@ -4378,28 +4424,55 @@ def cmd_alarm(parts: list):
     /alarm harsisl SYMBOL LONG|SHORT   → Alarm 4/4b (HARSI_SL, für offene Trades)
     /alarm h2     SYMBOL LONG|SHORT    → Alarm 2/2b (H2_SIGNAL Entry)
     /alarm h4     LONG|SHORT           → Alarm 1/1b (H4_TRIGGER Watchlist)
+
+    Tippbare Aliasse (Telegram-Klick):
+      /alarm_harsi_SYMBOL_DIR  /alarm_harsisl_SYMBOL_DIR
+      /alarm_h2_SYMBOL_DIR     /alarm_h4_DIR
     """
     # 1) Keine Args → Übersicht
     if len(parts) == 1:
+        # Offene Positionen für Symbol-spezifische Klick-Aliasse ermitteln
+        try:
+            _open_syms = [p.get("symbol", "") for p in (get_all_positions() or []) if p.get("symbol")]
+        except Exception:
+            _open_syms = []
+
         lines = [
             "🔔 <b>Alarm-Vorlagen — Copy &amp; Paste für TradingView</b>",
             "━" * 12,
             "",
-            "<b>Befehle:</b>",
+            "<b>Syntax (mit Platzhaltern — Copy &amp; edit):</b>",
             "<code>/alarm SYMBOL LONG|SHORT</code> — Kurzform → HARSI Exit (Alarm 3/3b)",
             "<code>/alarm harsi SYMBOL LONG|SHORT</code> — Alarm 3/3b (HARSI Exit)",
             "<code>/alarm harsisl SYMBOL LONG|SHORT</code> — Alarm 4/4b (HARSI SL)",
             "<code>/alarm h2 SYMBOL LONG|SHORT</code> — Alarm 2/2b (H2 Entry)",
             "<code>/alarm h4 LONG|SHORT</code> — Alarm 1/1b (H4 Watchlist)",
             "",
+            "<b>⚡ Klickbar (H4 Watchlist — keine Args nötig):</b>",
+            f"  {_alarm_click_cmd('h4', direction='LONG')}",
+            f"  {_alarm_click_cmd('h4', direction='SHORT')}",
         ]
+
+        # Symbol-spezifische Klick-Aliasse für alle offenen Positionen
+        if _open_syms:
+            lines += ["", "<b>⚡ Klickbar für offene Positionen (HARSI SL):</b>"]
+            for _sym in _open_syms:
+                lines.append(f"  {_alarm_click_cmd('harsisl', _sym, 'LONG')}")
+                lines.append(f"  {_alarm_click_cmd('harsisl', _sym, 'SHORT')}")
+
+        lines.append("")
         active = _list_active_harsi_windows()
         if active:
             lines.append("<b>🟢 Aktive HARSI-Fenster (30-Min-Timer läuft):</b>")
             for sym, drct, rem, exp in active:
                 icon = dir_icon(drct)
                 lines.append(f"  {icon} <b>{sym}</b> {drct.upper()} — noch {rem} Min (bis {exp})")
-                lines.append(f"     → <code>/alarm harsi {sym} {drct.upper()}</code>")
+                # Tippbare Alias-Commands (Telegram erkennt /xxx als Link)
+                lines.append(
+                    f"     ⚡ {_alarm_click_cmd('harsi', sym, drct)}  "
+                    f"| {_alarm_click_cmd('harsisl', sym, drct)}  "
+                    f"| {_alarm_click_cmd('h2', sym, drct)}"
+                )
         else:
             lines.append("<i>Aktuell kein aktives HARSI-Fenster.</i>")
         lines += [
@@ -4902,7 +4975,8 @@ def cmd_dedup_trades(parts: list = None):
                 lines.append(f"  … und {len(duplicate_info) - 20} weitere")
         lines += [
             "",
-            "⚙️ Zum Bereinigen: <code>/dedup_trades apply</code>",
+            "⚙️ Zum Bereinigen: /dedup_apply  (tippen/klicken)",
+            "   <i>oder Langform:</i> <code>/dedup_trades apply</code>",
             "📋 /status | /report",
         ]
         reply("\n".join(lines))
@@ -5003,6 +5077,29 @@ def poll_telegram_commands():
             cmd_queue_stats(parts)
         elif cmd == "/dedup_trades" or cmd == "/deduptrades":
             cmd_dedup_trades(parts)
+        elif cmd == "/dedup_apply" or cmd == "/dedupapply":
+            # Klick-Alias für /dedup_trades apply (Telegram erkennt /xxx
+            # automatisch als tippbaren Befehl, /xxx yyy aber nicht mehr).
+            cmd_dedup_trades(["/dedup_trades", "apply"])
+        elif cmd.startswith("/alarm_") or cmd.startswith("/harsi_") \
+             or cmd.startswith("/harsisl_") or cmd.startswith("/h2_") \
+             or cmd.startswith("/h4_"):
+            # Klick-Aliasse für cmd_alarm() — siehe _alarm_click_cmd() für
+            # das Format. Beispiele (alles lowercase nach Normalisierung):
+            #   /alarm_harsi_btcusdt_long  → /alarm harsi BTCUSDT LONG
+            #   /alarm_harsisl_ethusdt_short
+            #   /alarm_h2_solusdt_long
+            #   /alarm_h4_long             → /alarm h4 LONG
+            #   /harsi_btcusdt_long        → Kurzform (dasselbe)
+            if cmd.startswith("/alarm_"):
+                _suffix = cmd[len("/alarm_"):]
+            else:
+                _suffix = cmd[1:]  # führenden Slash entfernen
+            _tokens = [t for t in _suffix.split("_") if t]
+            if _tokens:
+                cmd_alarm(["/alarm"] + _tokens)
+            else:
+                cmd_alarm(["/alarm"])
         elif cmd == "/hilfe" or cmd == "/start" or cmd == "/help":
             cmd_hilfe()
         else:
@@ -6260,7 +6357,8 @@ def check_and_repair_position(pos: dict):
                         f"Script-Start: Position im Gewinn ({pnl_sign}{pnl}% Margin), "
                         f"kein SL gefunden\n"
                         f"SL: {sl_str} USDT (Schutz: kein Rückfall in Verlust)\n"
-                        f"⚠️ Mit Ausstiegslinie abgleichen!"
+                        f"⚠️ Mit Ausstiegslinie abgleichen!",
+                        reply_markup=build_setup_buttons(symbol),
                     )
                 else:
                     log(f"  ✗ SL-Floor fehlgeschlagen: {res.get('msg', res)}")
@@ -6278,7 +6376,10 @@ def check_and_repair_position(pos: dict):
                     })
             else:
                 log(f"  ⚠ Mark {mark} hinter Entry {avg} — SL auf Entry nicht setzbar")
-                telegram(f"⚠️ <b>{symbol}</b>: Position im Verlust, SL manuell setzen!")
+                telegram(
+                    f"⚠️ <b>{symbol}</b>: Position im Verlust, SL manuell setzen!",
+                    reply_markup=build_setup_buttons(symbol),
+                )
 
         else:
             # Kein TP passiert, kein Gewinn → Auto-SL auf -25% Margin
@@ -6301,14 +6402,16 @@ def check_and_repair_position(pos: dict):
                     f"🛡 <b>Auto-SL gesetzt — {symbol}</b>\n"
                     f"Script-Start: kein SL gefunden\n"
                     f"SL: {sl_str} USDT ({sl_dist:.1f}% Abstand)\n"
-                    f"⚠️ Bitte mit Ausstiegslinie abgleichen!"
+                    f"⚠️ Bitte mit Ausstiegslinie abgleichen!",
+                    reply_markup=build_setup_buttons(symbol),
                 )
             else:
                 log(f"  ✗ Auto-SL fehlgeschlagen: {res.get('msg', res)}")
                 telegram(
                     f"❌ <b>Kein SL — {symbol}</b>\n"
                     f"Auto-SL fehlgeschlagen. Bitte manuell setzen!\n"
-                    f"Empfehlung: {sl_str} USDT ({sl_dist:.1f}%)"
+                    f"Empfehlung: {sl_str} USDT ({sl_dist:.1f}%)",
+                    reply_markup=build_setup_buttons(symbol),
                 )
 
     sl_at_entry[symbol] = sl_is_entry
