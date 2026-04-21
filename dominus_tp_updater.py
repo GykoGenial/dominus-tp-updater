@@ -658,7 +658,7 @@ def sheets_log_trade(trade: dict):
             if ws is None:
                 return
             ts       = trade.get("ts", time.time())
-            dt       = datetime.utcfromtimestamp(ts)
+            dt       = datetime.fromtimestamp(ts, timezone.utc)
             pnl      = float(trade.get("net_pnl", 0))
             entry_px = float(trade.get("entry", 0))
             close_px = float(trade.get("close_price", 0))
@@ -708,7 +708,7 @@ def csv_log_trade(trade: dict):
     def _write():
         try:
             ts       = trade.get("ts", time.time())
-            dt       = datetime.utcfromtimestamp(ts)
+            dt       = datetime.fromtimestamp(ts, timezone.utc)
             pnl      = float(trade.get("net_pnl", 0))
             entry_px = float(trade.get("entry", 0))
             close_px = float(trade.get("close_price", 0))
@@ -3503,7 +3503,7 @@ def log_scored_entry(entry: dict) -> None:
                 dr     = entry.get("direction", "?")
                 tid    = f"{sym}_{dr}_{int(ts)}"
 
-                dt_iso = datetime.utcfromtimestamp(ts).strftime("%Y-%m-%dT%H:%M:%SZ")
+                dt_iso = datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
                 btc_d  = (entry.get("btc_dir") or "").lower()
                 t2_d   = (entry.get("t2_dir")  or "").lower()
@@ -3594,7 +3594,7 @@ def mark_trade_taken(symbol: str, direction: str,
 
         r = rows[target_idx]
         r["taken"]         = 1
-        r["ts_open"]       = datetime.utcfromtimestamp(now).strftime("%Y-%m-%dT%H:%M:%SZ")
+        r["ts_open"]       = datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         r["open_entry"]    = open_entry
         r["open_sl"]       = open_sl
         r["open_leverage"] = open_leverage
@@ -3665,7 +3665,7 @@ def update_entry_log_outcome(symbol: str, direction: str,
         except Exception:
             duration_sec = ""
 
-        r["ts_close"]     = datetime.utcfromtimestamp(ts_close).strftime("%Y-%m-%dT%H:%M:%SZ")
+        r["ts_close"]     = datetime.fromtimestamp(ts_close, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         r["duration_sec"] = duration_sec
         r["exit_price"]   = exit_price
         r["pnl_usdt"]     = round(float(pnl_usdt), 2)
@@ -4842,6 +4842,38 @@ def start_webhook_server():
         log("requirements.txt: flask hinzufügen")
         return
 
+    # ── Token-Redaction im Werkzeug-Access-Log ──────────────────
+    # Werkzeug loggt jedes eingehende POST /webhook?token=XYZ im Access-Log.
+    # Das landet in Railway → Token leakt jedes Mal wenn Logs geteilt/exportiert
+    # werden. Wir hängen einen Filter an den werkzeug-Logger, der jedes
+    # ?token=... durch ?token=*** ersetzt BEVOR die Zeile rausgeht.
+    # Defense-in-Depth: auch wenn TradingView-Alerts noch URL-Token schicken,
+    # wird der Token nie mehr geloggt.
+    import logging as _logging
+    import re as _re_log
+
+    class _TokenRedactFilter(_logging.Filter):
+        _TOKEN_PAT = _re_log.compile(r'(\?|&)token=[^\s"&]+', _re_log.IGNORECASE)
+
+        def filter(self, record: _logging.LogRecord) -> bool:
+            try:
+                # Werkzeug baut die Message aus record.msg + record.args zusammen
+                msg = record.getMessage()
+                # Case-insensitive Pre-Check (TradingView sendet immer klein,
+                # aber falls doch mal "Token=" o.ä. → trotzdem fangen)
+                if "token=" in msg.lower():
+                    redacted = self._TOKEN_PAT.sub(r'\1token=***REDACTED***', msg)
+                    # Wir überschreiben .msg und leeren .args, damit getMessage()
+                    # beim nächsten Aufruf die geänderte Version liefert.
+                    record.msg = redacted
+                    record.args = ()
+            except Exception:
+                pass
+            return True  # Zeile nicht verwerfen, nur modifizieren
+
+    _wz_logger = _logging.getLogger("werkzeug")
+    _wz_logger.addFilter(_TokenRedactFilter())
+
     app = Flask(__name__)
 
     @app.route("/webhook", methods=["POST"])
@@ -4887,7 +4919,11 @@ def start_webhook_server():
         token_body = str(data.get("token", ""))
         token      = token_url or token_body
         if WEBHOOK_SECRET and token != WEBHOOK_SECRET:
-            log(f"⚠ Webhook: Ungültiger Token (url='{token_url}' body='{token_body}')")
+            # Token NICHT ins Log — nur Länge + Quelle, damit man debuggen kann
+            # ohne den (womöglich echten) falschen Token zu persistieren.
+            _src = "url" if token_url else ("body" if token_body else "none")
+            _len = len(token) if token else 0
+            log(f"⚠ Webhook: Ungültiger Token (quelle={_src}, len={_len})")
             return jsonify({"status": "ignored", "reason": "unauthorized"}), 200
 
         # ── Verarbeitung im Hintergrund-Thread ────────────────
@@ -5014,7 +5050,7 @@ def start_webhook_server():
             save_state()
 
             _until_ts  = macro_extreme[_market]["until_ts"]
-            _until_str = datetime.utcfromtimestamp(_until_ts).strftime("%d.%m.%Y %H:%M UTC")
+            _until_str = datetime.fromtimestamp(_until_ts, timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
             log(f"📡 {_label} → {_state_txt} (Premium-Zone bis {_until_str})")
 
             # Offene Gegenpositionen: Hinweis, dass der Makro-Kontext umgeschlagen hat.
@@ -5459,11 +5495,18 @@ def start_webhook_server():
     @app.route("/", methods=["GET"])
     @app.route("/health", methods=["GET"])
     def health():
-        return jsonify({"status": "running", "version": "v4.18"}), 200
+        return jsonify({"status": "running", "version": "v4.21"}), 200
 
     port = _env_int("PORT", 8080)
+    # WICHTIG: Token NICHT ins Log schreiben — er landet sonst in Railway-Logs.
+    _tok_hint = (
+        f"gesetzt (len={len(WEBHOOK_SECRET)})"
+        if WEBHOOK_SECRET and WEBHOOK_SECRET != "dominus"
+        else "⚠ NICHT gesetzt (Default 'dominus' — bitte WEBHOOK_SECRET env-var setzen!)"
+    )
     log(f"Webhook-Server gestartet auf Port {port}")
-    log(f"Endpoint: /webhook?token={WEBHOOK_SECRET}")
+    log(f"Endpoint: POST /webhook  (Token: {_tok_hint})")
+    log("Token-Übergabe: Query-Param ?token=… ODER JSON-Body-Feld \"token\" — beides wird akzeptiert.")
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
 
