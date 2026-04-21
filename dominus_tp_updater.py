@@ -4492,6 +4492,8 @@ def cmd_hilfe():
         "   Beispiel: /trade ETHUSDT LONG 10 2850 2700\n"
         "/refresh [SYMBOL] — SL/TP/DCA sofort prüfen &amp; reparieren\n"
         "   Beispiel: /refresh BTCUSDT  (oder /refresh für alle)\n"
+        "/dedup_trades [apply] — Duplikate im Trade-Archiv suchen\n"
+        "   ohne Argument: Dry-Run | mit <code>apply</code>: bereinigen\n"
         "\n"
         "🔔 <b>Alarm-Vorlagen (Copy-Paste für TradingView):</b>\n"
         "/alarm — Übersicht + aktive HARSI-Fenster\n"
@@ -4745,6 +4747,205 @@ def build_daily_report(date_str: str = None) -> str:
     return "\n".join(lines)
 
 
+def cmd_dedup_trades(parts: list = None):
+    """
+    /dedup_trades [apply] — Räumt Duplikate aus dem Trade-Archiv.
+
+    Ohne Argument: DRY-RUN — zeigt gefundene Duplikate an, ändert nichts.
+    Mit `apply`:   Bereinigt trades.csv + In-Memory closed_trades[].
+
+    Duplikat-Definition: Gleicher Symbol + Richtung + Entry + Close + PnL
+    innerhalb eines 2-Stunden-Fensters (gleiche Schliessung, mehrfach durch
+    Railway-Restarts erfasst). Bei Match wird der **älteste** Eintrag behalten.
+    """
+    apply = bool(parts and len(parts) > 1 and parts[1].lower() in ("apply", "yes", "ja", "--apply"))
+
+    if not TRADES_CSV or not os.path.isfile(TRADES_CSV):
+        reply(f"❌ Kein Trade-Archiv gefunden unter <code>{TRADES_CSV}</code>")
+        return
+
+    # CSV einlesen
+    try:
+        with open(TRADES_CSV, "r", encoding="utf-8", newline="") as f:
+            reader = csv.reader(f, delimiter=";")
+            rows = list(reader)
+    except Exception as e:
+        reply(f"❌ CSV-Lesefehler: {e}")
+        return
+
+    if len(rows) < 2:
+        reply("ℹ️ Trade-Archiv ist leer — nichts zu bereinigen.")
+        return
+
+    header = rows[0]
+    data_rows = rows[1:]
+
+    # Spaltenindizes bestimmen
+    try:
+        idx_datum  = header.index("Datum")
+        idx_zeit   = header.index("Zeit (UTC)")
+        idx_sym    = header.index("Symbol")
+        idx_dir    = header.index("Richtung")
+        idx_entry  = header.index("Entry")
+        idx_close  = header.index("Close")
+        idx_pnl    = header.index("PnL USDT")
+    except ValueError as e:
+        reply(f"❌ CSV-Header unvollständig: {e}")
+        return
+
+    def _parse_ts(r):
+        try:
+            dt = datetime.strptime(
+                f"{r[idx_datum]} {r[idx_zeit]}", "%d.%m.%Y %H:%M"
+            ).replace(tzinfo=timezone.utc)
+            return int(dt.timestamp())
+        except Exception:
+            return 0
+
+    # Stabil nach Timestamp sortieren, Ursprungs-Index als Sekundärschlüssel
+    indexed = list(enumerate(data_rows))
+    indexed.sort(key=lambda x: (_parse_ts(x[1]), x[0]))
+
+    kept_rows      = []
+    duplicate_info = []   # Liste von (original_idx, kept_key, kept_ts, dup_ts)
+    seen           = {}   # key → (ts, list_index_in_kept_rows)
+    dedup_window   = 2 * 3600  # 2 h
+
+    def _key(r):
+        try:
+            return (
+                r[idx_sym].strip(),
+                r[idx_dir].strip().upper(),
+                round(float(r[idx_entry] or 0), 8),
+                round(float(r[idx_close] or 0), 8),
+                round(float(r[idx_pnl]  or 0), 4),
+            )
+        except Exception:
+            return (r[idx_sym].strip(), r[idx_dir].strip().upper(), r[idx_entry], r[idx_close], r[idx_pnl])
+
+    for orig_idx, r in indexed:
+        k   = _key(r)
+        ts  = _parse_ts(r)
+        prev = seen.get(k)
+        if prev and (ts - prev[0]) < dedup_window:
+            # Duplikat → verwerfen
+            duplicate_info.append({
+                "symbol":   r[idx_sym],
+                "direction": r[idx_dir],
+                "pnl":      r[idx_pnl],
+                "datum":    r[idx_datum],
+                "zeit":     r[idx_zeit],
+                "orig_ts":  datetime.fromtimestamp(prev[0], timezone.utc).strftime("%d.%m %H:%M"),
+            })
+            continue
+        seen[k] = (ts, len(kept_rows))
+        kept_rows.append(r)
+
+    removed = len(data_rows) - len(kept_rows)
+
+    # ── In-Memory closed_trades ebenfalls deduplizieren (gleiche Logik)
+    mem_removed = 0
+    global closed_trades
+    try:
+        mem_sorted = sorted(enumerate(closed_trades), key=lambda x: int(x[1].get("ts", 0) or 0))
+        mem_kept   = []
+        mem_seen   = {}
+        for orig_i, t in mem_sorted:
+            try:
+                mk = (
+                    str(t.get("symbol", "")),
+                    str(t.get("direction", "")).upper(),
+                    round(float(t.get("entry", 0) or 0), 8),
+                    round(float(t.get("close_price", 0) or 0), 8),
+                    round(float(t.get("net_pnl", 0) or 0), 4),
+                )
+            except Exception:
+                mk = (str(t.get("symbol", "")), str(t.get("direction", "")))
+            mts  = int(t.get("ts", 0) or 0)
+            prev = mem_seen.get(mk)
+            if prev and (mts - prev) < dedup_window:
+                mem_removed += 1
+                continue
+            mem_seen[mk] = mts
+            mem_kept.append(t)
+    except Exception as e:
+        log(f"[DEDUP] Memory-Dedup Fehler: {e}")
+        mem_kept = closed_trades
+
+    # DRY-RUN: nur Rapport
+    if not apply:
+        if removed == 0 and mem_removed == 0:
+            reply(
+                "✅ <b>Keine Duplikate gefunden.</b>\n"
+                f"• CSV-Zeilen:        {len(data_rows)}\n"
+                f"• Memory-Trades:     {len(closed_trades)}\n"
+                "\n"
+                "📋 /status | /report"
+            )
+            return
+        lines = [
+            "🔍 <b>DEDUP Dry-Run</b> (keine Änderungen geschrieben)",
+            "━━━━━━━━━━━━",
+            f"CSV:     {len(data_rows)} Zeilen → {len(kept_rows)} behalten, <b>{removed} Duplikate</b>",
+            f"Memory:  {len(closed_trades)} Trades → {len(mem_kept)} behalten, <b>{mem_removed} Duplikate</b>",
+        ]
+        if duplicate_info:
+            lines.append("")
+            lines.append("<b>Gefundene CSV-Duplikate:</b>")
+            for d in duplicate_info[:20]:
+                lines.append(
+                    f"  • {d['symbol']} {d['direction']} {d['pnl']} USDT "
+                    f"@ {d['datum']} {d['zeit']} "
+                    f"(Original: {d['orig_ts']})"
+                )
+            if len(duplicate_info) > 20:
+                lines.append(f"  … und {len(duplicate_info) - 20} weitere")
+        lines += [
+            "",
+            "⚙️ Zum Bereinigen: <code>/dedup_trades apply</code>",
+            "📋 /status | /report",
+        ]
+        reply("\n".join(lines))
+        return
+
+    # APPLY: Backup + bereinigte CSV schreiben
+    ts_tag     = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    backup_path = f"{TRADES_CSV}.backup_{ts_tag}.csv"
+    try:
+        import shutil as _shutil
+        _shutil.copy2(TRADES_CSV, backup_path)
+    except Exception as e:
+        reply(f"❌ Backup fehlgeschlagen, Abbruch: {e}")
+        return
+
+    try:
+        with open(TRADES_CSV, "w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f, delimiter=";")
+            writer.writerow(header)
+            # Original-Reihenfolge wiederherstellen (nach Timestamp sortieren)
+            kept_rows_sorted = sorted(kept_rows, key=_parse_ts)
+            writer.writerows(kept_rows_sorted)
+    except Exception as e:
+        reply(f"❌ CSV-Schreibfehler: {e}\nBackup liegt unter <code>{backup_path}</code>")
+        return
+
+    # Memory-Liste ersetzen
+    closed_trades = mem_kept
+
+    log(f"[DEDUP] apply: CSV {removed} entfernt, Memory {mem_removed} entfernt. Backup: {backup_path}")
+
+    reply(
+        "🧹 <b>Trade-Archiv bereinigt</b>\n"
+        "━━━━━━━━━━━━\n"
+        f"CSV:     {len(data_rows)} → {len(kept_rows)} Zeilen ({removed} Duplikate entfernt)\n"
+        f"Memory:  {len(data_rows)} → {len(mem_kept)} Trades ({mem_removed} Duplikate entfernt)\n"
+        "\n"
+        f"💾 Backup: <code>{backup_path}</code>\n"
+        "\n"
+        "📋 /status | /report"
+    )
+
+
 def cmd_report():
     """Sendet den täglichen P&L Report auf Telegram-Anfrage."""
     try:
@@ -4800,6 +5001,8 @@ def poll_telegram_commands():
             cmd_alarm(parts)
         elif cmd == "/queue_stats" or cmd == "/queuestats":
             cmd_queue_stats(parts)
+        elif cmd == "/dedup_trades" or cmd == "/deduptrades":
+            cmd_dedup_trades(parts)
         elif cmd == "/hilfe" or cmd == "/start" or cmd == "/help":
             cmd_hilfe()
         else:
