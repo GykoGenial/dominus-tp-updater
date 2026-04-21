@@ -258,7 +258,7 @@ import html
 import threading
 import requests
 import math
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 try:
     from flask import Flask, request as flask_request, jsonify
     FLASK_AVAILABLE = True
@@ -316,6 +316,7 @@ DOCS_URL           = os.environ.get("DOCS_URL", "https://GykoGenial.github.io/do
 GOOGLE_CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS", "")  # Service Account JSON als String
 GOOGLE_SHEET_ID    = os.environ.get("GOOGLE_SHEET_ID",    "")  # Spreadsheet ID aus URL
 TRADES_CSV         = os.environ.get("TRADES_CSV", "/app/data/trades.csv")  # Persistentes Trade-Archiv auf Railway Volume
+ENTRY_LOG_CSV      = os.environ.get("ENTRY_LOG_CSV", "/app/data/entry_queue_log.csv")  # Queue-Entscheidungen + Outcomes (v4.20)
 
 
 # v4.13: Robuste Env-Parser — Railway-Variablen können "" statt fehlend sein,
@@ -451,6 +452,14 @@ _entry_flush_started_ts    = 0.0          # time.time() beim Start des aktuellen
 # v4.19: Win-Rate Cache pro Symbol — {symbol: (wr, n_trades, expire_ts)}
 _winrate_cache: dict = {}
 _WINRATE_CACHE_TTL   = 3600               # 1h TTL
+
+# v4.20: Entry-Log Lock — schützt CSV-Read-Modify-Write Operationen
+_entry_log_lock = threading.Lock()
+# Maximales Alter (Sekunden) für mark_trade_taken() Matching eines
+# Queue-Eintrags zur tatsächlich eröffneten Position. User kann nach einem
+# Signal bis zu ~60 Min brauchen um /trade auszuführen — darüber hinaus
+# wird das Signal als "nicht genommen" gewertet.
+_ENTRY_MATCH_WINDOW_SEC = 60 * 60
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1743,6 +1752,21 @@ def handle_position_closed(symbol: str, reason: str = ""):
     closed_trades.append(_trade_record)
     csv_log_trade(_trade_record)     # → Railway Volume CSV (non-blocking, immer aktiv)
     sheets_log_trade(_trade_record)  # → Google Sheets (non-blocking, optional)
+    # v4.20: Queue-Log Outcome-Annotation — bindet R-Multiple, Duration etc.
+    # an die ursprüngliche Queue-Entscheidung (falls vorhanden). Kein Eintrag
+    # im Queue-Log → stillschweigendes No-Op (manuelle Trades ohne Signal).
+    try:
+        update_entry_log_outcome(
+            symbol        = symbol,
+            direction     = direction,
+            exit_price    = close_px or 0,
+            pnl_usdt      = net_pnl,
+            ts_close      = time.time(),
+            won           = won,
+            close_reason  = (reason or "unknown").strip() or "unknown",
+        )
+    except Exception as ex:
+        log(f"[update_entry_log_outcome] {ex}")
     save_state()
 
     # Internen Status zurücksetzen
@@ -2478,6 +2502,11 @@ def setup_new_trade(pos: dict):
             last_known_avg[symbol]  = entry
             last_known_size[symbol] = size
             new_trade_done[symbol]  = True
+            # v4.20: Queue-Log Outcome-Bindung (Fail-Pfad, ohne valides SL)
+            try:
+                mark_trade_taken(symbol, direction, entry, sl_price or 0, leverage)
+            except Exception as ex:
+                log(f"[mark_trade_taken] {ex}")
             return
 
     # ── Hebel-Empfehlung & R:R-Check ─────────────────────
@@ -2526,6 +2555,14 @@ def setup_new_trade(pos: dict):
     # new_trade_done IMMER setzen damit der Loop diesen Trade nicht nochmals
     # als Neu-Trade behandelt. Bei DCA-Fehler: Telegram-Warnung + /refresh empfehlen.
     new_trade_done[symbol] = True
+    # v4.20: Queue-Log Outcome-Bindung — matched die jüngste passende
+    # Queue-Zeile mit taken=1 + Open-Preisen. Wenn kein Queue-Eintrag
+    # vorhanden (manueller Trade ohne vorheriges Signal), ist das okay —
+    # mark_trade_taken() macht dann einen No-Op.
+    try:
+        mark_trade_taken(symbol, direction, entry, sl_price, leverage)
+    except Exception as ex:
+        log(f"[mark_trade_taken] {ex}")
     if not dca_results:
         log(f"  ⚠ DCA-Platzierung komplett fehlgeschlagen — /refresh {symbol} zum Nachholen")
         telegram(
@@ -3229,6 +3266,14 @@ def flush_entries() -> None:
         )
         n_premium = sum(1 for e in ranked if e["_scored"]["is_premium"])
 
+        # v4.20: Persistiert JEDES bewertete Signal (auch nicht-getradete)
+        # — essenziell für Survivorship-Bias-freie Score-Kalibrierung.
+        for e in ranked:
+            try:
+                log_scored_entry(e)
+            except Exception as ex:
+                log(f"[log_scored_entry] {ex}")
+
         try:
             balance = get_futures_balance()
         except Exception:
@@ -3319,6 +3364,545 @@ def format_ranked_list(ranked: list, balance: float, total: int) -> str:
     _anker = "sec-alarm3"
     lines.append(_doc_link(_anker, "Alarm 3/3b — HARSI Exit"))
     return "\n".join(lines)
+
+
+# ═══════════════════════════════════════════════════════════════
+# v4.20: ENTRY-QUEUE TRACKING
+#
+# Zweck: Jede vom Scorer bewertete Entscheidung (samt vollem Kontext)
+# wird in entry_queue_log.csv persistiert. Bei tatsächlicher Trade-
+# Eröffnung wird die zugehörige Zeile mit 'taken=1' + trade_id annotiert.
+# Beim Close wird der Outcome (exit_price, pnl, r_multiple, duration,
+# close_reason) zurückgeschrieben.
+#
+# Finanzmathematisches Fundament:
+#   • R-Multiple (R) = (exit − entry) / (entry − sl) für Long,
+#     negiert für Short. Macht Trades über Symbole/Hebel vergleichbar.
+#   • Expected Value: E[R] = Σ R_i / N — die eigentliche Metrik die
+#     maximiert werden soll (nicht bloße Win-Rate).
+#   • Wilson-LCB: ehrliche untere 95%-Schätzung der Win-Rate, robust
+#     gegen kleines N (verhindert z.B. 3/3 = "100% WR" Fehlinterpretation).
+#   • Kelly-Fraktion: f* = (p·b − (1−p)) / b wobei b = avg_R_win /
+#     |avg_R_loss|. Zeigt optimale Position-Gewichtung pro Setup-Klasse.
+#   • Survivorship-Bias-Control: auch NICHT getradete Kandidaten werden
+#     geloggt → Basis um zu erkennen ob die Auswahl-Entscheidung richtig
+#     war (Score 70 getraded vs. Score 50 übergangen → hätte Score 50
+#     profitabler abgeschnitten?).
+# ═══════════════════════════════════════════════════════════════
+
+_ENTRY_LOG_HEADER = [
+    # Identifikation
+    "ts_queue",          # ISO UTC — wann das Signal gescored wurde
+    "symbol",
+    "direction",
+    "trade_id",          # <symbol>_<direction>_<ts_queue_int>  (generiert bei enqueue)
+    # Score + Kontext
+    "score",             # 0–100
+    "is_premium",        # 0/1
+    "entry",
+    "sl",
+    "leverage",
+    "sl_pct",
+    "per_order",
+    "confirm_count",
+    "macro_ok",          # 0/1
+    "m_btc",             # 0/1 — BTC-Richtung matching
+    "m_t2",              # 0/1 — Total2-Richtung matching
+    "harsi_confirm",     # 0/1
+    "fresh_signal",      # 0/1
+    "wr",                # Win-Rate Lookup (0.0–1.0) zum Scoring-Zeitpunkt
+    "wr_n",              # Anzahl Trades hinter dieser WR
+    "breakdown",         # Komma-getrennte Score-Komponenten
+    # Ausführung (wird bei mark_trade_taken() gefüllt)
+    "taken",             # 0 wenn nicht getradet, 1 wenn Position eröffnet
+    "ts_open",           # ISO UTC der Positionseröffnung
+    "open_entry",        # Tatsächlicher Entry-Preis (kann vom vorgeschlagenen leicht abweichen)
+    "open_sl",           # Tatsächlich gesetzter SL
+    "open_leverage",     # Tatsächlicher Hebel
+    # Outcome (wird bei update_entry_log_outcome() gefüllt)
+    "ts_close",          # ISO UTC des Close
+    "duration_sec",      # Dauer zwischen Open und Close
+    "exit_price",        # Avg Close-Preis
+    "pnl_usdt",
+    "r_multiple",        # (exit − entry) / (entry − sl), Long-Konvention
+    "won",               # 0/1
+    "close_reason",      # TP1/TP2/TP3/TP4/SL/HARSI/manual/unknown
+]
+
+
+def _parse_iso_utc(s: str) -> float:
+    """Parst ISO-UTC-String (z.B. '2026-04-21T00:00:00Z') zu Unix-Timestamp.
+    Wichtig: .timestamp() auf naiver datetime interpretiert als LOKAL —
+    darum explizit UTC-TZ setzen, damit Railway-Container (UTC) und lokale
+    Dev-Umgebung dasselbe Ergebnis liefern. Raises bei invalidem Format."""
+    return datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(
+        tzinfo=timezone.utc).timestamp()
+
+
+def _entry_log_ensure_file() -> None:
+    """Legt die Log-CSV an falls nicht vorhanden (mit Header)."""
+    if not ENTRY_LOG_CSV:
+        return
+    try:
+        os.makedirs(os.path.dirname(ENTRY_LOG_CSV), exist_ok=True)
+    except Exception:
+        pass
+    if not os.path.isfile(ENTRY_LOG_CSV):
+        try:
+            with open(ENTRY_LOG_CSV, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f, delimiter=";")
+                writer.writerow(_ENTRY_LOG_HEADER)
+        except Exception as ex:
+            log(f"[entry_log_ensure_file] {ex}")
+
+
+def _entry_log_read_all() -> list:
+    """Liest die Queue-Log-CSV als list[dict]. Gibt [] zurück wenn Datei fehlt."""
+    if not ENTRY_LOG_CSV or not os.path.isfile(ENTRY_LOG_CSV):
+        return []
+    try:
+        with open(ENTRY_LOG_CSV, "r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f, delimiter=";")
+            return list(reader)
+    except Exception as ex:
+        log(f"[entry_log_read_all] {ex}")
+        return []
+
+
+def _entry_log_write_all(rows: list) -> None:
+    """Schreibt alle Zeilen zurück (überschreibt). Caller MUSS _entry_log_lock halten."""
+    if not ENTRY_LOG_CSV:
+        return
+    try:
+        os.makedirs(os.path.dirname(ENTRY_LOG_CSV), exist_ok=True)
+        tmp_path = ENTRY_LOG_CSV + ".tmp"
+        with open(tmp_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=_ENTRY_LOG_HEADER, delimiter=";",
+                                     extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(rows)
+        os.replace(tmp_path, ENTRY_LOG_CSV)
+    except Exception as ex:
+        log(f"[entry_log_write_all] {ex}")
+
+
+def log_scored_entry(entry: dict) -> None:
+    """Persistiert ein gescortes Queue-Signal (non-blocking via Thread).
+    Wird aus flush_entries() für jeden Kandidaten gerufen — auch für die,
+    die nicht getradet werden (→ Survivorship-Bias-Kontrolle)."""
+
+    def _write():
+        with _entry_log_lock:
+            _entry_log_ensure_file()
+            try:
+                s      = entry.get("_scored") or {}
+                sugg   = entry.get("sugg") or {}
+                tags   = entry.get("tags") or {}
+                ts     = entry.get("timestamp") or time.time()
+                sym    = entry.get("symbol", "?")
+                dr     = entry.get("direction", "?")
+                tid    = f"{sym}_{dr}_{int(ts)}"
+
+                dt_iso = datetime.utcfromtimestamp(ts).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+                btc_d  = (entry.get("btc_dir") or "").lower()
+                t2_d   = (entry.get("t2_dir")  or "").lower()
+
+                def _dir_ok(d: str) -> int:
+                    if dr == "long":  return 1 if d in ("long", "recovering") else 0
+                    if dr == "short": return 1 if d in ("short", "recovering_short") else 0
+                    return 0
+
+                row = {
+                    "ts_queue":       dt_iso,
+                    "symbol":         sym,
+                    "direction":      dr,
+                    "trade_id":       tid,
+                    "score":          s.get("score", 0),
+                    "is_premium":     1 if s.get("is_premium") else 0,
+                    "entry":          entry.get("entry", 0),
+                    "sl":             sugg.get("sl", 0),
+                    "leverage":       sugg.get("leverage", 0),
+                    "sl_pct":         round(float(sugg.get("sl_dist_pct", 0) or 0), 3),
+                    "per_order":      round(float(sugg.get("per_order", 0) or 0), 2),
+                    "confirm_count":  entry.get("confirm_count", 1),
+                    "macro_ok":       1 if tags.get("macro_ok") else 0,
+                    "m_btc":          _dir_ok(btc_d),
+                    "m_t2":           _dir_ok(t2_d),
+                    "harsi_confirm":  1 if tags.get("harsi_confirm") else 0,
+                    "fresh_signal":   1 if tags.get("fresh_signal") else 0,
+                    "wr":             round(float(s.get("wr", 0) or 0), 4),
+                    "wr_n":           int(s.get("wr_n", 0) or 0),
+                    "breakdown":      " | ".join(s.get("breakdown") or []),
+                    # Ausführung + Outcome bleiben leer bis mark_trade_taken /
+                    # update_entry_log_outcome angerufen werden.
+                    "taken": 0, "ts_open": "", "open_entry": "", "open_sl": "",
+                    "open_leverage": "", "ts_close": "", "duration_sec": "",
+                    "exit_price": "", "pnl_usdt": "", "r_multiple": "",
+                    "won": "", "close_reason": "",
+                }
+
+                with open(ENTRY_LOG_CSV, "a", newline="", encoding="utf-8") as f:
+                    writer = csv.DictWriter(f, fieldnames=_ENTRY_LOG_HEADER,
+                                             delimiter=";", extrasaction="ignore")
+                    writer.writerow(row)
+            except Exception as ex:
+                log(f"[log_scored_entry] {ex}")
+
+    threading.Thread(target=_write, daemon=True).start()
+
+
+def mark_trade_taken(symbol: str, direction: str,
+                      open_entry: float, open_sl: float,
+                      open_leverage: int) -> None:
+    """Wenn eine Position aufmacht, wird die jüngste passende
+    (symbol+direction, taken=0, score innerhalb _ENTRY_MATCH_WINDOW_SEC)
+    Zeile im Queue-Log auf taken=1 gesetzt und mit Open-Preisen annotiert.
+    Gibt es keinen passenden Queue-Eintrag (z.B. manueller Trade ohne
+    vorheriges Signal), passiert nichts — der Trade wird nur im trades.csv
+    archiviert, nicht im Queue-Log."""
+    if not ENTRY_LOG_CSV:
+        return
+    with _entry_log_lock:
+        rows = _entry_log_read_all()
+        if not rows:
+            return
+        now = time.time()
+        cutoff_ts_ns = now - _ENTRY_MATCH_WINDOW_SEC
+
+        # jüngste matchende pending Zeile finden (rückwärts iterieren)
+        target_idx = -1
+        for i in range(len(rows) - 1, -1, -1):
+            r = rows[i]
+            if r.get("symbol") != symbol:          continue
+            if r.get("direction") != direction:    continue
+            if str(r.get("taken", "0")) == "1":    continue
+            # Timestamp parsen
+            try:
+                ts_q = _parse_iso_utc(r.get("ts_queue", ""))
+            except Exception:
+                continue
+            if ts_q < cutoff_ts_ns:
+                break  # älter als Fenster → abbrechen
+            target_idx = i
+            break
+
+        if target_idx < 0:
+            log(f"[mark_trade_taken] kein Queue-Eintrag für "
+                f"{symbol} {direction} in {_ENTRY_MATCH_WINDOW_SEC//60} Min gefunden")
+            return
+
+        r = rows[target_idx]
+        r["taken"]         = 1
+        r["ts_open"]       = datetime.utcfromtimestamp(now).strftime("%Y-%m-%dT%H:%M:%SZ")
+        r["open_entry"]    = open_entry
+        r["open_sl"]       = open_sl
+        r["open_leverage"] = open_leverage
+        _entry_log_write_all(rows)
+        log(f"[mark_trade_taken] {symbol} {direction} → Queue-Eintrag markiert (score={r.get('score')})")
+
+
+def calc_r_multiple(entry: float, sl: float, exit_price: float,
+                     direction: str) -> float:
+    """R-Multiple = Profit/Loss in Einheiten des initialen Risikos.
+    Long:  R = (exit - entry) / (entry - sl)   [sl < entry → entry-sl > 0]
+    Short: R = (entry - exit) / (sl - entry)   [sl > entry → sl-entry > 0]
+    Macht Trades über Symbole, Hebel und Positionsgrößen vergleichbar.
+    Unabhängig vom Hebel — R misst den SL-Abstand als Risiko-Einheit."""
+    try:
+        entry = float(entry); sl = float(sl); exit_price = float(exit_price)
+    except Exception:
+        return 0.0
+    if direction == "long":
+        risk = entry - sl
+        return (exit_price - entry) / risk if risk > 0 else 0.0
+    else:
+        risk = sl - entry
+        return (entry - exit_price) / risk if risk > 0 else 0.0
+
+
+def update_entry_log_outcome(symbol: str, direction: str,
+                              exit_price: float, pnl_usdt: float,
+                              ts_close: float, won: bool,
+                              close_reason: str = "unknown") -> None:
+    """Annotiert die jüngste getakte (taken=1, exit_price="") Zeile im
+    Queue-Log mit Close-Daten. Wird direkt nach csv_log_trade() in der
+    Close-Routine aufgerufen."""
+    if not ENTRY_LOG_CSV:
+        return
+    with _entry_log_lock:
+        rows = _entry_log_read_all()
+        if not rows:
+            return
+
+        target_idx = -1
+        for i in range(len(rows) - 1, -1, -1):
+            r = rows[i]
+            if r.get("symbol") != symbol:          continue
+            if r.get("direction") != direction:    continue
+            if str(r.get("taken", "0")) != "1":    continue
+            if r.get("exit_price", "") != "":      continue
+            target_idx = i
+            break
+
+        if target_idx < 0:
+            log(f"[update_entry_log_outcome] kein offener Queue-Eintrag "
+                f"für {symbol} {direction} gefunden — Close nicht im Queue-Log annotiert")
+            return
+
+        r = rows[target_idx]
+        try:
+            open_entry = float(r.get("open_entry") or r.get("entry") or 0)
+            open_sl    = float(r.get("open_sl")    or r.get("sl")    or 0)
+            r_mult     = calc_r_multiple(open_entry, open_sl, float(exit_price),
+                                           direction)
+        except Exception:
+            r_mult = 0.0
+
+        try:
+            ts_open = _parse_iso_utc(r.get("ts_open", ""))
+            duration_sec = int(ts_close - ts_open)
+        except Exception:
+            duration_sec = ""
+
+        r["ts_close"]     = datetime.utcfromtimestamp(ts_close).strftime("%Y-%m-%dT%H:%M:%SZ")
+        r["duration_sec"] = duration_sec
+        r["exit_price"]   = exit_price
+        r["pnl_usdt"]     = round(float(pnl_usdt), 2)
+        r["r_multiple"]   = round(r_mult, 3)
+        r["won"]          = 1 if won else 0
+        r["close_reason"] = close_reason
+        _entry_log_write_all(rows)
+        log(f"[update_entry_log_outcome] {symbol} {direction} → R={r_mult:+.2f} "
+            f"({close_reason})")
+
+
+# ── Statistik-Helfer ───────────────────────────────────────────
+
+def _wilson_lower_bound(successes: int, n: int, z: float = 1.96) -> float:
+    """Untere Grenze des 95%-Wilson-Konfidenzintervalls für eine Erfolgsrate.
+    Robust bei kleinem N — verhindert Fehlschlüsse aus wenigen Beobachtungen.
+    n=0 → 0.0; 3/3 → ≈0.29 (nicht 1.0); 30/40 → ≈0.60 (nicht 0.75)."""
+    if n <= 0:
+        return 0.0
+    p = successes / n
+    denom = 1 + (z**2) / n
+    centre = p + (z**2) / (2 * n)
+    adj = z * math.sqrt((p * (1 - p) + (z**2) / (4 * n)) / n)
+    return max(0.0, (centre - adj) / denom)
+
+
+def _kelly_fraction(p_win: float, avg_r_win: float, avg_r_loss_abs: float) -> float:
+    """Kelly-Fraktion für ein Setup mit gegebener Win-Prob und R-Verteilung.
+    f* = (p·b − (1−p)) / b   mit   b = avg_R_win / |avg_R_loss|
+    Negativer Kelly → Setup ist finanzmathematisch unrentabel (nicht traden).
+    Cap bei 0.25 (25%) um Fat-Tail-Risiken abzufedern."""
+    if avg_r_loss_abs <= 0 or avg_r_win <= 0:
+        return 0.0
+    b = avg_r_win / avg_r_loss_abs
+    f = (p_win * b - (1 - p_win)) / b
+    return max(-1.0, min(0.25, f))
+
+
+def _queue_rows_completed(rows: list, days: int = 30) -> list:
+    """Filtert Zeilen: nur getradete mit vorhandenem Outcome, innerhalb letzter N Tage."""
+    cutoff = time.time() - days * 86400
+    out = []
+    for r in rows:
+        if str(r.get("taken", "0")) != "1":
+            continue
+        if r.get("r_multiple", "") in ("", None):
+            continue
+        try:
+            ts_q = _parse_iso_utc(r.get("ts_queue", ""))
+        except Exception:
+            continue
+        if ts_q < cutoff:
+            continue
+        out.append(r)
+    return out
+
+
+def _bucket_stats(rows: list, bucket_fn) -> dict:
+    """Gruppiert Zeilen nach bucket_fn(row) und berechnet Stats pro Bucket:
+    {bucket: {n, wins, wr, wilson_lcb, avg_r, e_r, kelly}}"""
+    buckets = {}
+    for r in rows:
+        try:
+            key = bucket_fn(r)
+        except Exception:
+            continue
+        if key is None:
+            continue
+        buckets.setdefault(key, []).append(r)
+
+    out = {}
+    for key, brows in buckets.items():
+        n = len(brows)
+        try:
+            rs = [float(x.get("r_multiple", 0) or 0) for x in brows]
+        except Exception:
+            rs = []
+        wins    = sum(1 for x in brows if str(x.get("won", "0")) == "1")
+        avg_r   = sum(rs) / n if n else 0.0
+        wr      = wins / n if n else 0.0
+        wilson  = _wilson_lower_bound(wins, n)
+        wins_r  = [r for r in rs if r > 0]
+        losses_r = [abs(r) for r in rs if r < 0]
+        avg_win  = sum(wins_r) / len(wins_r) if wins_r else 0.0
+        avg_loss = sum(losses_r) / len(losses_r) if losses_r else 0.0
+        kelly   = _kelly_fraction(wr, avg_win, avg_loss)
+        out[key] = {"n": n, "wins": wins, "wr": wr, "wilson": wilson,
+                     "avg_r": avg_r, "e_r": avg_r, "kelly": kelly,
+                     "avg_win": avg_win, "avg_loss": avg_loss}
+    return out
+
+
+def _score_bucket(r: dict) -> str:
+    """Score-Bucket für Attribution."""
+    try:
+        s = int(r.get("score", 0) or 0)
+    except Exception:
+        return "?"
+    if s <= 20:  return "00–20"
+    if s <= 40:  return "21–40"
+    if s <= 60:  return "41–60"
+    if s <= 80:  return "61–80"
+    return "81–100"
+
+
+def queue_stats_report(days: int = 30) -> str:
+    """Baut den HTML-Report für /queue_stats — liest entry_queue_log.csv,
+    aggregiert nach R-Multiple und gibt die wichtigsten Kennzahlen aus."""
+    if not ENTRY_LOG_CSV or not os.path.isfile(ENTRY_LOG_CSV):
+        return ("📊 <b>Queue-Stats</b>\n\n"
+                "<i>Noch keine Daten — Queue-Log-CSV existiert nicht oder ist leer.</i>")
+
+    with _entry_log_lock:
+        rows = _entry_log_read_all()
+
+    if not rows:
+        return "📊 <b>Queue-Stats</b>\n\n<i>Noch keine Queue-Einträge.</i>"
+
+    # Alle Signale der letzten N Tage
+    cutoff = time.time() - days * 86400
+    recent = []
+    for r in rows:
+        try:
+            ts_q = _parse_iso_utc(r.get("ts_queue", ""))
+        except Exception:
+            continue
+        if ts_q >= cutoff:
+            recent.append(r)
+
+    n_total  = len(recent)
+    n_taken  = sum(1 for r in recent if str(r.get("taken", "0")) == "1")
+    n_prem   = sum(1 for r in recent if str(r.get("is_premium", "0")) == "1")
+    take_rate = (n_taken / n_total * 100) if n_total else 0.0
+
+    completed = _queue_rows_completed(rows, days=days)
+    n_c = len(completed)
+
+    lines = [
+        f"📊 <b>Queue-Stats — letzte {days} Tage</b>",
+        "━━━━━━━━━━━━",
+        f"Signale: <b>{n_total}</b>  ·  getradet: <b>{n_taken}</b> "
+        f"({take_rate:.0f}%)  ·  ⭐ Premium: <b>{n_prem}</b>",
+    ]
+
+    if n_c == 0:
+        lines.append("")
+        lines.append("<i>Noch keine geschlossenen Trades im Zeitraum — "
+                     "Stats erscheinen sobald die ersten Positionen schließen.</i>")
+        return "\n".join(lines)
+
+    # ── Gesamt-Performance ────────────────────────────────
+    rs      = [float(r.get("r_multiple", 0) or 0) for r in completed]
+    wins    = sum(1 for r in completed if str(r.get("won", "0")) == "1")
+    wr      = wins / n_c
+    wilson  = _wilson_lower_bound(wins, n_c)
+    avg_r   = sum(rs) / n_c
+    wins_r  = [r for r in rs if r > 0]
+    loss_r  = [abs(r) for r in rs if r < 0]
+    avg_win = sum(wins_r) / len(wins_r) if wins_r else 0.0
+    avg_los = sum(loss_r) / len(loss_r) if loss_r else 0.0
+    kelly   = _kelly_fraction(wr, avg_win, avg_los)
+    total_pnl = sum(float(r.get("pnl_usdt", 0) or 0) for r in completed)
+
+    lines.extend([
+        "",
+        f"<b>Geschlossene Trades: {n_c}</b>",
+        f"  Win-Rate   : <b>{wr*100:.1f}%</b>  "
+        f"(Wilson 95% LCB: {wilson*100:.1f}%)",
+        f"  E[R]       : <b>{avg_r:+.2f}R</b>  "
+        f"(pro Trade, risiko-normalisiert)",
+        f"  Avg Win/Loss: +{avg_win:.2f}R / −{avg_los:.2f}R",
+        f"  Kelly f*   : <b>{kelly*100:.1f}%</b> "
+        f"({'traden' if kelly > 0 else '⚠ unprofitabel'})",
+        f"  Netto PnL  : {total_pnl:+.2f} USDT",
+    ])
+
+    # ── Score-Bucket Attribution ──────────────────────────
+    by_score = _bucket_stats(completed, _score_bucket)
+    if by_score:
+        lines.append("")
+        lines.append("<b>Score-Buckets</b> (Attribution der Gewichte)")
+        for key in ["81–100", "61–80", "41–60", "21–40", "00–20"]:
+            b = by_score.get(key)
+            if not b:
+                continue
+            marker = " ⚠" if b["n"] < 5 else ""
+            lines.append(
+                f"  {key}: n={b['n']}{marker} · WR {b['wr']*100:.0f}% · "
+                f"E[R] <b>{b['e_r']:+.2f}</b>"
+            )
+        if any(b["n"] < 5 for b in by_score.values()):
+            lines.append("  <i>⚠ n&lt;5 — statistisch nicht belastbar</i>")
+
+    # ── Premium vs. Regular ───────────────────────────────
+    by_prem = _bucket_stats(completed, lambda r: "Premium" if str(r.get("is_premium", "0")) == "1" else "Regular")
+    if len(by_prem) >= 1:
+        lines.append("")
+        lines.append("<b>Premium vs. Regular</b>")
+        for key in ["Premium", "Regular"]:
+            b = by_prem.get(key)
+            if not b:
+                continue
+            marker = " ⚠" if b["n"] < 5 else ""
+            lines.append(
+                f"  {key}: n={b['n']}{marker} · WR {b['wr']*100:.0f}% · "
+                f"E[R] <b>{b['e_r']:+.2f}</b> · Kelly {b['kelly']*100:.0f}%"
+            )
+
+    # ── Close-Reason Breakdown ─────────────────────────────
+    by_reason = _bucket_stats(completed, lambda r: (r.get("close_reason") or "unknown").upper())
+    if by_reason:
+        lines.append("")
+        lines.append("<b>Close-Gründe</b>")
+        for key, b in sorted(by_reason.items(), key=lambda kv: -kv[1]["n"]):
+            lines.append(f"  {key}: n={b['n']} · E[R] {b['e_r']:+.2f}")
+
+    lines.append("")
+    lines.append("━━━━━━━━━━━━")
+    lines.append("💡 <i>E[R] ist die Leitmetrik. Score-Buckets mit "
+                 "negativem E[R] → Gewichte reviewen.</i>")
+
+    return "\n".join(lines)
+
+
+def cmd_queue_stats(parts: list = None):
+    """Telegram-Command /queue_stats [tage]  — Default: 30 Tage."""
+    days = 30
+    if parts and len(parts) >= 2:
+        try:
+            days = max(1, min(365, int(parts[1])))
+        except Exception:
+            pass
+    try:
+        msg = queue_stats_report(days=days)
+    except Exception as ex:
+        msg = f"❌ <b>Queue-Stats Fehler</b>\n<code>{html.escape(str(ex))}</code>"
+    telegram(msg)
 
 
 def cmd_trade(parts: list):
@@ -3866,6 +4450,7 @@ def cmd_hilfe():
         "/berechnen — Kontostand + Money-Management + Chart-Links\n"
         "/makro — BTC &amp; Total2 Impuls-Richtung + Trade-Erlaubnis\n"
         "/report — Tages- &amp; Monats-P&amp;L Report\n"
+        "/queue_stats [tage] — Entry-Queue Auswertung (E[R], Kelly, Score-Buckets)\n"
         "\n"
         "⚙️ <b>Aktionen:</b>\n"
         "/trade SYMBOL LONG|SHORT HEBEL ENTRY SL\n"
@@ -4179,6 +4764,8 @@ def poll_telegram_commands():
             cmd_report()
         elif cmd == "/alarm":
             cmd_alarm(parts)
+        elif cmd == "/queue_stats" or cmd == "/queuestats":
+            cmd_queue_stats(parts)
         elif cmd == "/hilfe" or cmd == "/start" or cmd == "/help":
             cmd_hilfe()
         else:
