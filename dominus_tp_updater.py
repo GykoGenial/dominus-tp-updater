@@ -1614,6 +1614,21 @@ def get_closed_pnl(symbol: str, since_ms: int) -> dict:
     prices = [float(f.get("price", 0) or 0) for f in close_fills if float(f.get("price",0))>0]
     avg_close = sum(prices) / len(prices) if prices else 0
 
+    # Haltedauer = Zeit zwischen Trade-Öffnung (since_ms) und letztem Close-Fill.
+    # Bitget liefert cTime (ms) pro Fill. Falls nicht vorhanden, bleibt hold_time=0
+    # und der Report zeigt "?" (altes Fallback-Verhalten).
+    close_times = []
+    for f in close_fills:
+        ct = f.get("cTime") or f.get("ctime") or 0
+        try:
+            ct_int = int(ct)
+        except (TypeError, ValueError):
+            ct_int = 0
+        if ct_int > 0:
+            close_times.append(ct_int)
+    last_close_ts = max(close_times) if close_times else 0
+    hold_time_ms  = (last_close_ts - since_ms) if (last_close_ts and since_ms and last_close_ts > since_ms) else 0
+
     # Einzelne Schliessungen für Detail-Bericht
     tp_closes = []
     for f in close_fills:
@@ -1634,6 +1649,7 @@ def get_closed_pnl(symbol: str, since_ms: int) -> dict:
         "total_size":   total_size,
         "tp_closes":    tp_closes,
         "num_closes":   len(close_fills),
+        "hold_time":    hold_time_ms,
     }
 
 
@@ -1749,9 +1765,27 @@ def handle_position_closed(symbol: str, reason: str = ""):
         "trailing_level": trailing_sl_level.get(symbol, 0),
         "won":            won,
     }
-    closed_trades.append(_trade_record)
-    csv_log_trade(_trade_record)     # → Railway Volume CSV (non-blocking, immer aktiv)
-    sheets_log_trade(_trade_record)  # → Google Sheets (non-blocking, optional)
+
+    # Dedup: Nach Railway-Restart wird handle_position_closed() manchmal
+    # mehrfach für denselben Trade ausgelöst. Wenn bereits ein Record mit
+    # identischem (Symbol, peak_size, net_pnl, entry) innerhalb der letzten
+    # 2 h existiert, ist es dieselbe Schliessung → Eintrag überspringen.
+    _dedup_window = 2 * 3600  # Sekunden
+    _now_ts = int(time.time())
+    _duplicate = any(
+        r.get("symbol") == symbol
+        and abs(float(r.get("peak_size", 0) or 0) - float(peak_size or 0)) < 1e-9
+        and round(float(r.get("net_pnl", 0) or 0), 4) == round(float(net_pnl or 0), 4)
+        and abs(float(r.get("entry", 0) or 0) - float(entry or 0)) < 1e-12
+        and (_now_ts - int(r.get("ts", 0))) < _dedup_window
+        for r in closed_trades
+    )
+    if _duplicate:
+        log(f"  ⚠ Doppelter Close erkannt ({symbol}, {net_pnl:+.2f} USDT) — Eintrag übersprungen")
+    else:
+        closed_trades.append(_trade_record)
+        csv_log_trade(_trade_record)     # → Railway Volume CSV (non-blocking, immer aktiv)
+        sheets_log_trade(_trade_record)  # → Google Sheets (non-blocking, optional)
     # v4.20: Queue-Log Outcome-Annotation — bindet R-Multiple, Duration etc.
     # an die ursprüngliche Queue-Entscheidung (falls vorhanden). Kein Eintrag
     # im Queue-Log → stillschweigendes No-Op (manuelle Trades ohne Signal).
