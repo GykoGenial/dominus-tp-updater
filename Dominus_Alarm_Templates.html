@@ -65,6 +65,23 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#111114;color:#de
 .trailing-box.t2{background:#0d2820;color:#4ECBA0}
 .trailing-box.t3{background:#0e1f33;color:#7BB8F5}
 .trailing-arrow{font-size:16px;color:#b0b0a8;text-align:center}
+/* ---- Setup / Token-Input ---- */
+.setup-card{border-left:3px solid #4ECBA0}
+.token-row{display:flex;gap:8px;align-items:stretch;flex-wrap:wrap}
+.token-input{flex:1 1 280px;min-width:240px;background:#0a0a0c;color:#e8e8e0;border:1px solid rgba(78,203,160,0.35);border-radius:8px;padding:10px 12px;font-family:'SF Mono','Fira Mono',monospace;font-size:13px;letter-spacing:.02em;outline:none;transition:border-color .15s,box-shadow .15s}
+.token-input:focus{border-color:#4ECBA0;box-shadow:0 0 0 2px rgba(78,203,160,0.15)}
+.token-input.has-token{border-color:#4ECBA0;background:#0e1912}
+.token-btn{background:#0d2820;color:#4ECBA0;border:1px solid rgba(78,203,160,0.35);border-radius:8px;padding:10px 14px;font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap;transition:.15s;font-family:inherit}
+.token-btn:hover{background:#163d2f;color:#7ed8b3}
+.token-btn.danger{color:#F07070;border-color:rgba(240,112,112,0.35);background:#2e1616}
+.token-btn.danger:hover{background:#451f1f;color:#ff8a8a}
+.token-toggle{background:#252528;color:#888;border:1px solid rgba(255,255,255,0.1);border-radius:6px;padding:4px 10px;font-size:11px;cursor:pointer;font-family:inherit}
+.token-toggle:hover{background:#353539;color:#deded8}
+.token-status{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:500;padding:4px 10px;border-radius:6px;margin-top:4px}
+.token-status.ok{background:#0e2010;color:#5EC45E}
+.token-status.warn{background:#2a1c08;color:#E09040}
+.field-value.mono.token-set{border-left:2px solid #4ECBA0}
+.field-value.mono.token-placeholder{border-left:2px dashed #E09040}
 /* ---- Responsive Breakpoints ---- */
 /* Tablets / kleinere Desktops */
 @media(max-width:900px){
@@ -134,13 +151,128 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#111114;color:#de
 <div class="page-title">DOMINUS Alarm-Templates</div>
 <div class="page-sub">TradingView &rarr; Railway Webhook &rarr; Telegram &middot; DOM-ORC v2.4 &middot; Railway v4.21 &mdash; Dark Mode &mdash; Stand April 2026</div>
 
+<!-- ======================================== -->
+<!-- 1. EINSTELLUNGEN / SETUP                  -->
+<!-- ======================================== -->
+<div class="card setup-card" id="sec-setup">
+  <div class="card-head">
+    <div class="step-badge" style="background:#0d2820;color:#4ECBA0">&#x2699;</div>
+    <div>
+      <div class="h2">1 &middot; Einstellungen</div>
+      <div class="sub">Token einmal eingeben &mdash; alle JSON-Templates unten werden live aktualisiert</div>
+    </div>
+  </div>
+
+  <!-- TOKEN-INPUT -->
+  <div class="field">
+    <div class="field-label" style="justify-content:space-between;align-items:center">
+      <span>&#x1F511; Dein WEBHOOK_SECRET (aus Railway &rarr; Variables)</span>
+      <button class="token-toggle" id="token-visibility-btn" onclick="toggleTokenVisibility()">Anzeigen</button>
+    </div>
+    <div class="token-row">
+      <input type="password" id="token-input" class="token-input" placeholder="Hier deinen echten WEBHOOK_SECRET einf&uuml;gen&hellip;" autocomplete="off" spellcheck="false" />
+      <button class="token-btn" onclick="saveToken()">Speichern</button>
+      <button class="token-btn danger" onclick="clearToken()">L&ouml;schen</button>
+    </div>
+    <div id="token-status" class="token-status warn">&#x26A0; Kein Token gesetzt &mdash; JSONs zeigen den Platzhalter <code>DEIN_WEBHOOK_SECRET</code></div>
+    <div style="margin-top:8px;font-size:11px;color:#666;line-height:1.5">
+      &#x1F6E1; Der Token wird <b>ausschliesslich lokal</b> in deinem Browser gespeichert (<code>localStorage</code>) &mdash; nie an einen Server geschickt, nie in die HTML-Datei geschrieben. Bei jedem Klick auf <em>Kopieren</em> wird automatisch dein echter Token statt des Platzhalters ins Clipboard gelegt.
+    </div>
+  </div>
+
+  <!-- WEBHOOK-URL -->
+  <div class="field">
+    <div class="field-label">
+      <span>&#x26A1; Webhook-URL (in jeden TradingView-Alarm einf&uuml;gen)</span>
+      <button class="copy-btn" onclick="copyField('wh-url',this)">Kopieren</button>
+    </div>
+    <div class="webhook-url" id="wh-url">https://dominus-tp-updater-production.up.railway.app/webhook</div>
+    <div style="margin-top:8px;font-size:11.5px;color:#888;line-height:1.5">
+      &#x1F512; <b>Token liegt ab v4.21 im JSON-Body</b>, nicht mehr in der URL &mdash; die obige URL enth&auml;lt <em>kein</em> <code>?token=</code> mehr. Je nach Alarm-Typ kommt der Token aus <b>zwei</b> Quellen:
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px">
+      <!-- Pfad A: Pine-basiert -->
+      <div style="background:#0d1a0d;border:1px solid #2a4a2a;border-radius:10px;padding:10px 12px">
+        <div style="font-size:11px;font-weight:700;color:#5EC45E;text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px">&#x2705; Pine-basiert &mdash; Token automatisch</div>
+        <div style="font-size:12px;color:#B8B8C0;line-height:1.55">
+          Alarme vom Typ <code>Any alert() function call</code> (z.&#8239;B. <b>4c</b>, <b>5c</b>, <b>Sling-SL Universal</b>): Der Token steht im <b>Indikator-Setting</b> <code>webhook_token</code> des <code>Dominus_Orchestrator_v2.4</code> und wird bei jedem Pine-<code>alert()</code>-Aufruf automatisch mitgesendet.
+        </div>
+        <div style="margin-top:6px;font-size:11px;color:#5EC45E">&rarr; Message-Feld in TV: <b>leer lassen</b>. Nichts zu tun.</div>
+      </div>
+      <!-- Pfad B: Standalone -->
+      <div style="background:#2a1c08;border:1px solid #4a3a00;border-radius:10px;padding:10px 12px">
+        <div style="font-size:11px;font-weight:700;color:#E09040;text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px">&#x26A0;&#xFE0F; Standalone &mdash; Token wird hier eingesetzt</div>
+        <div style="font-size:12px;color:#B8B8C0;line-height:1.55">
+          Alarme mit manuell eingef&uuml;gtem JSON (<b>H4</b>, <b>BTC_DIR</b>, <b>T2_DIR</b>, <b>BTC/T2 Oversold/Overbought</b>, <b>Recovery</b>): Kein Zugriff auf Pine-Variablen. Sobald du oben deinen Token speicherst, enthalten alle JSON-Templates unten automatisch den echten Wert &mdash; Copy-Paste reicht.
+        </div>
+        <div style="margin-top:6px;font-size:11px;color:#E09040">&rarr; Kein manuelles Suchen &amp; Ersetzen mehr n&ouml;tig.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- PINE-SETUP (webhook_token im Indikator) -->
+  <div class="field">
+    <div class="field-label"><span>&#x1F4D6; Pine-Setup (einmalig, im TradingView-Indikator)</span></div>
+    <div style="background:#0d1f2d;border:1px solid rgba(123,184,245,0.25);border-radius:10px;padding:12px 14px;font-size:12px;line-height:1.65;color:#B8B8C0">
+      F&uuml;r alle Pine-basierten Alarme (<code>Any alert() function call</code>) muss der Token einmalig im <b>DOM-ORC v2.4</b>-Indikator gesetzt werden:
+      <ol style="margin:8px 0 0 20px;padding:0;color:#deded8;font-size:12px;line-height:1.8">
+        <li>TradingView-Chart &rarr; Indikator <b>Dominus Orchestrator v2.4</b> &rarr; Zahnrad-Icon &rarr; <b>Einstellungen</b></li>
+        <li>Feld <code>Webhook-Token (aus Railway)</code> &rarr; deinen echten <code>WEBHOOK_SECRET</code> einf&uuml;gen</li>
+        <li>Mit <b>OK</b> best&auml;tigen &mdash; der Token wird in jedem Pine-<code>alert()</code> automatisch mitgeschickt</li>
+      </ol>
+      <div style="margin-top:8px;color:#7BB8F5;font-size:11.5px">&#x1F4A1; TradingView speichert den Token serverseitig in deinem Layout &mdash; nicht &ouml;ffentlich sichtbar.</div>
+    </div>
+  </div>
+
+  <!-- RAILWAY-VARIABLES CHECKLISTE -->
+  <div class="field">
+    <div class="field-label"><span>&#x2601; Railway Variables (Serverseite, siehe <code>dominus_tp_updater.py</code>)</span></div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:6px">
+      <div style="background:#1a1a1e;border-radius:6px;padding:7px 10px;font-size:11.5px"><code style="color:#4ECBA0">WEBHOOK_SECRET</code> <span style="color:#666">&mdash; derselbe Token</span></div>
+      <div style="background:#1a1a1e;border-radius:6px;padding:7px 10px;font-size:11.5px"><code style="color:#7BB8F5">BITGET_API_KEY</code> / SECRET / PASSPHRASE</div>
+      <div style="background:#1a1a1e;border-radius:6px;padding:7px 10px;font-size:11.5px"><code style="color:#7BB8F5">BYBIT_API_KEY</code> / SECRET</div>
+      <div style="background:#1a1a1e;border-radius:6px;padding:7px 10px;font-size:11.5px"><code style="color:#A89FF5">TELEGRAM_TOKEN</code> / CHAT_ID</div>
+      <div style="background:#1a1a1e;border-radius:6px;padding:7px 10px;font-size:11.5px"><code style="color:#E09040">STATE_FILE</code> <span style="color:#666">= /app/data/dominus_state.json</span></div>
+      <div style="background:#1a1a1e;border-radius:6px;padding:7px 10px;font-size:11.5px"><code style="color:#E09040">TRADES_CSV</code> <span style="color:#666">= /app/data/trades.csv</span></div>
+    </div>
+  </div>
+
+  <div style="margin-top:4px;font-size:11px;color:#666;line-height:1.5">
+    &#x1F6E1; <b>Sicherheit:</b> Niemals den echten Token in diese HTML einchecken. In Railway-Logs taucht er ab v4.21 nicht mehr auf (<code>_TokenRedactFilter</code> im Werkzeug-Logger, Body-Redaction).
+  </div>
+</div>
+
+<!-- ======================================== -->
+<!-- 2. ABLAUFFOLGE                            -->
+<!-- ======================================== -->
+
 <!-- INHALTSVERZEICHNIS / TIMELINE -->
 <div class="card" id="sec-toc">
   <div class="card-head">
     <div class="step-badge" style="background:#252528;color:#909090">&#9776;</div>
     <div>
-      <div class="h2">Ablauf &amp; Inhaltsverzeichnis</div>
-      <div class="sub">Zeitlicher Workflow &mdash; Alarm 2/2b dauerhaft aktiv, kein H4-Alarm n&ouml;tig</div>
+      <div class="h2">2 &middot; Ablauffolge &amp; Inhaltsverzeichnis</div>
+      <div class="sub">Trader-Workflow &middot; Script-Verarbeitung &middot; Sprungmarken zu allen Alarmen</div>
+    </div>
+  </div>
+
+  <!-- SCRIPT-PROCESSING-FLOW -->
+  <div style="background:#0a0f14;border:1px solid rgba(123,184,245,0.18);border-radius:10px;padding:12px 14px;margin-bottom:14px">
+    <div style="font-size:11px;color:#7BB8F5;text-transform:uppercase;letter-spacing:.06em;font-weight:600;margin-bottom:8px">&#x1F504; Was passiert script-seitig bei jedem Alarm</div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:6px;font-size:11.5px;color:#B8B8C0;line-height:1.5">
+      <div style="background:#1a1a1e;border-radius:6px;padding:8px 10px"><b style="color:#7BB8F5">1. TV feuert</b><br>POST JSON &rarr; <code>/webhook</code></div>
+      <div style="background:#1a1a1e;border-radius:6px;padding:8px 10px"><b style="color:#7BB8F5">2. Token-Check</b><br><code>token</code>-Feld &harr; <code>WEBHOOK_SECRET</code></div>
+      <div style="background:#1a1a1e;border-radius:6px;padding:8px 10px"><b style="color:#7BB8F5">3. Signal-Router</b><br><code>signal</code>-Feld &rarr; Handler</div>
+      <div style="background:#1a1a1e;border-radius:6px;padding:8px 10px"><b style="color:#5EC45E">4a. H2_SIGNAL</b><br>&rarr; Entry-Queue &rarr; Scoring</div>
+      <div style="background:#1a1a1e;border-radius:6px;padding:8px 10px"><b style="color:#4ECBA0">4b. BTC_DIR / T2_DIR</b><br>&rarr; Makro-Filter update</div>
+      <div style="background:#1a1a1e;border-radius:6px;padding:8px 10px"><b style="color:#E09040">4c. HARSI_SL / SLING_SL</b><br>&rarr; Trailing-Stop-Update</div>
+      <div style="background:#1a1a1e;border-radius:6px;padding:8px 10px"><b style="color:#A89FF5">4d. HARSI_EXIT</b><br>&rarr; 30-Min-Timer / Entry freigegeben</div>
+      <div style="background:#1a1a1e;border-radius:6px;padding:8px 10px"><b style="color:#F07070">5. Exchange-Call</b><br>Bitget / Bybit Order / SL</div>
+      <div style="background:#1a1a1e;border-radius:6px;padding:8px 10px"><b style="color:#C28AF5">6. Telegram</b><br>Bestatigung + Chart-Links</div>
+      <div style="background:#1a1a1e;border-radius:6px;padding:8px 10px"><b style="color:#888">7. Persistenz</b><br><code>dominus_state.json</code> + <code>trades.csv</code></div>
+    </div>
+    <div style="margin-top:8px;font-size:11px;color:#666;line-height:1.5">
+      Token-Leaks sind ab v4.21 in Railway-Access-Logs unterbunden (<code>_TokenRedactFilter</code>). Jedes <code>signal</code> mappt auf genau einen Handler &mdash; deshalb darf das JSON pro Alarm nie identisch sein.
     </div>
   </div>
 
@@ -203,7 +335,7 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#111114;color:#de
   <div style="border-top:0.5px solid rgba(255,255,255,0.06);padding-top:10px;margin-top:4px">
     <div style="font-size:11px;color:#555;letter-spacing:.05em;text-transform:uppercase;margin-bottom:7px">Sektionen</div>
     <div style="display:flex;flex-wrap:wrap;gap:6px">
-      <a href="#sec-webhook"  style="font-size:12px;padding:4px 10px;border-radius:6px;background:#252528;color:#909090;text-decoration:none;border:0.5px solid rgba(0,0,0,0.09)">&#x26A1; Webhook-URL</a>
+      <a href="#sec-setup"    style="font-size:12px;padding:4px 10px;border-radius:6px;background:#0d2820;color:#4ECBA0;text-decoration:none;border:0.5px solid rgba(78,203,160,0.25)">&#x2699; Einstellungen &amp; Token</a>
       <a href="#sec-harsi"    style="font-size:12px;padding:4px 10px;border-radius:6px;background:#252528;color:#909090;text-decoration:none;border:0.5px solid rgba(0,0,0,0.09)">&#x26A0; HARSI-Konzept</a>
       <a href="#sec-alarm2"   style="font-size:12px;padding:4px 10px;border-radius:6px;background:#162a16;color:#5EC45E;text-decoration:none;border:0.5px solid rgba(0,0,0,0.06)">2 Long Entry</a>
       <a href="#sec-alarm2b"  style="font-size:12px;padding:4px 10px;border-radius:6px;background:#2e1616;color:#F07070;text-decoration:none;border:0.5px solid rgba(0,0,0,0.06)">2b Short Entry</a>
@@ -230,48 +362,11 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#111114;color:#de
   </div>
 </div>
 
-<!-- WEBHOOK INFO -->
-<div class="card" id="sec-webhook">
-  <div class="card-head">
-    <div class="step-badge" style="background:#0d2820;color:#4ECBA0">&#x26A1;</div>
-    <div>
-      <div class="h2">Railway Webhook-URL</div>
-      <div class="sub">Alle Alerts senden JSON an diese URL &rarr; Railway &rarr; Telegram</div>
-    </div>
-  </div>
-  <div class="field">
-    <div class="field-label">
-      <span>Webhook-URL (in jeden Alert einf&uuml;gen)</span>
-      <button class="copy-btn" onclick="copyField('wh-url',this)">Kopieren</button>
-    </div>
-    <div class="webhook-url" id="wh-url">https://dominus-tp-updater-production.up.railway.app/webhook</div>
-    <div style="margin-top:8px;font-size:11.5px;color:#888;line-height:1.5">
-      &#x1F512; <strong>Token liegt ab v4.21 im JSON-Body</strong>, nicht mehr in der URL &mdash; die obige URL enth&auml;lt <em>kein</em> <code>?token=</code> mehr. Je nach Alarm-Typ kommt der Token aus <strong>zwei</strong> verschiedenen Quellen:
-    </div>
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px">
-      <!-- Pfad A: Pine-basiert -->
-      <div style="background:#0d1a0d;border:1px solid #2a4a2a;border-radius:10px;padding:10px 12px">
-        <div style="font-size:11px;font-weight:700;color:#5EC45E;text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px">&#x2705; Pine-basiert &mdash; Token automatisch</div>
-        <div style="font-size:12px;color:#B8B8C0;line-height:1.55">
-          Alarme vom Typ <code>Any alert() function call</code> (z.&#8239;B. <b>4c</b>, <b>5c</b>, <b>Sling-SL Universal</b>): Der Token steht im <b>Indikator-Setting</b> <code>webhook_token</code> des <code>Dominus_Orchestrator_v2.4</code> und wird bei jedem Pine-<code>alert()</code>-Aufruf automatisch mitgesendet.
-        </div>
-        <div style="margin-top:6px;font-size:11px;color:#5EC45E">&rarr; Message-Feld in TV: <b>leer lassen</b>. Nichts zu tun.</div>
-      </div>
-      <!-- Pfad B: Standalone -->
-      <div style="background:#2a1c08;border:1px solid #4a3a00;border-radius:10px;padding:10px 12px">
-        <div style="font-size:11px;font-weight:700;color:#E09040;text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px">&#x26A0;&#xFE0F; Standalone &mdash; Token manuell ersetzen</div>
-        <div style="font-size:12px;color:#B8B8C0;line-height:1.55">
-          Alarme mit manuell eingef&uuml;gtem JSON (z.&#8239;B. <b>H4</b>, <b>BTC_DIR</b>, <b>T2_DIR</b>, <b>BTC/T2 Oversold/Overbought</b>, <b>Recovery</b>): Kein Zugriff auf Pine-Variablen m&ouml;glich. In jedem JSON-Block unten ist <code>"token":"DEIN_WEBHOOK_SECRET"</code> das erste Feld.
-        </div>
-        <div style="margin-top:6px;font-size:11px;color:#E09040">&rarr; Vor dem Kopieren <code>DEIN_WEBHOOK_SECRET</code> durch den echten Token aus Railway &rarr; Variables &rarr; <code>WEBHOOK_SECRET</code> ersetzen.</div>
-      </div>
-    </div>
-    <div style="margin-top:8px;font-size:11px;color:#666;line-height:1.5">
-      &#x1F6E1; <b>Niemals den echten Token in diese HTML einchecken.</b> TradingView speichert das Message-Feld serverseitig im jeweiligen Alarm &mdash; nicht &ouml;ffentlich sichtbar. In Railway-Logs taucht der Token ab v4.21 nicht mehr auf (<code>_TokenRedactFilter</code> im Werkzeug-Logger, Body-Redaction).
-    </div>
-  </div>
-  <div class="success"><strong>Was passiert:</strong> TradingView sendet JSON &rarr; Railway empf&auml;ngt &rarr; Telegram sendet DOMINUS-Checkliste + Chart-Links in deinem Layout lX5eDAis.</div>
-</div>
+<!-- (Webhook-URL &amp; Token: wurde in Abschnitt 1 &laquo;Einstellungen&raquo; oben integriert) -->
+
+<!-- ======================================== -->
+<!-- 3. ALARME                                 -->
+<!-- ======================================== -->
 
 <!-- HARSI KONZEPT -->
 <div class="card" id="sec-harsi">
@@ -1969,19 +2064,153 @@ Beispiel:
 
 </div>
 <script>
+/* ============================================================
+   DOMINUS Alarm-Templates — Token-Management & Copy-Handler
+   ============================================================ */
+
+const TOKEN_KEY = 'dominus_webhook_token_v1';
+const PLACEHOLDER = 'DEIN_WEBHOOK_SECRET';
+
+/* ---- Token-Persistenz (localStorage) ---- */
+function getToken(){
+  try { return localStorage.getItem(TOKEN_KEY) || ''; }
+  catch(e){ return ''; }
+}
+function storeToken(val){
+  try {
+    if (val) localStorage.setItem(TOKEN_KEY, val);
+    else localStorage.removeItem(TOKEN_KEY);
+  } catch(e){}
+}
+
+/* ---- Kern: Token in alle JSON-Templates substituieren ---- */
+function applyTokenEverywhere(){
+  const token = getToken();
+  const shown = token || PLACEHOLDER;
+
+  document.querySelectorAll('.field-value.mono').forEach(el => {
+    // Original einmalig cachen, damit wir immer aus der Vorlage neu rendern.
+    if (!el.hasAttribute('data-tpl')) {
+      const raw = el.textContent;
+      if (raw.indexOf(PLACEHOLDER) === -1) return;     // keine Token-Vorlage
+      el.setAttribute('data-tpl', raw);
+    }
+    const tpl = el.getAttribute('data-tpl');
+    el.textContent = tpl.split(PLACEHOLDER).join(shown);
+    if (token){
+      el.classList.add('token-set');
+      el.classList.remove('token-placeholder');
+    } else {
+      el.classList.add('token-placeholder');
+      el.classList.remove('token-set');
+    }
+  });
+
+  /* Token-Reminder-Hints ausblenden, sobald Token gesetzt ist */
+  document.querySelectorAll('.hint').forEach(el => {
+    if (el.textContent.indexOf('dieser Alarm l\u00e4uft standalone') !== -1){
+      el.style.display = token ? 'none' : '';
+    }
+  });
+
+  /* Status-Pille aktualisieren */
+  const pill = document.getElementById('token-status');
+  if (pill){
+    if (token){
+      pill.className = 'token-status ok';
+      pill.innerHTML = '&#x2705; Token gesetzt (L&auml;nge ' + token.length +
+        ') &mdash; alle JSON-Templates unten enthalten jetzt den echten Token';
+    } else {
+      pill.className = 'token-status warn';
+      pill.innerHTML = '&#x26A0; Kein Token gesetzt &mdash; JSONs zeigen den Platzhalter <code>DEIN_WEBHOOK_SECRET</code>';
+    }
+  }
+
+  /* Input-Styling: has-token-Indikator */
+  const input = document.getElementById('token-input');
+  if (input){
+    if (token) input.classList.add('has-token');
+    else input.classList.remove('has-token');
+  }
+}
+
+/* ---- Button-Handler ---- */
+function saveToken(){
+  const input = document.getElementById('token-input');
+  const val = (input.value || '').trim();
+  if (!val){
+    alert('Bitte den Token einf\u00fcgen, bevor du auf Speichern klickst.');
+    return;
+  }
+  if (val.length < 6){
+    if (!confirm('Dieser Token ist kurz (nur ' + val.length + ' Zeichen). Trotzdem speichern?')) return;
+  }
+  storeToken(val);
+  applyTokenEverywhere();
+  flashButton(event && event.target);
+}
+function clearToken(){
+  if (!confirm('Token aus dem Browser-Speicher entfernen?\nDie JSON-Templates zeigen danach wieder den Platzhalter.')) return;
+  const input = document.getElementById('token-input');
+  if (input) input.value = '';
+  storeToken('');
+  applyTokenEverywhere();
+}
+function flashButton(btn){
+  if (!btn) return;
+  const orig = btn.textContent;
+  btn.textContent = '\u2713 Gespeichert';
+  setTimeout(() => { btn.textContent = orig; }, 1500);
+}
+function toggleTokenVisibility(){
+  const input = document.getElementById('token-input');
+  const btn = document.getElementById('token-visibility-btn');
+  if (!input || !btn) return;
+  if (input.type === 'password'){
+    input.type = 'text';
+    btn.textContent = 'Verstecken';
+  } else {
+    input.type = 'password';
+    btn.textContent = 'Anzeigen';
+  }
+}
+
+/* ---- Copy-Handler (nutzt textContent, das bereits substituiert ist) ---- */
 function copyField(id,btn){
-  const el=document.getElementById(id);
-  navigator.clipboard.writeText(el.textContent.trim()).then(()=>{
-    btn.textContent='Kopiert!';btn.classList.add('copied');
-    setTimeout(()=>{btn.textContent='Kopieren';btn.classList.remove('copied');},2000);
+  const el = document.getElementById(id);
+  if (!el) return;
+  navigator.clipboard.writeText(el.textContent.trim()).then(() => {
+    btn.textContent = 'Kopiert!';
+    btn.classList.add('copied');
+    setTimeout(() => { btn.textContent = 'Kopieren'; btn.classList.remove('copied'); }, 2000);
   });
 }
 function copyText(text,btn){
-  navigator.clipboard.writeText(text).then(()=>{
-    btn.textContent='Kopiert!';btn.classList.add('copied');
-    setTimeout(()=>{btn.textContent='Kopieren';btn.classList.remove('copied');},2000);
+  navigator.clipboard.writeText(text).then(() => {
+    btn.textContent = 'Kopiert!';
+    btn.classList.add('copied');
+    setTimeout(() => { btn.textContent = 'Kopieren'; btn.classList.remove('copied'); }, 2000);
   });
 }
+
+/* ---- Init: beim Laden + live beim Tippen ---- */
+document.addEventListener('DOMContentLoaded', () => {
+  const input = document.getElementById('token-input');
+  if (input){
+    input.value = getToken();
+    /* Live-Persistenz & Live-Preview: jeder Tastendruck schreibt nach localStorage
+       und rendert s\u00e4mtliche JSON-Templates neu. */
+    input.addEventListener('input', () => {
+      storeToken(input.value.trim());
+      applyTokenEverywhere();
+    });
+    /* Enter-Taste = Speichern (Button-Feedback + Validierung) */
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter'){ e.preventDefault(); saveToken(); }
+    });
+  }
+  applyTokenEverywhere();
+});
 </script>
 </body>
 </html>
