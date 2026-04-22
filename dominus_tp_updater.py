@@ -1,5 +1,5 @@
 """
-DOMINUS Trade-Automatisierung v4.19
+DOMINUS Trade-Automatisierung v4.21
 ══════════════════════════════════════════════════════════════
 Vollautomatisches Setup nach DOMINUS-Strategie (Handbuch März 2026)
 Finanzmathematische Optimierungen:
@@ -11,6 +11,46 @@ Finanzmathematische Optimierungen:
   ⑥ Sling-SL Trailing — Swing-Pivot-basierter SL (nur protektiv)
   ⑦ Exposure-Cap 25%  — max. Gesamt-Einsatz inkl. Hebel pro Trade
   ⑧ Entry-Queue       — mehrere HARSI_EXIT-Signale als Rangliste (v4.19)
+  ⑨ Queue-Tracking    — entry_queue_log.csv + R-Multiple-Outcome (v4.20)
+  ⑩ Klick-UX          — Inline-Buttons, klickbare Alarm-Templates (v4.21)
+
+Changelog v4.21 — Klick-UX, CSV-Dedup, Token-Redact, utcfromtimestamp-Fix:
+  U1: Inline-Keyboard-Buttons für Trade-Setups — telegram() und reply() nehmen
+      ein optionales reply_markup; build_setup_buttons(symbol) liefert das
+      Standard-Layout (Row 1: 🟠 Bitget COIN, Row 2: 📈 BTC H2 / 🔀 Total2).
+      Integriert in /trade-Setup, /berechnen-Style-Ausgabe, Auto-SL-Meldungen,
+      SL-auf-Entry-Bestätigung und Close-Summary.
+  U2: tv_chart_links(symbol) um bitget-Feld erweitert —
+      https://www.bitget.com/futures/usdt/<SYMBOL> für Direkt-Sprung in den
+      Futures-Chart des Coins.
+  U3: Klickbare Alarm-Templates — /alarm-Overview zeigt Aliases wie
+      /alarm_harsi_BTC_LONG. Router zerlegt den Unterstrich-Suffix in Tokens
+      und dispatcht auf cmd_alarm(["/alarm", sub, SYMBOL, DIR]). Funktioniert
+      analog für /alarm_harsi, /alarm_harsisl, /alarm_h2, /alarm_h4.
+  U4: /dedup_trades-Command — Dry-Run zeigt Dubletten in trades.csv (Fingerprint
+      symbol+direction+entry+close+pnl innerhalb 2h). /dedup_apply (oder
+      /dedup_trades apply) legt Timestamp-Backup trades.csv.backup_YYYYMMDD-
+      HHMMSS.csv an, schreibt dedup'te CSV atomar und bereinigt closed_trades[]
+      im RAM. Dry-Run-Output enthält /dedup_apply als tappbaren Klick-Link.
+  U5: Werkzeug-Log-Filter _TokenRedactFilter — scrubt WEBHOOK_SECRET aus
+      Flask-Access-Logs, damit der Token in Railway-Logs nicht im Klartext
+      auftaucht (Query-Param ?token=… und JSON-Body-Redaction).
+  U6: datetime.utcfromtimestamp() Deprecation-Fix — auf
+      datetime.fromtimestamp(ts, tz=timezone.utc) umgestellt (2 Stellen).
+      OFFEN: 8 weitere datetime.utcnow()-Vorkommen werden separat migriert.
+
+Changelog v4.20 — Entry-Queue-Outcome-Tracking (datengetriebene Optimierung):
+  T1: entry_queue_log.csv persistiert JEDES bewertete Signal (auch Rank≥2 und
+      nicht-getradete) — Schema: id, ts, symbol, direction, score, rank, total,
+      premium_flag, taken (1/0), outcome (open/win/loss), r_multiple, duration_h.
+  T2: Two-Phase-Logging: log_scored_entry() schreibt alle Queue-Kandidaten beim
+      flush_entries(); mark_trade_taken() und später der Close-Handler annotieren
+      Outcome und R-Multiple zurück in die CSV (atomic Read-Modify-Write mit Lock).
+  T3: symbol_win_rate() ist jetzt aus trades.csv + entry_queue_log.csv gespeist —
+      Queue-Log liefert zusätzlich die Gegenprobe "hätte funktioniert, aber nicht
+      getradet" für künftige Parameter-Kalibrierung.
+  T4: /queue_stats-Command — zeigt Win-Rate, durchschnittlicher R-Multiple,
+      Wilson-Konfidenzintervall und optimaler Kelly über das Queue-Log.
 
 Changelog v4.19 — Entry-Queue: Ranked Entry-Liste bei mehreren HARSI_EXIT:
   Q1: Mehrere HARSI_EXIT-Signale innerhalb ENTRY_QUEUE_WINDOW_SEC (Standard
@@ -6742,7 +6782,7 @@ def main():
         log("In Railway → Variables eintragen.")
         return
 
-    log("DOMINUS Trade-Automatisierung v4.18 gestartet — mit finanzmathematischen Optimierungen")
+    log("DOMINUS Trade-Automatisierung v4.21 gestartet — mit finanzmathematischen Optimierungen")
     log(f"Intervall: {POLL_INTERVAL}s")
     log("Warte auf neue Trades...")
     log("─" * 55)
