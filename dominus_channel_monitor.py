@@ -1,14 +1,23 @@
 #!/usr/bin/env python3
 """
-DOMINUS Channel Monitor  v1.4  (2026-04-22)
+DOMINUS Channel Monitor  v1.5  (2026-04-22)
 ════════════════════════════════════════════════════════════════
 Überwacht den Dominus Telegram-Kanal auf neue Coins UND optional
 parallel eine öffentliche TradingView-Watchlist.
 Prüft Verfügbarkeit auf Bitget (bevorzugt) oder Bybit.
 Sendet bei neuen Coins eine aktualisierte TradingView-Watchlist
 als importierbare .txt-Datei + eine interaktive HTML-Clicklist
-(ein Button je Coin, kopiert BITGET:XYZUSDT.P in die Zwischenablage)
-per Telegram.
+(Delta-Modus: nur Coins, die seit dem letzten master_watchlist.txt
+dazugekommen sind — ein Button je Coin, kopiert BITGET:XYZUSDT.P
+in die Zwischenablage) per Telegram.
+
+Changelog v1.5:
+  • ÄNDERUNG: Clicklist zeigt nur noch die DELTA — Coins, die
+    state["known_coins"] kennt, die aber NICHT in master_watchlist.txt
+    stehen. Sobald State und master synchron sind, wird keine
+    Clicklist gesendet (nur Log-Zeile). Workflow: neue Coins aus
+    Clicklist in TV übernehmen → TV exportieren → master_watchlist.txt
+    ersetzen → pushen → Railway-Redeploy → Delta ist wieder leer.
 
 Changelog v1.4:
   • NEU: HTML-Clicklist integriert. Bei jedem Bootstrap-Ende und
@@ -454,7 +463,7 @@ def build_clicklist_html(available: list[str], bitget_ok: bool,
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Bitget Clicklist · {count} Coins</title>
+<title>Bitget Clicklist · {count} neue Coin(s)</title>
 <style>
   *{{box-sizing:border-box}}
   body{{font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text",system-ui,sans-serif;
@@ -489,11 +498,12 @@ def build_clicklist_html(available: list[str], bitget_ok: bool,
 </style>
 </head>
 <body>
-<h1>Bitget Clicklist · {count} Coin(s)</h1>
+<h1>Bitget Clicklist · {count} neue Coin(s) seit letztem TV-Export</h1>
 <div class="meta">
   Stand: {ts} · {filter_msg}<br>
+  Enthält nur Coins, die der Monitor kennt, die aber <b>noch nicht</b> in Deiner <code>master_watchlist.txt</code> stehen.<br>
   Klick kopiert <code>BITGET:XYZUSDT.P</code> ins Clipboard — danach in TradingView ins Symbolfeld (<kbd>⌘V</kbd>).<br>
-  Wird automatisch neu generiert sobald der Monitor einen neuen Coin aus dem Kanal aufnimmt.
+  Nach TV-Übernahme: neuen TV-Export in <code>master_watchlist.txt</code> ablegen + pushen → Delta wird leer.
 </div>
 <div class="grid">
 {buttons}
@@ -524,23 +534,37 @@ document.querySelectorAll('.btn').forEach(b=>{{
 
 def send_clicklist_file(state: dict, caption_prefix: str = "📋 Bitget Clicklist") -> None:
     """
-    Baut die Bitget-Clicklist aus dem aktuellen state (live-gefiltert gegen
-    _bitget_syms) und sendet sie als HTML-Attachment via Telegram.
+    Sendet die DELTA-Clicklist: nur Coins, die der Monitor kennt, die aber
+    NICHT in der master_watchlist.txt-Baseline stehen (also noch nicht in
+    Deiner TV-Watchlist sind).
+
+    Wenn State und master_watchlist.txt synchron sind, wird nichts gesendet.
+
+    Gefiltert wird live gegen _bitget_syms (Bitget USDT-Perp API, 6h-Cache).
+    Coins, die nur auf Bybit sind, landen im HTML im Collapsible am Ende.
     """
     _ensure_symbols_fresh()  # stellt sicher, dass _bitget_syms aktuell ist
-    known = set(state.get("known_coins", []))
+    known    = set(state.get("known_coins", []))
+    baseline = seed_tv_coins()          # liest master_watchlist.txt
+    delta    = known - baseline         # nur was seit master neu dazugekommen ist
+
+    if not delta:
+        log.info(f"[Clicklist] State ({len(known)} Coins) = master_watchlist.txt "
+                 f"({len(baseline)} Coins) — keine Delta, nichts gesendet")
+        return
+
     if _bitget_syms:
-        available   = sorted(c for c in known if c in _bitget_syms)
-        unavailable = sorted(c for c in known if c not in _bitget_syms)
+        available   = sorted(c for c in delta if c in _bitget_syms)
+        unavailable = sorted(c for c in delta if c not in _bitget_syms)
         bitget_ok   = True
     else:
-        available   = sorted(known)
+        available   = sorted(delta)
         unavailable = []
         bitget_ok   = False
 
     html     = build_clicklist_html(available, bitget_ok, unavailable)
     filename = f"bitget_clicklist_{time.strftime('%Y%m%d_%H%M')}.html"
-    caption  = f"{caption_prefix} — {len(available)} Coins"
+    caption  = f"{caption_prefix} — {len(available)} neu"
     if unavailable:
         caption += f" (+{len(unavailable)} nicht auf Bitget)"
     try:
@@ -550,7 +574,9 @@ def send_clicklist_file(state: dict, caption_prefix: str = "📋 Bitget Clicklis
             files={"document": (filename, io.BytesIO(html.encode("utf-8")), "text/html")},
             timeout=15,
         )
-        log.info(f"[Clicklist] gesendet: {filename} ({len(available)} Coins, {len(unavailable)} excluded)")
+        log.info(f"[Clicklist] Delta gesendet: {filename} "
+                 f"({len(available)} Bitget + {len(unavailable)} nicht-Bitget, "
+                 f"state={len(known)}, baseline={len(baseline)})")
     except Exception as e:
         log.warning(f"Clicklist-Send fehlgeschlagen: {e}")
 
@@ -706,7 +732,7 @@ async def bootstrap_state(client, channel, state: dict) -> dict:
 
 # ── Hauptprogramm ────────────────────────────────────────────────
 async def main() -> None:
-    log.info("════ Dominus Channel Monitor v1.4 ════")
+    log.info("════ Dominus Channel Monitor v1.5 ════")
     log.info(f"STATE_FILE = {STATE_FILE}")
     log.info(f"SEED_FILE  = {SEED_FILE} (exists={os.path.exists(SEED_FILE)})")
     log.info(f"CHANNEL_HISTORY_LIMIT = {CHANNEL_HISTORY_LIMIT}")
