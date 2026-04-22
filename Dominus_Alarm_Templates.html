@@ -149,7 +149,7 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#111114;color:#de
 <div class="wrap">
 
 <div class="page-title">DOMINUS Alarm-Templates</div>
-<div class="page-sub">TradingView &rarr; Railway Webhook &rarr; Telegram &middot; DOM-ORC v2.4 &middot; Railway v4.21 &mdash; Dark Mode &mdash; Stand April 2026</div>
+<div class="page-sub">TradingView &rarr; Railway Webhook &rarr; Telegram &middot; DOM-ORC v2.4.2 &middot; Railway v4.21 &mdash; Dark Mode &mdash; Stand April 2026</div>
 
 <!-- ======================================== -->
 <!-- 1. EINSTELLUNGEN / SETUP                  -->
@@ -1013,7 +1013,7 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#111114;color:#de
   <div class="card-head">
     <div class="step-badge" style="background:#0d2820;color:#4ECBA0">3</div>
     <div>
-      <div class="h2">HARSI Exit Long <span class="new-badge">NEU</span></div>
+      <div class="h2">HARSI Exit Long <span class="new-badge">NEU</span> <span class="upd-badge">Intrabar v2.4.2</span></div>
       <div class="sub">Feuert wenn HARSI Extremzone verl&auml;sst &mdash; jetzt Long einsteigen</div>
     </div>
   </div>
@@ -1030,11 +1030,16 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#111114;color:#de
         <span class="cond-num">1</span>
         <div>
           <div class="cond-text">DOMINUS Orchestrator &rarr; <strong>DOMINUS Long HARSI frei</strong></div>
-          <div class="cond-detail"><span class="pill p-teal">H2</span> Kerzenschluss &middot; Einmal pro Bar &middot; Einzelner Coin</div>
+          <div class="cond-detail"><span class="pill p-teal">H2</span> <strong>Intrabar</strong> (kein Bar-Close-Warten) &middot; Einmal pro Bar &middot; Einzelner Coin</div>
         </div>
       </div>
     </div>
 
+    <div class="success" style="margin-top:8px">
+      <strong>&#x26A1; Neu ab DOM-ORC v2.4.2 &mdash; Intrabar-Feuerung:</strong><br>
+      Der <code>HARSI_EXIT</code>-Alarm feuert jetzt <strong>sofort beim Verlassen der HARSI-Extremzone</strong> (Pine: <code>alert.freq_once_per_bar</code>) und nicht mehr erst am 2h-Bar-Close. Damit bleibt das 30-Min-Fenster eingehalten statt im schlimmsten Fall 2 h zu verlieren.<br>
+      Railway dedupliziert serverseitig &uuml;ber <code>signal_fingerprint</code>, es kann also nicht zu Mehrfach-Entries innerhalb derselben Bar kommen.
+    </div>
     <div class="danger" style="margin-top:8px">
       <strong>&#x23F1; 30-Minuten-Zeitfenster — strikt einhalten!</strong><br>
       Alarm 3 nur erstellen wenn du den 30-Min-Timer sofort startest. Wenn der Alarm <strong>nach Ablauf der 30 Minuten</strong> feuert &rarr; <strong>nicht einsteigen</strong>, Signal ist abgelaufen.<br>
@@ -1068,7 +1073,7 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#111114;color:#de
   <div class="card-head">
     <div class="step-badge" style="background:#2e1616;color:#F07070">3b</div>
     <div>
-      <div class="h2">HARSI Exit Short <span class="new-badge">NEU</span></div>
+      <div class="h2">HARSI Exit Short <span class="new-badge">NEU</span> <span class="upd-badge">Intrabar v2.4.2</span></div>
       <div class="sub">Feuert wenn HARSI Extremzone verl&auml;sst &mdash; jetzt Short einsteigen</div>
     </div>
   </div>
@@ -1085,11 +1090,16 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#111114;color:#de
         <span class="cond-num">1</span>
         <div>
           <div class="cond-text">DOMINUS Orchestrator &rarr; <strong>DOMINUS Short HARSI frei</strong></div>
-          <div class="cond-detail"><span class="pill p-red">H2</span> Kerzenschluss &middot; Einmal pro Bar &middot; Einzelner Coin</div>
+          <div class="cond-detail"><span class="pill p-red">H2</span> <strong>Intrabar</strong> (kein Bar-Close-Warten) &middot; Einmal pro Bar &middot; Einzelner Coin</div>
         </div>
       </div>
     </div>
 
+    <div class="success" style="margin-top:8px">
+      <strong>&#x26A1; Neu ab DOM-ORC v2.4.2 &mdash; Intrabar-Feuerung:</strong><br>
+      Der <code>HARSI_EXIT</code>-Alarm feuert jetzt <strong>sofort beim Verlassen der HARSI-Extremzone</strong> (Pine: <code>alert.freq_once_per_bar</code>) und nicht mehr erst am 2h-Bar-Close. Damit bleibt das 30-Min-Fenster eingehalten statt im schlimmsten Fall 2 h zu verlieren.<br>
+      Railway dedupliziert serverseitig &uuml;ber <code>signal_fingerprint</code>, es kann also nicht zu Mehrfach-Entries innerhalb derselben Bar kommen.
+    </div>
     <div class="danger" style="margin-top:8px">
       <strong>&#x23F1; 30-Minuten-Zeitfenster — strikt einhalten!</strong><br>
       Alarm 3b nur erstellen wenn du den 30-Min-Timer sofort startest. Wenn der Alarm <strong>nach Ablauf der 30 Minuten</strong> feuert &rarr; <strong>nicht einsteigen</strong>, Signal ist abgelaufen.<br>
