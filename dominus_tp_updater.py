@@ -1,5 +1,5 @@
 """
-DOMINUS Trade-Automatisierung v4.24
+DOMINUS Trade-Automatisierung v4.25
 ══════════════════════════════════════════════════════════════
 Vollautomatisches Setup nach DOMINUS-Strategie (Handbuch März 2026)
 Finanzmathematische Optimierungen:
@@ -12,7 +12,47 @@ Finanzmathematische Optimierungen:
   ⑦ Exposure-Cap 25%  — max. Gesamt-Einsatz inkl. Hebel pro Trade
   ⑧ Entry-Queue       — H2_SIGNAL + HARSI_EXIT gemeinsam als Rangliste (v4.22)
   ⑨ Queue-Tracking    — entry_queue_log.csv + R-Multiple-Outcome (v4.20)
-  ⑩ Klick-UX          — Inline-Buttons in allen Signal-Messages (v4.22)
+  ⑩ Klick-UX          — Button-Driven Rangliste mit adaptivem Keyboard (v4.25)
+
+Changelog v4.25 — Button-Driven Entry-Rangliste (One-Message-UX):
+  B1: Die Entry-Rangliste ist keine seitenlange Text-Liste mehr, sondern
+      eine KOMPAKTE Übersichts-Message mit Coin-Buttons (Top-10 im 3er-Grid,
+      darunter "▾ N weitere"). Tap auf einen Coin-Button klappt dessen Detail
+      per editMessageText in derselben Message auf — inkl. Trade-Vorschlag
+      (Entry/SL/Hebel/DCA), Score-Breakdown mit rechtsbündiger Punkte-Spalte
+      (✅ Faktor ... +XX) und Premium-Hinweis. Nur EIN Coin gleichzeitig offen.
+  B2: Adaptives Inline-Keyboard im Detail-Zustand. Detail-relevante Buttons
+      (🎯 Berechnen / 🟠 Bitget / 📊 TV / 📈 BTC H2 / 🔀 Total2 /
+      ❌ Schliessen) oben, danach Divider (Label-Button, callback=noop), dann
+      die Coin-Grid-Buttons. Bitget + TV-Links werden auf den offenen Coin
+      umgeschaltet; BTC/Total2 bleiben gleich.
+  B3: 1-Tap-Berechnung via Callback-Button "🎯 Berechnen {COIN}".
+      callback_data = calc:SYM:DIR:LEV:ENTRY:SL (36 Byte, Limit 64).
+      Callback-Handler delegiert an cmd_trade() — User bekommt die volle
+      /trade-Antwort als separate Message in denselben Chat.
+  B4: Score-Breakdown jetzt als ✅-Liste mit rechtsbündiger Punkte-Spalte
+      plus "Score"-Summe unten. DOMINUS Impuls Extremzone + H4 Trigger sind
+      als Pine-Gates (ohne Punkte) oben gelistet — sie sind bei ankommendem
+      Signal per Definition erfüllt.
+  B5: Farbkodiertes Score-Badge 🟢 ≥75 / 🟡 50–74 / 🔴 <50 in Buttons und
+      Detail-Header.
+  B6: Top-5-Kurzform im Übersichts-Header ("⚡ Top-5  AVAX 82 · OP 78 ...").
+      Hilft beim Lock-Screen-Check ohne Message zu öffnen.
+  B7: Low-Score-Bucket: alle Signale unter SLOT_LOWSCORE_CUT (default 50)
+      wandern in einen separaten "▾ N weitere"-Block (einzeilig kompakt).
+      Spart bei 30+ Signalen ~60% vertikalen Platz.
+  B8: State-Management _slot_states[msg_id] → {ranked, balance, current_detail,
+      view_mode, created_ts}. TTL 2h, Thread-safe via _slot_states_lock.
+      Expired-Callbacks → Toast "Slot abgelaufen — neue H2-Welle abwarten".
+  B9: Neue Helpers:
+        • telegram(..., return_id=True) — gibt message_id zurück
+        • telegram_edit_message(msg_id, text, reply_markup) — editMessageText
+        • telegram_answer_callback(cb_id, text, show_alert) — answerCallbackQuery
+        • format_slot_overview / format_slot_detail / format_slot_more
+        • build_slot_keyboard(state, open_symbol, mode)
+        • handle_callback_query(update) — Dispatcher
+  B10: ENV-Flags SLOT_TOP_N (default 10), SLOT_LOWSCORE_CUT (default 50) —
+      erlauben spätere Feinjustierung ohne Code-Änderung.
 
 Changelog v4.24 — Ghost-Flag-Fix (kein fälschliches "♻️ TPs nach DCA" mehr):
   G1: Discriminator in main()-Polling-Loop gehärtet. Bisher entschied allein
@@ -545,6 +585,27 @@ pending_entries_lock       = threading.Lock()
 _entry_flush_timer         = None         # threading.Timer oder None
 _entry_flush_started_ts    = 0.0          # time.time() beim Start des aktuellen Fensters
 
+# v4.25: Slot-States — Button-Driven Entry-Rangliste (transient, 2h TTL)
+# Nach flush_entries() wird EINE Übersichts-Message gesendet. Deren message_id
+# dient als Slot-Key. Callbacks (detail:/close/more/calc:) mutieren diesen
+# State und edit_message_text() rendert die Nachricht neu.
+# Struktur: {slot_msg_id (int): {
+#     "ranked":         list[entry_dict],     # sortiert nach Score absteigend
+#     "balance":        float,
+#     "slot_label":     str,                   # "16:00-Slot"
+#     "current_detail": str | None,            # aktuell aufgeklappter Symbol oder None
+#     "view_mode":      "overview"|"detail"|"more",
+#     "created_ts":     float,
+# }}
+_slot_states: dict = {}
+_slot_states_lock  = threading.Lock()
+_SLOT_TTL_SEC      = 2 * 3600  # 2h — danach Callbacks mit "Slot abgelaufen"-Toast
+
+# Top-N Coins mit Detail-Button (Score-absteigend). Rest geht in "Weitere"-Block.
+SLOT_TOP_N         = _env_int("SLOT_TOP_N", 10)
+# Score-Schwelle unter der Signale in den Low-Score-Block wandern.
+SLOT_LOWSCORE_CUT  = _env_int("SLOT_LOWSCORE_CUT", 50)
+
 # v4.19: Win-Rate Cache pro Symbol — {symbol: (wr, n_trades, expire_ts)}
 _winrate_cache: dict = {}
 _WINRATE_CACHE_TTL   = 3600               # 1h TTL
@@ -844,15 +905,18 @@ def csv_log_trade(trade: dict):
     threading.Thread(target=_write, daemon=True).start()
 
 
-def telegram(msg: str, reply_markup: dict = None):
+def telegram(msg: str, reply_markup: dict = None, return_id: bool = False):
     """
     Sendet Telegram-Nachricht wenn konfiguriert.
 
     reply_markup: optional inline keyboard (dict mit {"inline_keyboard": [[...]]})
                   — z.B. Ergebnis von build_setup_buttons(symbol).
+    return_id:    v4.25 — wenn True, wird die message_id der gesendeten Nachricht
+                  zurückgegeben (oder None bei Fehler). Default False behält
+                  Backward-Compat mit allen bestehenden Aufrufern.
     """
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        return
+        return None if return_id else None
     try:
         payload = {
             "chat_id":                  TELEGRAM_CHAT_ID,
@@ -862,8 +926,83 @@ def telegram(msg: str, reply_markup: dict = None):
         }
         if reply_markup:
             payload["reply_markup"] = reply_markup
-        requests.post(
+        r = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json=payload,
+            timeout=5
+        )
+        if return_id:
+            try:
+                data = r.json()
+                if data.get("ok"):
+                    return data["result"]["message_id"]
+            except Exception:
+                pass
+            return None
+    except Exception:
+        if return_id:
+            return None
+    return None if return_id else None
+
+
+def telegram_edit_message(
+    msg_id: int,
+    text: str,
+    reply_markup: dict = None,
+) -> bool:
+    """v4.25 — editMessageText für Button-Driven Entry-Rangliste.
+    Returns True bei Erfolg, False sonst. Silent-Fail bei Netz-Problemen."""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID or not msg_id:
+        return False
+    try:
+        payload = {
+            "chat_id":                  TELEGRAM_CHAT_ID,
+            "message_id":               msg_id,
+            "text":                     text,
+            "parse_mode":               "HTML",
+            "disable_web_page_preview": True,
+        }
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
+        r = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/editMessageText",
+            json=payload,
+            timeout=5
+        )
+        try:
+            data = r.json()
+            if data.get("ok"):
+                return True
+            # "message is not modified" ist kein echter Fehler (Callback hat
+            # gar nichts verändert, z.B. Tap auf bereits geöffneten Coin)
+            desc = (data.get("description") or "").lower()
+            if "not modified" in desc:
+                return True
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return False
+
+
+def telegram_answer_callback(
+    callback_id: str,
+    text: str = "",
+    show_alert: bool = False,
+) -> None:
+    """v4.25 — answerCallbackQuery: bestätigt den Tap-Event und zeigt
+    optional einen Toast/Alert (z.B. 'Slot abgelaufen'). MUSS innerhalb
+    von 15 Sekunden nach dem Tap ausgeführt werden, sonst zeigt Telegram
+    eine lästige 'Konnte Callback nicht verarbeiten'-Meldung."""
+    if not TELEGRAM_TOKEN or not callback_id:
+        return
+    try:
+        payload = {"callback_query_id": callback_id}
+        if text:
+            payload["text"]       = text
+            payload["show_alert"] = bool(show_alert)
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery",
             json=payload,
             timeout=5
         )
@@ -3451,14 +3590,36 @@ def flush_entries() -> None:
         except Exception:
             balance = 0.0
 
-        msg = format_ranked_list(ranked, balance, len(batch))
-        # v4.22: Button-Zeile mit Top-1-Bitget + BTC H2 + Total2, damit der User
-        # direkt auf den Top-Score-Coin springen kann. Die restlichen Kandidaten
-        # sind im Text als /trade-Copy-Commands verfügbar (einer pro Zeile).
-        _top_sym = ranked[0]["symbol"] if ranked else ""
-        telegram(msg, reply_markup=build_setup_buttons(_top_sym))
-        log(f"  ENTRY-QUEUE: Flush gesendet — {len(ranked)} Signale "
-            f"({n_premium} Premium)")
+        # v4.25: Button-Driven Rangliste — initialen Slot-State bauen und
+        # als Übersichts-Message senden. message_id dient als Slot-Key für
+        # spätere editMessageText-Updates bei Detail-Taps.
+        _now = __import__("datetime").datetime.now()
+        slot_label = f"{_now.strftime('%H:%M')}-Slot"
+
+        _slot_purge_expired()
+
+        slot_state = {
+            "ranked":         ranked,
+            "balance":        balance,
+            "slot_label":     slot_label,
+            "current_detail": None,
+            "view_mode":      "overview",
+            "created_ts":     time.time(),
+        }
+        overview_text = format_slot_overview(slot_state)
+        keyboard      = build_slot_keyboard(slot_state, mode="overview")
+        msg_id = telegram(overview_text, reply_markup=keyboard, return_id=True)
+
+        if msg_id:
+            with _slot_states_lock:
+                _slot_states[int(msg_id)] = slot_state
+            log(f"  ENTRY-QUEUE: Slot-Overview gesendet (msg_id={msg_id}) "
+                f"— {len(ranked)} Signale ({n_premium} Premium)")
+        else:
+            # Fallback — Callbacks funktionieren nicht, aber User sieht
+            # zumindest die Übersicht als normale Telegram-Message.
+            log("  ENTRY-QUEUE: WARNUNG — keine message_id erhalten, "
+                "Callback-Navigation deaktiviert für diesen Slot")
     except Exception as ex:
         log(f"[flush_entries] Fehler: {ex}")
         try:
@@ -3540,6 +3701,421 @@ def format_ranked_list(ranked: list, balance: float, total: int) -> str:
     _anker = "sec-alarm3"
     lines.append(_doc_link(_anker, "Alarm 3/3b — HARSI Exit"))
     return "\n".join(lines)
+
+
+# ═══════════════════════════════════════════════════════════════
+# v4.25: BUTTON-DRIVEN ENTRY-RANGLISTE
+#
+# Neue UX statt seitenlanger Rangliste:
+#   • Übersichts-Message mit Coin-Button-Grid
+#   • Tap auf Coin → Message wird zu Detail-View (nur EIN Coin offen)
+#   • Adaptives Keyboard (🎯 Berechnen / 🟠 Bitget / 📊 TV / BTC H2 /
+#     🔀 Total2 / ❌ Schliessen, darunter die restlichen Coin-Buttons)
+#   • Tap auf 🎯 Berechnen → 1-Tap /trade-Berechnung (Callback-Handler)
+# ═══════════════════════════════════════════════════════════════
+
+def _slot_purge_expired() -> None:
+    """Entfernt abgelaufene Slots aus _slot_states (TTL 2h)."""
+    cutoff = time.time() - _SLOT_TTL_SEC
+    with _slot_states_lock:
+        expired = [mid for mid, st in _slot_states.items()
+                   if st.get("created_ts", 0) < cutoff]
+        for mid in expired:
+            _slot_states.pop(mid, None)
+
+
+def _score_color_badge(score: int) -> str:
+    """Farbkodiertes Score-Badge: 🟢 ≥75 | 🟡 50–74 | 🔴 <50."""
+    if score >= 75:
+        return "🟢"
+    if score >= 50:
+        return "🟡"
+    return "🔴"
+
+
+def format_slot_overview(state: dict) -> str:
+    """Rendert die Übersichts-Message (kompakt) für einen Slot.
+    Zeigt: Header mit Slot-Label, Signal-Summary, Top-5-Kurzform, Hinweis."""
+    ranked = state.get("ranked") or []
+    balance = state.get("balance", 0) or 0
+    slot_label = state.get("slot_label", "")
+    total = len(ranked)
+    n_premium = sum(1 for e in ranked
+                    if (e.get("_scored") or {}).get("is_premium"))
+
+    lines = [
+        f"🏁 <b>DOMINUS Entry-Rangliste</b> · {html.escape(slot_label)}",
+        "━━━━━━━━━━━━",
+    ]
+    summary_bits = [f"{total} Signal{'e' if total != 1 else ''}"]
+    if n_premium:
+        summary_bits.append(f"⭐ {n_premium} Premium")
+    summary_bits.append(f"Fenster {ENTRY_QUEUE_WINDOW_SEC}s")
+    lines.append("  ·  ".join(summary_bits))
+    if balance > 0:
+        lines.append(f"💰 {balance:.2f} USDT  ·  Cap {MAX_EXPOSURE_PCT*100:.0f}%")
+    lines.append("")
+
+    # Top-5-Kurzform (extra 3 des Changelogs)
+    top5 = ranked[:5]
+    if top5:
+        top5_bits = [
+            f"{e['symbol'].replace('USDT','')} {(e.get('_scored') or {}).get('score', 0)}"
+            for e in top5
+        ]
+        lines.append("⚡ <b>Top-5</b>")
+        lines.append("  " + "  ·  ".join(top5_bits))
+        lines.append("")
+
+    lines.append("💡 <i>Coin antippen für Details</i>")
+    return "\n".join(lines)
+
+
+def format_slot_detail(state: dict, symbol: str) -> str:
+    """Rendert die Detail-View für genau einen Coin. Score-Breakdown
+    mit rechtsbündiger Punkte-Spalte + Checkliste-Gates oben."""
+    ranked = state.get("ranked") or []
+    slot_label = state.get("slot_label", "")
+    # Rang ermitteln
+    rank = None
+    entry = None
+    for i, e in enumerate(ranked, 1):
+        if e.get("symbol") == symbol:
+            rank = i
+            entry = e
+            break
+    if entry is None:
+        return format_slot_overview(state)
+
+    s        = entry.get("_scored") or {}
+    sugg     = entry.get("sugg") or {}
+    dr       = entry.get("direction", "").upper()
+    icon     = "🟢" if dr == "LONG" else "🔴"
+    score    = int(s.get("score", 0))
+    is_prem  = bool(s.get("is_premium"))
+    badge    = "⭐" if is_prem else "  "
+    entry_px = entry.get("entry", 0) or 0
+    sl       = sugg.get("sl", 0) or 0
+    sl_pct   = sugg.get("sl_dist_pct", 0) or 0
+    lev      = sugg.get("leverage", 0) or 0
+    per_ord  = sugg.get("per_order", 0) or 0
+
+    lines = [
+        f"🏁 <b>DOMINUS Entry-Rangliste</b> · {html.escape(slot_label)}",
+        "━━━━━━━━━━━━",
+        f"{badge}  <b>{rank}. {icon} {symbol} {dr}</b>  ·  "
+        f"{_score_color_badge(score)} {score}/100",
+        "",
+    ]
+
+    # Trade-Vorschlag (Entry/SL/Hebel/DCA)
+    if entry_px and sl and lev:
+        lines.append("<pre>"
+                     f"Entry   {entry_px:.5f}\n"
+                     f"SL      {sl:.5f}  ({sl_pct:.2f}%)\n"
+                     f"Hebel   {lev}x  ·  {per_ord:.2f} USDT/Order"
+                     + (f"\nDCA     {per_ord * DCA1_MULTIPLIER:.2f} / "
+                        f"{per_ord * DCA2_MULTIPLIER:.2f} USDT"
+                        if per_ord > 0 else "")
+                     + "</pre>")
+    lines.append("")
+
+    # Score-Breakdown — Gates oben (ohne Punkte), dann Faktoren mit +XX
+    breakdown = list(s.get("breakdown") or [])
+    # Pine-Gates (implizit bei ankommendem Signal)
+    lines.append("✅ DOMINUS Impuls Extremzone")
+    lines.append("✅ H4 Trigger bestätigt")
+    # Score-Faktoren aus breakdown (Format: "+XX Label" oder "-YY Label" oder "±0 Label")
+    for bd in breakdown:
+        bd = str(bd).strip()
+        if not bd:
+            continue
+        # Split in Punkte-Token (erste Gruppe) und Label (Rest)
+        parts = bd.split(" ", 1)
+        pts_tok = parts[0] if parts else ""
+        label = parts[1] if len(parts) > 1 else ""
+        # Zeichen für die Zeile: ✅ (positiv), ⚠️ (negativ), ➖ (±0)
+        if pts_tok.startswith("+") and pts_tok != "+0":
+            row_icon = "✅"
+        elif pts_tok.startswith("-"):
+            row_icon = "⚠️"
+        else:
+            row_icon = "➖"
+        # Punkte-Spalte rechtsbündig auf 4 Zeichen
+        lines.append(f"{row_icon} {label:<28} {pts_tok:>5}")
+
+    # Warnungen (falls vorhanden)
+    for w in (s.get("warnings") or []):
+        lines.append(f"⚠️ {html.escape(str(w))}")
+
+    lines.append("──────────────────────────────────────")
+    lines.append(f"<b>Score{'':<27}{score:>5}</b>")
+
+    # Premium-Hinweis aus Extreme-Info
+    xinfo = entry.get("xinfo") or {}
+    if xinfo.get("premium"):
+        lines.append("")
+        lines.append("🎯 <i>DOMINUS-Premium aktiv (Extremzone konform)</i>")
+
+    lines.append("━━━━━━━━━━━━")
+    lines.append("💡 <i>Anderen Coin antippen, oder ❌ Schliessen</i>")
+    return "\n".join(lines)
+
+
+def format_slot_more(state: dict) -> str:
+    """Rendert den 'Weitere X Signale'-Block als einzeilige Low-Score-Liste."""
+    ranked = state.get("ranked") or []
+    slot_label = state.get("slot_label", "")
+    low = [e for e in ranked if (e.get("_scored") or {}).get("score", 0)
+           < SLOT_LOWSCORE_CUT]
+    top = [e for e in ranked if (e.get("_scored") or {}).get("score", 0)
+           >= SLOT_LOWSCORE_CUT][SLOT_TOP_N:]
+    # "Weitere" = alle jenseits Top-N (Score ≥ cut) + alle unter cut
+    extra = top + low
+
+    lines = [
+        f"🏁 <b>DOMINUS Entry-Rangliste</b> · {html.escape(slot_label)}",
+        "━━━━━━━━━━━━",
+        f"<b>Weitere {len(extra)} Signale</b>",
+        "",
+    ]
+    if not extra:
+        lines.append("<i>Keine weiteren Signale.</i>")
+    else:
+        # Pro Zeile: "11 MEMEUSDT SHORT 47" (einzeilig kompakt)
+        for i, e in enumerate(extra, SLOT_TOP_N + 1):
+            s = e.get("_scored") or {}
+            sym = e.get("symbol", "").replace("USDT", "")
+            dr  = e.get("direction", "").upper()
+            sc  = int(s.get("score", 0))
+            pr  = "⭐" if s.get("is_premium") else " "
+            lines.append(f"{pr} {i:>2}. {_score_color_badge(sc)} "
+                         f"<code>{sym:<10}</code> {dr:<5} {sc:>3}")
+    lines.append("")
+    lines.append("━━━━━━━━━━━━")
+    lines.append("💡 <i>Score &lt; 50 = kein Entry empfohlen</i>")
+    return "\n".join(lines)
+
+
+def _encode_calc_payload(entry: dict) -> str:
+    """Kodiert /trade-Parameter für callback_data (Limit 64 Bytes).
+    Format: calc:SYM:DIR:LEV:ENTRY:SL  (SL/ENTRY als Float, max ~5 Nachkommastellen).
+    Beispiel: calc:AVAXUSDT:short:25:9.5420:9.8700 (36 Byte) — gut unter 64."""
+    sugg     = entry.get("sugg") or {}
+    sym      = entry.get("symbol", "")
+    dr       = entry.get("direction", "")
+    lev      = int(sugg.get("leverage", 0) or 0)
+    entry_px = float(entry.get("entry", 0) or 0)
+    sl       = float(sugg.get("sl", 0) or 0)
+    return f"calc:{sym}:{dr}:{lev}:{entry_px:.5f}:{sl:.5f}"
+
+
+def _coin_button_label(idx: int, entry: dict, is_open: bool) -> str:
+    """Kompakter Button-Label: '⭐1 AVAX 82' / '▾ AVAX 82' (aktiv)."""
+    s  = entry.get("_scored") or {}
+    sc = int(s.get("score", 0))
+    sym_short = entry.get("symbol", "").replace("USDT", "")
+    prefix = "▾" if is_open else ("⭐" if s.get("is_premium") else "")
+    # Rang-Nr nur wenn nicht offen (der aufgeklappte Coin zeigt ▾)
+    if is_open:
+        return f"{prefix} {sym_short} {sc}"
+    # Kompakt: "⭐1 AVAX 82" / "2 OP 78"
+    if prefix:
+        return f"{prefix}{idx} {sym_short} {sc}"
+    return f"{idx} {sym_short} {sc}"
+
+
+def build_slot_keyboard(state: dict, open_symbol: str = None,
+                        mode: str = "overview") -> dict:
+    """v4.25 — Adaptives Inline-Keyboard für die Slot-Message.
+
+    mode="overview": nur Coin-Grid (Top-N) + Weitere-Button.
+    mode="detail":   Detail-Aktionen oben (Berechnen / Bitget / TV / BTC /
+                     Total2 / Schliessen) + Divider + Coin-Grid.
+    mode="more":     einfacher Zurück-Button.
+    """
+    ranked = state.get("ranked") or []
+    rows: list = []
+
+    if mode == "more":
+        rows.append([
+            {"text": "⬅ Zurück zur Rangliste", "callback_data": "back"},
+        ])
+        return {"inline_keyboard": rows}
+
+    # Detail-Zustand: Aktions-Buttons zuerst
+    if mode == "detail" and open_symbol:
+        open_entry = next((e for e in ranked
+                           if e.get("symbol") == open_symbol), None)
+        if open_entry:
+            sugg = open_entry.get("sugg") or {}
+            base_coin = open_symbol.replace("USDT", "").replace(".P", "")
+            links = tv_chart_links(open_symbol)
+            # Reihe 1: 🎯 Berechnen (Callback für 1-Tap /trade)
+            if (sugg.get("leverage") and open_entry.get("entry")
+                    and sugg.get("sl")):
+                rows.append([{
+                    "text": f"🎯 Berechnen {base_coin} (1-Tap)",
+                    "callback_data": _encode_calc_payload(open_entry),
+                }])
+            # Reihe 2: Bitget + TV (URL-Buttons)
+            rows.append([
+                {"text": f"🟠 Bitget {base_coin}", "url": links["bitget"]},
+                {"text": f"📊 TV {base_coin} H2", "url": links["coin_h2"]},
+            ])
+            # Reihe 3: BTC H2 + Total2
+            rows.append([
+                {"text": "📈 BTC H2", "url": links["btc_h2"]},
+                {"text": "🔀 Total2", "url": links["total2"]},
+            ])
+            # Reihe 4: Schliessen
+            rows.append([
+                {"text": "❌ Schliessen", "callback_data": "close"},
+            ])
+            # Reihe 5: Divider (noop)
+            rows.append([
+                {"text": "━━━━━ Weitere Signale ━━━━━",
+                 "callback_data": "noop"},
+            ])
+
+    # Coin-Grid (Top-N, sortiert nach Score absteigend)
+    top = ranked[:SLOT_TOP_N]
+    # 3 Buttons pro Reihe
+    grid_row: list = []
+    for i, e in enumerate(top, 1):
+        sym = e.get("symbol", "")
+        is_open = (mode == "detail" and sym == open_symbol)
+        grid_row.append({
+            "text": _coin_button_label(i, e, is_open),
+            "callback_data": f"detail:{sym}",
+        })
+        if len(grid_row) == 3:
+            rows.append(grid_row)
+            grid_row = []
+    if grid_row:
+        rows.append(grid_row)
+
+    # "Weitere N Signale"-Button (nur wenn Rest existiert)
+    rest_count = max(0, len(ranked) - SLOT_TOP_N)
+    if rest_count > 0:
+        rows.append([
+            {"text": f"▾ {rest_count} weitere", "callback_data": "more"},
+        ])
+
+    return {"inline_keyboard": rows}
+
+
+def handle_callback_query(update: dict) -> None:
+    """v4.25 — Dispatcher für Inline-Button-Taps in der Slot-Rangliste.
+
+    Erwartete callback_data-Formate:
+      detail:{SYMBOL}                        → Coin aufklappen
+      close                                  → zurück zur Übersicht
+      more                                   → Weitere-Block zeigen
+      back                                   → aus more/detail zurück zur Übersicht
+      calc:{SYM}:{DIR}:{LEV}:{ENTRY}:{SL}    → 1-Tap /trade-Berechnung
+      noop                                   → Divider / Label-Button (ignoriert)
+
+    Slot wird über msg_id identifiziert (eindeutig pro flush_entries()-Lauf).
+    Expired/unbekannte Slots → Toast "Slot abgelaufen — neue H2-Welle abwarten".
+    """
+    cbq = update.get("callback_query")
+    if not cbq:
+        return
+    callback_id = cbq.get("id", "")
+    data        = (cbq.get("data") or "").strip()
+    msg         = cbq.get("message") or {}
+    msg_id      = int(msg.get("message_id") or 0)
+    # Sicherheit: nur eigene Chat-ID
+    chat_id_cb = str((msg.get("chat") or {}).get("id", ""))
+    if chat_id_cb and chat_id_cb != str(TELEGRAM_CHAT_ID):
+        telegram_answer_callback(callback_id, "⛔ Nicht erlaubt")
+        return
+
+    log(f"Callback empfangen: data={data!r} msg_id={msg_id}")
+
+    # Noop / Divider — nur Toast unterdrücken
+    if data == "noop" or not data:
+        telegram_answer_callback(callback_id)
+        return
+
+    # Slot-State laden
+    with _slot_states_lock:
+        state = _slot_states.get(msg_id)
+
+    if state is None:
+        telegram_answer_callback(
+            callback_id,
+            "⏳ Slot abgelaufen — neue H2-Welle abwarten.",
+            show_alert=True,
+        )
+        return
+
+    # 1-Tap-Berechnung — delegiert an cmd_trade() mit den encodierten Parametern
+    if data.startswith("calc:"):
+        try:
+            _, sym, dr, lev, entry_px, sl = data.split(":", 5)
+            # cmd_trade erwartet: parts = ["/trade", SYMBOL, DIR, LEV, ENTRY, SL]
+            cmd_trade(["/trade", sym, dr.upper(), lev, entry_px, sl])
+            telegram_answer_callback(callback_id, "🎯 Berechne...")
+        except Exception as ex:
+            log(f"[callback calc] Fehler: {ex}")
+            telegram_answer_callback(
+                callback_id,
+                f"❌ Berechnung fehlgeschlagen: {ex}",
+                show_alert=True,
+            )
+        return
+
+    # Navigations-Callbacks — alle mutieren state + editen Message
+    if data == "close" or data == "back":
+        new_mode = "overview"
+        open_sym = None
+    elif data == "more":
+        new_mode = "more"
+        open_sym = None
+    elif data.startswith("detail:"):
+        new_mode = "detail"
+        open_sym = data.split(":", 1)[1]
+        # Sicherheit: Symbol muss in ranked sein
+        if not any(e.get("symbol") == open_sym for e in (state.get("ranked") or [])):
+            telegram_answer_callback(callback_id, "Coin nicht im Slot.")
+            return
+    else:
+        telegram_answer_callback(callback_id)
+        return
+
+    # State mutieren (unter Lock)
+    with _slot_states_lock:
+        current_state = _slot_states.get(msg_id)
+        if current_state is None:
+            telegram_answer_callback(callback_id, "⏳ Slot abgelaufen.",
+                                     show_alert=True)
+            return
+        current_state["view_mode"]      = new_mode
+        current_state["current_detail"] = open_sym
+        state_snapshot = dict(current_state)  # für Rendering ausserhalb Lock
+
+    # Rendern + editMessageText
+    if new_mode == "overview":
+        new_text = format_slot_overview(state_snapshot)
+        new_kb   = build_slot_keyboard(state_snapshot, mode="overview")
+    elif new_mode == "more":
+        new_text = format_slot_more(state_snapshot)
+        new_kb   = build_slot_keyboard(state_snapshot, mode="more")
+    else:  # detail
+        new_text = format_slot_detail(state_snapshot, open_sym)
+        new_kb   = build_slot_keyboard(
+            state_snapshot, open_symbol=open_sym, mode="detail"
+        )
+
+    ok = telegram_edit_message(msg_id, new_text, reply_markup=new_kb)
+    if ok:
+        telegram_answer_callback(callback_id)
+    else:
+        telegram_answer_callback(
+            callback_id, "⚠️ Update fehlgeschlagen", show_alert=False
+        )
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -5145,6 +5721,14 @@ def poll_telegram_commands():
 
     updates = get_telegram_updates()
     for update in updates:
+        # v4.25: Callback-Query für Button-Driven Entry-Rangliste
+        if update.get("callback_query"):
+            try:
+                handle_callback_query(update)
+            except Exception as ex:
+                log(f"[handle_callback_query] Fehler: {ex}")
+            continue
+
         msg = update.get("message")
         if not msg:
             continue
@@ -5982,7 +6566,7 @@ def start_webhook_server():
     @app.route("/", methods=["GET"])
     @app.route("/health", methods=["GET"])
     def health():
-        return jsonify({"status": "running", "version": "v4.24"}), 200
+        return jsonify({"status": "running", "version": "v4.25"}), 200
 
     port = _env_int("PORT", 8080)
     # WICHTIG: Token NICHT ins Log schreiben — er landet sonst in Railway-Logs.
@@ -6877,7 +7461,7 @@ def main():
         log("In Railway → Variables eintragen.")
         return
 
-    log("DOMINUS Trade-Automatisierung v4.24 gestartet — mit finanzmathematischen Optimierungen")
+    log("DOMINUS Trade-Automatisierung v4.25 gestartet — mit finanzmathematischen Optimierungen")
     log(f"Intervall: {POLL_INTERVAL}s")
     log("Warte auf neue Trades...")
     log("─" * 55)
