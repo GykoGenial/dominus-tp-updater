@@ -1,12 +1,30 @@
 #!/usr/bin/env python3
 """
-DOMINUS Channel Monitor
+DOMINUS Channel Monitor  v1.3  (2026-04-22)
 ════════════════════════════════════════════════════════════════
 Überwacht den Dominus Telegram-Kanal auf neue Coins UND optional
 parallel eine öffentliche TradingView-Watchlist.
 Prüft Verfügbarkeit auf Bitget (bevorzugt) oder Bybit.
 Sendet bei neuen Coins eine aktualisierte TradingView-Watchlist
 als importierbare .txt-Datei per Telegram.
+
+Changelog v1.3:
+  • BUG-FIX: _state_lock wurde referenziert aber nie definiert
+    → Live-Updates crashten lautlos bei jeder Coin-Liste im Kanal.
+    Lock ist jetzt eine lokale asyncio.Lock() in main().
+  • BUG-FIX: STATE_FILE lag im /tmp (wird von Railway bei jedem
+    Redeploy gewischt). Jetzt über MONITOR_STATE_FILE env var auf
+    Railway-Volume /app/data/. Auto-Migration vom alten /tmp-Pfad.
+  • BUG-FIX: Initial-Bootstrap hat den TV-Abgleich ignoriert und
+    alle historischen Channel-Coins in die Watchlist gekippt.
+    Jetzt wird zuerst die TV-Baseline (via API + Seed-Fallback)
+    geladen, dann der Channel gegen diese Baseline gefiltert.
+  • NEU: Seed-File master_watchlist.txt (Format: TV-Export,
+    komma- oder zeilen-separiert) als Offline-Fallback, wenn die
+    TV-API nicht erreichbar ist.
+  • NEU: Channel-History auf 2000 Msgs erweitert (konfigurierbar).
+  • NEU: MONITOR_REBUILD=1 erzwingt einen sauberen Re-Bootstrap
+    (State wird gewipt, TV-Baseline + Full-Channel neu aufgebaut).
 
 Benötigte Railway-Variablen:
   TELEGRAM_API_ID         → my.telegram.org API ID
@@ -16,17 +34,17 @@ Benötigte Railway-Variablen:
   TELEGRAM_TOKEN          → Bot-Token
   TELEGRAM_CHAT_ID        → Deine Chat-ID
 
-Optionale Railway-Variablen (TV-Abgleich als Filter):
-  TV_WATCHLIST_URL        → Öffentliche TV-Watchlist, z.B.
-                            https://de.tradingview.com/watchlists/328392936/
-                            Dient als "Ist-Stand" — Coins, die dort schon
-                            enthalten sind, werden in der Telegram-Meldung
-                            NICHT mehr als neu angezeigt.
-                            Leer = TV-Abgleich deaktiviert.
+Optionale Railway-Variablen:
+  TV_WATCHLIST_URL                → Öffentliche TV-Watchlist (Abgleich-Filter)
+  MONITOR_STATE_FILE              → /app/data/dominus_watchlist.json (Default)
+  MONITOR_SEED_FILE               → Pfad zur TV-Export-Baseline-Datei
+                                    Default: master_watchlist.txt im Skript-Ordner
+  MONITOR_CHANNEL_HISTORY_LIMIT   → Max. Nachrichten beim initialen Walk (Default 2000)
+  MONITOR_REBUILD                 → "1" erzwingt kompletten Re-Bootstrap
 ════════════════════════════════════════════════════════════════
 """
 
-import os, json, re, time, asyncio, logging, io
+import os, json, re, time, asyncio, logging, io, shutil
 import requests
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
@@ -53,7 +71,26 @@ TV_WATCHLIST_URL = os.environ.get("TV_WATCHLIST_URL", TV_WATCHLIST_URL_DEFAULT).
 # Jede Telegram-Meldung innerhalb dieses Fensters nutzt den gecachten Stand.
 TV_CACHE_TTL = 12 * 3600  # 43'200 Sekunden = 12 h
 
-STATE_FILE     = "/tmp/dominus_watchlist.json"
+# State auf Railway-Volume (/app/data/) — überlebt Redeploys.
+# Alter Pfad /tmp/dominus_watchlist.json wird beim Start automatisch migriert.
+STATE_FILE       = os.environ.get("MONITOR_STATE_FILE", "/app/data/dominus_watchlist.json")
+STATE_FILE_LEGACY = "/tmp/dominus_watchlist.json"
+
+# Seed-Datei (TV-Export als Offline-Baseline). Wird verwendet, wenn die TV-API
+# beim Bootstrap nicht erreichbar ist. Default: master_watchlist.txt im Skript-Ordner.
+SEED_FILE = os.environ.get(
+    "MONITOR_SEED_FILE",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "master_watchlist.txt"),
+)
+
+# Wie viele Nachrichten aus dem Kanal beim initialen Bootstrap durchgehen?
+# 100 war zu wenig (alter Default) — der volle Kanal hat deutlich mehr.
+CHANNEL_HISTORY_LIMIT = int(os.environ.get("MONITOR_CHANNEL_HISTORY_LIMIT", "2000"))
+
+# Sauberer Re-Bootstrap: State wipen, TV-Baseline + Full-Channel neu aufbauen.
+# Setze MONITOR_REBUILD=1 in Railway und redeploye — nach dem Rebuild wieder auf 0.
+MONITOR_REBUILD = os.environ.get("MONITOR_REBUILD", "0").strip().lower() in ("1", "true", "yes", "on")
+
 SYMBOL_CACHE_TTL = 6 * 3600   # Exchange-Listen alle 6h neu laden
 
 # ── Coin-Erkennung ────────────────────────────────────────────────
@@ -224,6 +261,30 @@ def resolve_tv_symbol(coin: str) -> tuple[str, str] | tuple[None, None]:
 
 
 # ── State-Persistenz ─────────────────────────────────────────────
+def _ensure_state_dir() -> None:
+    """Stellt sicher, dass der Zielordner für STATE_FILE existiert."""
+    d = os.path.dirname(os.path.abspath(STATE_FILE))
+    if d and not os.path.exists(d):
+        try:
+            os.makedirs(d, exist_ok=True)
+        except Exception as e:
+            log.warning(f"State-Verzeichnis konnte nicht erstellt werden ({d}): {e}")
+
+
+def _migrate_legacy_state() -> None:
+    """Kopiert einen alten /tmp-State einmalig auf den neuen /app/data-Pfad."""
+    if os.path.exists(STATE_FILE):
+        return  # neuer Pfad bereits vorhanden — nichts zu tun
+    if not os.path.exists(STATE_FILE_LEGACY):
+        return  # kein alter State
+    try:
+        _ensure_state_dir()
+        shutil.copy2(STATE_FILE_LEGACY, STATE_FILE)
+        log.info(f"Legacy-State migriert: {STATE_FILE_LEGACY} → {STATE_FILE}")
+    except Exception as e:
+        log.warning(f"State-Migration fehlgeschlagen: {e}")
+
+
 def load_state() -> dict:
     try:
         with open(STATE_FILE) as f:
@@ -234,8 +295,65 @@ def load_state() -> dict:
 
 def save_state(state: dict) -> None:
     state["updated"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    _ensure_state_dir()
     with open(STATE_FILE, "w") as f:
         json.dump(state, f, indent=2)
+
+
+# ── Seed-File (TV-Export als Offline-Baseline) ────────────────────
+def load_seed_symbols() -> list[str]:
+    """
+    Liest die TV-Export-Datei und gibt die darin enthaltenen TV-Symbole
+    (z.B. 'BITGET:BTCUSDT.P') als Liste zurück.
+    Unterstützt sowohl komma-separiertes als auch zeilen-separiertes Format
+    (TradingView exportiert standardmässig komma-separiert auf einer Zeile).
+    Leere Liste → Datei nicht gefunden oder leer.
+    """
+    if not os.path.exists(SEED_FILE):
+        return []
+    try:
+        with open(SEED_FILE, encoding="utf-8") as f:
+            content = f.read()
+    except Exception as e:
+        log.warning(f"Seed-File nicht lesbar ({SEED_FILE}): {e}")
+        return []
+    # Komma oder Zeilenumbruch als Trenner akzeptieren
+    parts = re.split(r"[,\n\r]+", content)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def seed_tv_coins() -> set[str]:
+    """Gibt die Basiswährungs-Menge aus der Seed-Datei zurück."""
+    syms = load_seed_symbols()
+    coins: set[str] = set()
+    for s in syms:
+        base = tv_symbol_to_coin(s)
+        if base:
+            coins.add(base)
+    return coins
+
+
+def get_tv_baseline_coins() -> set[str]:
+    """
+    Liefert die aktuelle TV-Baseline für den Initial-Bootstrap.
+    Priorität:
+      1) Live TV-API (via get_tv_watchlist_coins)
+      2) Seed-File (master_watchlist.txt) als Offline-Fallback
+      3) Leere Menge (Bootstrap läuft ohne Baseline)
+    """
+    try:
+        live = get_tv_watchlist_coins()
+        if live:
+            log.info(f"[Baseline] TV-API: {len(live)} Coins")
+            return live
+    except Exception as e:
+        log.warning(f"[Baseline] TV-API fehlgeschlagen: {e}")
+    seed = seed_tv_coins()
+    if seed:
+        log.info(f"[Baseline] Seed-File {SEED_FILE}: {len(seed)} Coins (Offline-Fallback)")
+    else:
+        log.warning(f"[Baseline] Kein Seed-File gefunden ({SEED_FILE}) — Bootstrap ohne Baseline")
+    return seed
 
 
 # ── TradingView Watchlist .txt ────────────────────────────────────
@@ -362,10 +480,101 @@ def get_tv_watchlist_coins() -> set[str]:
     return coins
 
 
+# ── Bootstrap ─────────────────────────────────────────────────────
+async def bootstrap_state(client, channel, state: dict) -> dict:
+    """
+    Baut den State aus TV-Baseline + voller Channel-History auf.
+    Wird ausgeführt bei:
+      - leerem State (erster Start)
+      - MONITOR_REBUILD=1 (erzwungener Rebuild)
+
+    Reihenfolge:
+      1) TV-Baseline (Live-API → Seed-Fallback) als "bereits bekannt" markieren
+         + alle in Exchange verfügbaren Coins in state["watchlist"] übernehmen.
+      2) Volle Channel-History durchlaufen (CHANNEL_HISTORY_LIMIT).
+      3) Für Channel-Coins NICHT in TV-Baseline → auflösen + zur Watchlist.
+      4) Persistieren.
+    """
+    log.info("=== Bootstrap gestartet ===")
+
+    # 1) TV-Baseline laden
+    baseline_coins: set[str] = await asyncio.to_thread(get_tv_baseline_coins)
+    baseline_known: set[str] = set()
+    baseline_resolved: list[str] = []
+
+    for coin in sorted(baseline_coins):
+        baseline_known.add(coin)
+        tv_sym, _ = resolve_tv_symbol(coin)
+        if tv_sym:
+            baseline_resolved.append(tv_sym)
+
+    state["known_coins"] = sorted(baseline_known)
+    state["watchlist"]   = sorted(set(baseline_resolved))
+    state["skipped"]     = []  # wird gleich durch Channel-Walk ergänzt
+    log.info(f"[Bootstrap] TV-Baseline: {len(baseline_known)} Coins "
+             f"({len(baseline_resolved)} auf Bitget/Bybit verfügbar)")
+
+    # 2) Volle Channel-History durchlaufen
+    log.info(f"[Bootstrap] Lese letzte {CHANNEL_HISTORY_LIMIT} Nachrichten aus dem Kanal...")
+    channel_raw: list[str] = []
+    msg_count = 0
+    coin_msg_count = 0
+    async for msg in client.iter_messages(channel, limit=CHANNEL_HISTORY_LIMIT):
+        msg_count += 1
+        if not msg.text:
+            continue
+        coins = extract_coins(msg.text)
+        if coins:
+            coin_msg_count += 1
+            for c in coins:
+                if c not in channel_raw:
+                    channel_raw.append(c)
+    log.info(f"[Bootstrap] {msg_count} Nachrichten gelesen, "
+             f"{coin_msg_count} Coin-Listen, {len(channel_raw)} Roh-Coins extrahiert")
+
+    # 3) Channel-Coins verarbeiten (filter gegen Baseline passiert implizit via known_coins)
+    new_syms, skipped = process_new_coins(channel_raw, state)
+
+    # 4) Persistieren
+    save_state(state)
+
+    log.info(f"=== Bootstrap fertig: {len(state['watchlist'])} Watchlist-Symbole, "
+             f"{len(new_syms)} neue aus Channel, {len(skipped)} nicht gefunden ===")
+
+    # Telegram-Report
+    lines = [
+        "✅ <b>Dominus-Monitor Bootstrap abgeschlossen</b>",
+        "",
+        f"📊 TV-Baseline: <b>{len(baseline_known)}</b> Coins",
+        f"📋 Watchlist gesamt: <b>{len(state['watchlist'])}</b> Symbole",
+        f"➕ Aus Kanal-History neu: <b>{len(new_syms)}</b>",
+    ]
+    if skipped:
+        lines.append(f"⚠️ Nicht auf Bitget/Bybit: {', '.join(skipped[:15])}"
+                     + (f" …(+{len(skipped)-15})" if len(skipped) > 15 else ""))
+    lines += ["", "Ab jetzt werden neue Coins automatisch erkannt."]
+    send_text("\n".join(lines))
+
+    return state
+
+
 # ── Hauptprogramm ────────────────────────────────────────────────
 async def main() -> None:
+    log.info("════ Dominus Channel Monitor v1.3 ════")
+    log.info(f"STATE_FILE = {STATE_FILE}")
+    log.info(f"SEED_FILE  = {SEED_FILE} (exists={os.path.exists(SEED_FILE)})")
+    log.info(f"CHANNEL_HISTORY_LIMIT = {CHANNEL_HISTORY_LIMIT}")
+    log.info(f"MONITOR_REBUILD = {MONITOR_REBUILD}")
+
+    # State-Migration & Directory-Setup
+    _ensure_state_dir()
+    _migrate_legacy_state()
+
     # Exchange-Listen beim Start laden
     _load_exchange_symbols()
+
+    # Thread-safe State-Lock für concurrent Channel-Events
+    state_lock = asyncio.Lock()
 
     client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
     await client.start()
@@ -381,53 +590,30 @@ async def main() -> None:
         channel = await client.get_entity(CHANNEL_LINK)
     log.info(f"Kanal verbunden: {getattr(channel, 'title', CHANNEL_LINK)}")
 
-    # Initiale Watchlist aus Channel-Historie aufbauen
+    # TV-Abgleich-Setup-Check (damit Config-Fehler früh im Log auftauchen)
+    if TV_WATCHLIST_URL:
+        if _extract_watchlist_id(TV_WATCHLIST_URL):
+            log.info(f"TV-Abgleich aktiv: {TV_WATCHLIST_URL}")
+        else:
+            log.warning(f"TV_WATCHLIST_URL gesetzt, aber keine ID extrahierbar: {TV_WATCHLIST_URL}")
+    else:
+        log.info("TV_WATCHLIST_URL nicht gesetzt → kein TV-Abgleich")
+
+    # State laden + ggf. Bootstrap erzwingen
     state = load_state()
-    if not state.get("known_coins"):
-        log.info("Erstelle initiale Watchlist aus letzten 100 Nachrichten...")
-        all_raw: list[str] = []
-        async for msg in client.iter_messages(channel, limit=100):
-            if msg.text:
-                coins = extract_coins(msg.text)
-                for c in coins:
-                    if c not in all_raw:
-                        all_raw.append(c)
+    need_bootstrap = MONITOR_REBUILD or not state.get("known_coins")
 
-        process_new_coins(all_raw, state)
-        save_state(state)
-        log.info(f"Initiale Watchlist: {len(state['watchlist'])} Symbole "
-                 f"({len(state['skipped'])} nicht gefunden)")
-
-        skip_note = ""
-        if state["skipped"]:
-            skip_note = f"\n⚠️ Nicht gefunden: {', '.join(state['skipped'])}"
-        send_text(
-            f"✅ <b>Dominus-Monitor gestartet</b>\n"
-            f"Watchlist aufgebaut: <b>{len(state['watchlist'])} Symbole</b>"
-            f" aus {len(state['known_coins'])} Kanal-Coins{skip_note}\n\n"
-            f"Ab jetzt werden neue Coins automatisch erkannt und die\n"
-            f"Watchlist-Datei automatisch zugestellt."
-        )
+    if need_bootstrap:
+        if MONITOR_REBUILD:
+            log.info("MONITOR_REBUILD=1 → State wird komplett neu aufgebaut")
+            state = {"known_coins": [], "watchlist": [], "skipped": []}
+        state = await bootstrap_state(client, channel, state)
     else:
         log.info(f"State geladen: {len(state['watchlist'])} Symbole bekannt")
         send_text(
             f"▶️ <b>Dominus-Monitor neugestartet</b>\n"
             f"Watchlist: {len(state['watchlist'])} Symbole — überwache auf Neuzugänge."
         )
-
-    # TV-Abgleich initial prüfen (damit ein Fehler früh im Log auftaucht)
-    if TV_WATCHLIST_URL:
-        if _extract_watchlist_id(TV_WATCHLIST_URL):
-            log.info(f"TV-Abgleich aktiv: {TV_WATCHLIST_URL}")
-            try:
-                initial = await asyncio.to_thread(get_tv_watchlist_coins)
-                log.info(f"TV-Watchlist initial: {len(initial)} Coins")
-            except Exception as e:
-                log.warning(f"TV-Initial-Fetch fehlgeschlagen (Abgleich arbeitet später on-demand): {e}")
-        else:
-            log.warning(f"TV_WATCHLIST_URL gesetzt, aber keine ID extrahierbar: {TV_WATCHLIST_URL}")
-    else:
-        log.info("TV_WATCHLIST_URL nicht gesetzt → kein TV-Abgleich")
 
     # Neue Nachrichten überwachen
     @client.on(events.NewMessage(chats=channel))
@@ -462,7 +648,7 @@ async def main() -> None:
             log.info("Alle Coins aus dieser Meldung sind bereits in der TV-Watchlist — kein Update")
             return
 
-        async with _state_lock:
+        async with state_lock:
             st = load_state()
             new_syms, skipped = process_new_coins(raw_coins, st)
             if new_syms:
