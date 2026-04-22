@@ -1,12 +1,23 @@
 #!/usr/bin/env python3
 """
-DOMINUS Channel Monitor  v1.3  (2026-04-22)
+DOMINUS Channel Monitor  v1.4  (2026-04-22)
 ════════════════════════════════════════════════════════════════
 Überwacht den Dominus Telegram-Kanal auf neue Coins UND optional
 parallel eine öffentliche TradingView-Watchlist.
 Prüft Verfügbarkeit auf Bitget (bevorzugt) oder Bybit.
 Sendet bei neuen Coins eine aktualisierte TradingView-Watchlist
-als importierbare .txt-Datei per Telegram.
+als importierbare .txt-Datei + eine interaktive HTML-Clicklist
+(ein Button je Coin, kopiert BITGET:XYZUSDT.P in die Zwischenablage)
+per Telegram.
+
+Changelog v1.4:
+  • NEU: HTML-Clicklist integriert. Bei jedem Bootstrap-Ende und
+    bei jeder Watchlist-Änderung wird zusätzlich zur .txt eine
+    bitget_clicklist_<timestamp>.html-Datei via Telegram gesendet.
+    Pro Coin ein Button → Klick kopiert BITGET:XYZUSDT.P ins
+    Clipboard (in TV-Symbolfeld paste'n). Filter: nur Coins, die
+    live auf der Bitget USDT-Perp-API sind. Rest in Collapsible
+    am Ende als "nicht verfügbar" markiert.
 
 Changelog v1.3:
   • BUG-FIX: _state_lock wurde referenziert aber nie definiert
@@ -412,6 +423,138 @@ def send_text(text: str) -> None:
         log.warning(f"Telegram-Send fehlgeschlagen: {e}")
 
 
+# ── Bitget Clicklist HTML (ein Button je Coin) ────────────────────
+def build_clicklist_html(available: list[str], bitget_ok: bool,
+                        unavailable: list[str]) -> str:
+    """
+    Generiert eine autonome HTML-Seite mit einem Button je Coin. Beim Klick
+    wird 'BITGET:XYZUSDT.P' in die Zwischenablage kopiert. Offline benutzbar
+    (keine externen Assets). Öffnet in jedem Browser, auch auf iOS.
+    """
+    count      = len(available)
+    ts         = time.strftime("%Y-%m-%d %H:%M")
+    filter_msg = ("gegen aktuelle Bitget-API gefiltert"
+                  if bitget_ok else "Bitget-API war offline — <b>kein Filter</b>")
+    buttons = "\n".join(
+        f'    <button class="btn" data-sym="BITGET:{c}USDT.P">'
+        f'<span class="sym">{c}</span><span class="copy">📋</span></button>'
+        for c in available
+    )
+    un_html = ""
+    if unavailable:
+        items = ", ".join(f"<code>{c}</code>" for c in unavailable)
+        un_html = (
+            '\n  <details class="excluded">\n'
+            f'    <summary>⚠️ {len(unavailable)} Coin(s) nicht auf Bitget (ausgeschlossen)</summary>\n'
+            f'    <div class="exc-body">{items}</div>\n'
+            '  </details>'
+        )
+    return f"""<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bitget Clicklist · {count} Coins</title>
+<style>
+  *{{box-sizing:border-box}}
+  body{{font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text",system-ui,sans-serif;
+       background:#0f141a;color:#e6edf3;margin:0;padding:20px}}
+  h1{{font-size:18px;font-weight:600;margin:0 0 4px}}
+  .meta{{color:#8b949e;font-size:12px;line-height:1.55;margin-bottom:16px}}
+  .meta code{{color:#e6edf3;background:#1f252d;padding:1px 5px;border-radius:4px}}
+  .grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:6px}}
+  .btn{{background:#1f252d;color:#e6edf3;border:1px solid #2d343d;border-radius:8px;
+        padding:10px 12px;font:600 13px/1 -apple-system,system-ui;cursor:pointer;
+        display:flex;justify-content:space-between;align-items:center;
+        transition:background .12s,border-color .12s,transform .05s;user-select:none}}
+  .btn:hover{{background:#28303a;border-color:#3f4855}}
+  .btn:active{{transform:scale(.97)}}
+  .btn.ok{{background:#1f3d2a;border-color:#2d6a45}}
+  .btn.ok .copy{{color:#4ade80}}
+  .sym{{letter-spacing:.02em}}
+  .copy{{opacity:.55;font-size:12px;transition:color .12s}}
+  .toast{{position:fixed;bottom:22px;left:50%;transform:translateX(-50%);
+         background:#1f3d2a;color:#e6edf3;border:1px solid #2d6a45;
+         padding:10px 18px;border-radius:10px;font-size:13px;font-weight:500;
+         opacity:0;transition:opacity .18s;pointer-events:none;
+         box-shadow:0 4px 12px rgba(0,0,0,.4)}}
+  .toast.show{{opacity:1}}
+  .excluded{{margin-top:20px;background:#1a1f27;border:1px solid #2d343d;
+             border-radius:8px;padding:10px 14px}}
+  .excluded summary{{cursor:pointer;color:#f59e0b;font-size:13px}}
+  .exc-body{{margin-top:10px;color:#8b949e;font-size:12px;line-height:1.8}}
+  .exc-body code{{background:#0f141a;padding:1px 6px;border-radius:4px}}
+  kbd{{background:#1f252d;border:1px solid #3f4855;border-bottom-width:2px;
+       border-radius:4px;padding:1px 5px;font-size:11px}}
+</style>
+</head>
+<body>
+<h1>Bitget Clicklist · {count} Coin(s)</h1>
+<div class="meta">
+  Stand: {ts} · {filter_msg}<br>
+  Klick kopiert <code>BITGET:XYZUSDT.P</code> ins Clipboard — danach in TradingView ins Symbolfeld (<kbd>⌘V</kbd>).<br>
+  Wird automatisch neu generiert sobald der Monitor einen neuen Coin aus dem Kanal aufnimmt.
+</div>
+<div class="grid">
+{buttons}
+</div>{un_html}
+<div class="toast" id="toast"></div>
+<script>
+const toast=document.getElementById('toast');let tt=null;
+function showToast(m){{toast.textContent=m;toast.classList.add('show');
+  clearTimeout(tt);tt=setTimeout(()=>toast.classList.remove('show'),1100)}}
+async function copyText(t){{
+  if(navigator.clipboard&&window.isSecureContext){{await navigator.clipboard.writeText(t);return}}
+  const ta=document.createElement('textarea');ta.value=t;ta.style.position='fixed';ta.style.opacity='0';
+  document.body.appendChild(ta);ta.select();document.execCommand('copy');document.body.removeChild(ta)
+}}
+document.querySelectorAll('.btn').forEach(b=>{{
+  b.addEventListener('click',async()=>{{
+    const s=b.dataset.sym;
+    try{{await copyText(s);b.classList.add('ok');
+      setTimeout(()=>b.classList.remove('ok'),900);showToast(s+' kopiert')
+    }}catch(e){{showToast('Kopieren fehlgeschlagen: '+e.message)}}
+  }})
+}});
+</script>
+</body>
+</html>
+"""
+
+
+def send_clicklist_file(state: dict, caption_prefix: str = "📋 Bitget Clicklist") -> None:
+    """
+    Baut die Bitget-Clicklist aus dem aktuellen state (live-gefiltert gegen
+    _bitget_syms) und sendet sie als HTML-Attachment via Telegram.
+    """
+    _ensure_symbols_fresh()  # stellt sicher, dass _bitget_syms aktuell ist
+    known = set(state.get("known_coins", []))
+    if _bitget_syms:
+        available   = sorted(c for c in known if c in _bitget_syms)
+        unavailable = sorted(c for c in known if c not in _bitget_syms)
+        bitget_ok   = True
+    else:
+        available   = sorted(known)
+        unavailable = []
+        bitget_ok   = False
+
+    html     = build_clicklist_html(available, bitget_ok, unavailable)
+    filename = f"bitget_clicklist_{time.strftime('%Y%m%d_%H%M')}.html"
+    caption  = f"{caption_prefix} — {len(available)} Coins"
+    if unavailable:
+        caption += f" (+{len(unavailable)} nicht auf Bitget)"
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument",
+            data={"chat_id": CHAT_ID, "caption": caption},
+            files={"document": (filename, io.BytesIO(html.encode("utf-8")), "text/html")},
+            timeout=15,
+        )
+        log.info(f"[Clicklist] gesendet: {filename} ({len(available)} Coins, {len(unavailable)} excluded)")
+    except Exception as e:
+        log.warning(f"Clicklist-Send fehlgeschlagen: {e}")
+
+
 # ── Neue Coins verarbeiten ────────────────────────────────────────
 def process_new_coins(raw_coins: list[str], state: dict) -> tuple[list[str], list[str]]:
     """
@@ -555,12 +698,15 @@ async def bootstrap_state(client, channel, state: dict) -> dict:
     lines += ["", "Ab jetzt werden neue Coins automatisch erkannt."]
     send_text("\n".join(lines))
 
+    # v1.4: Clicklist-HTML direkt nach dem Bootstrap mitschicken
+    await asyncio.to_thread(send_clicklist_file, state, "📋 Bitget Clicklist (Bootstrap)")
+
     return state
 
 
 # ── Hauptprogramm ────────────────────────────────────────────────
 async def main() -> None:
-    log.info("════ Dominus Channel Monitor v1.3 ════")
+    log.info("════ Dominus Channel Monitor v1.4 ════")
     log.info(f"STATE_FILE = {STATE_FILE}")
     log.info(f"SEED_FILE  = {SEED_FILE} (exists={os.path.exists(SEED_FILE)})")
     log.info(f"CHANNEL_HISTORY_LIMIT = {CHANNEL_HISTORY_LIMIT}")
@@ -656,6 +802,8 @@ async def main() -> None:
 
         if new_syms:
             await asyncio.to_thread(send_watchlist_file, st, new_syms, skipped)
+            # v1.4: aktualisierte Clicklist hinterher
+            await asyncio.to_thread(send_clicklist_file, st, "📋 Bitget Clicklist (aktualisiert)")
         elif skipped:
             log.info(f"Keine neuen Symbole, aber {len(skipped)} nicht gefunden: {skipped}")
         else:
