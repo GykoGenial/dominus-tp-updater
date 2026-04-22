@@ -1,5 +1,5 @@
 """
-DOMINUS Trade-Automatisierung v4.25
+DOMINUS Trade-Automatisierung v4.30
 ══════════════════════════════════════════════════════════════
 Vollautomatisches Setup nach DOMINUS-Strategie (Handbuch März 2026)
 Finanzmathematische Optimierungen:
@@ -13,6 +13,140 @@ Finanzmathematische Optimierungen:
   ⑧ Entry-Queue       — H2_SIGNAL + HARSI_EXIT gemeinsam als Rangliste (v4.22)
   ⑨ Queue-Tracking    — entry_queue_log.csv + R-Multiple-Outcome (v4.20)
   ⑩ Klick-UX          — Button-Driven Rangliste mit adaptivem Keyboard (v4.25)
+  ⑪ One-Click-Exec    — 🚀 Trade jetzt Button mit Two-Tap-Confirm (v4.28)
+
+Changelog v4.30 — Kosmetik: BTC/Total2 DOM-DIR-Meldung nur bei echtem Wechsel:
+  K1: BTC_DIR/T2_DIR-Webhook-Handler sendet Telegram-Message + save_state()
+      jetzt nur noch, wenn new_dir != prev (echter Richtungs-Wechsel). TV-
+      Alarme können pro Bar mehrfach triggern; bisher kam jeder Tick als
+      volle "BTC Impuls → 🟢 Grün (Bullish bestätigt)"-Nachricht inkl.
+      Gegenpositions-Warnung durch — das hat sich angefühlt wie mehrere
+      Flips pro Tag, war aber nur Re-Trigger. Bei Gleichstand wird noch
+      eine knappe Log-Zeile geschrieben ("📡 BTC DOM-DIR Tick (unverändert:
+      LONG) — ignoriert") damit der Alive-Check über die Logs sichtbar
+      bleibt.
+  K2: Erster-ever-Signal-Fall bleibt korrekt — prev="" und new_dir="long"
+      unterscheiden sich, also feuert die volle Initial-Meldung wie gehabt.
+
+Changelog v4.29 — datetime.utcnow() Deprecation-Fix (Python 3.12+ Futureproof):
+  D1: Alle 8 Vorkommen von datetime.utcnow() auf datetime.now(timezone.utc)
+      migriert. utcnow() ist seit Python 3.12 deprecated (gibt naive UTC
+      zurück, was gegen die zwingende Aware-Empfehlung für alle Zeitvergleiche
+      verstösst). Python 3.15 entfernt die Funktion komplett — Migration
+      garantiert Zukunftssicherheit ohne Verhaltensänderung.
+      Betroffene Stellen: cmd_makro Timestamp-String, harsi-window Status-
+      Prüfung (_harsi_window_status), /watchlist-List-Helper
+      (_list_active_harsi_windows), HARSI_EXIT-Pfad timing-elapsed,
+      H2_SIGNAL-Write + 35-Min-Cleanup, Ablauf-Zeile im HARSI_EXIT-Render-
+      Pfad, load_state() Migration-Pfad. Plus 1× Default-Fallback in
+      dict.get(..., datetime.utcnow()).
+  D2: Neuer Helper _ensure_aware_utc(dt). Defensiv angewandt an allen Stellen
+      wo Werte aus last_h2_signal_time oder load_state() subtrahiert/
+      verglichen werden. Grund: Beim ersten Deploy nach v4.29 kann die
+      State-Datei auf Railway noch naive ISO-Strings enthalten ("2026-04-22
+      T00:00:00" ohne +00:00). datetime.fromisoformat() liefert dann naive
+      datetime. Subtraktion aware-minus-naive → TypeError. Der Shim setzt
+      fehlende tzinfo auf UTC und lässt aware-Werte unverändert; nach dem
+      ersten save_state() sind alle Serialisierungen aware-roundtrip-safe.
+  D3: Kein externes Verhalten geändert — strftime-Output, Cutoff-Werte
+      (30 Min / 35 Min), alle Vergleichsgrenzen bleiben identisch. Der Fix
+      ist reine Python-API-Modernisierung plus ein-maliger Migrations-Shim.
+
+Changelog v4.28 — Stufe B: One-Click-Execution (🚀 Trade jetzt-Button):
+  E1: Neuer Button 🚀 Trade jetzt (Auto) in der Detail-Ansicht der
+      Entry-Rangliste. callback_data = exec:SYM:DIR:LEV:ENTRY:SL (~41 Byte).
+      Erscheint nur wenn AUTO_TRADE_ENABLED=true (Railway-Env) UND Setup-
+      Suggestion komplett vorliegt. Baut direkt auf dem v4.25-Slot-Keyboard
+      auf — keine neue Message, nur zusätzliche Reihe vor ❌ Schliessen.
+  E2: Two-Tap-Confirmation als Fat-Finger-Schutz. Erster Tap: Callback-Alert
+      "TRADE AUSFÜHREN? {SYM} {DIR} {LEV}x — Nochmals tippen zur Bestätigung
+      — läuft in 10s ab". State wird in-memory in _exec_confirm[(msg_id,
+      payload_sig)] gehalten mit TTL-Expiry. Zweiter Tap innerhalb TTL führt
+      execute_trade_order aus; nach TTL = Reset zum ersten Tap. TTL
+      konfigurierbar via AUTO_TRADE_CONFIRM_TTL_SEC (default 10).
+  E3: Neue Core-Funktion execute_trade_order(symbol, direction, leverage,
+      entry, sl). Pipeline:
+        (1) Pre-Validate: AUTO_TRADE_ENABLED, SL-Seite korrekt, Hebel in
+            [1, MAX_LEVERAGE], Balance > 0.
+        (2) Sizing: Half-Kelly-Total (kelly_recommendation) / 5 = Initial-
+            Margin (entspricht 20% im DOMINUS 20/30/50-Schema). Gekappt auf
+            balance*0.10/3 (10%-Regel) und optional MAX_AUTO_TRADE_USDT.
+        (3) set_leverage_on_bitget() — POST /account/set-leverage mit
+            holdSide=direction. Non-fatal bei Fehler (Bitget fällt auf
+            Account-Default zurück).
+        (4) Market-Order via /order/place-order (orderType=market,
+            tradeSide=open, marginMode=isolated).
+        (5) 3s Sleep, danach _get_all_positions_raw() — verifiziert dass
+            Position tatsächlich existiert (bypasst 5s-Cache). Kein Fill
+            → Fail-Closed Return.
+        (6) SL via /order/place-pos-tpsl mit stopLossTriggerType=mark_price.
+            Fehler nach geöffneter Position → PANIC-Telegram + "partial"-
+            Status, damit User manuell nachziehen kann.
+      DCA + TP1–TP4 setzt der bestehende Main-Loop über setup_new_trade()
+      automatisch im nächsten Position-Watcher-Tick.
+  E4: ENV-Flags (alle neu in v4.28):
+        • AUTO_TRADE_ENABLED (default "0") — Feature-Gate. Nur "1"/"true"/
+          "yes"/"on" aktivieren den Button + execute_trade_order.
+        • AUTO_TRADE_CONFIRM_TTL_SEC (default 10) — Sekunden zwischen erstem
+          und zweitem Tap.
+        • MAX_AUTO_TRADE_USDT (default 0) — Hard-Cap für Initial-Margin pro
+          Auto-Trade. 0 = kein extra Cap (nur Kelly + 10%-Regel).
+  E5: Neuer Helper set_leverage_on_bitget(symbol, direction, leverage) —
+      POST /api/v2/mix/account/set-leverage. Bisher hat das Script nie den
+      Hebel selber gesetzt (war immer manuell auf Bitget vorbelegt). Für
+      Auto-Trade essenziell — Bitget lehnt sonst Orders ab die den aktuellen
+      Hebel überschreiten.
+  E6: Result-Reporting: ✅-Telegram mit Order-ID/Qty/Margin/Notional bei
+      Erfolg, ❌-Telegram mit reason-String bei Abbruch, 🚨-Telegram bei
+      "partial" (Position offen aber SL-Fehler) — mit explizitem "manuell
+      SL setzen"-Hinweis + Bitget-Button.
+
+Changelog v4.27 — Score-Formel Refactor (SL/Hebel entkoppelt + Gegen-Trend-Malus):
+  S1: SL-Abstand Docstring an tatsächliche Formel angepasst. Alte Doku behauptete
+      2%=7pt, 5%=1pt; die Formel `15 − (sl_pct − 0.5) * 3` liefert aber 2%=10pt,
+      5%=2pt (Slope −3/% statt der Doku-impliziten −5/%). Formel bleibt —
+      Doku-Strings im Score-Breakdown sind jetzt konsistent.
+  S2: Hebel-Punkte von Linear (lev−2, Cap 10) auf asymmetrische Glockenkurve
+      um 12x Peak umgestellt. Unten Slope −1.0 pro Hebel-Stufe (5x=3pt, 8x=6pt,
+      10x=8pt, 12x=10pt), oben flacher Slope −0.7 (15x=8pt, 18x=6pt, 25x=1pt,
+      30x+=0pt). Entkoppelt SL+Hebel: Da in DOMINUS Hebel=25/SL% gilt, gab es
+      bei extremen Scalps (SL 0.5% ⇒ 50x) Double-Counting → früher 25pt, jetzt
+      15pt. Sweet-Spot bei SL 2% ⇒ 12x bleibt 20pt kombiniert. Dadurch belohnt
+      Score tatsächliches R:R-Gleichgewicht statt reiner Tightness.
+  S3: Gegen-Trend-Malus −5 eingeführt (bisher nur Warnung). Wenn btc_dir ODER
+      t2_dir bekannt sind, aber KEIN _dir_matches() greift (d.h. Makro-Trend
+      ist die Gegenrichtung, kein Recovering-Fall), gibt es jetzt expliziten
+      Punkt-Abzug. Recovering-Zustände werden via _dir_matches() als konform
+      gewertet und bleiben malus-frei.
+  S4: Korrelations-Malus linear gestaffelt. Bisher binary: ab 2 gleichartigen
+      offenen Positionen pauschal −10. Neu: 2 offen = −10 (wie bisher), 3+ =
+      −15 (Cap). Stärkerer Anti-Klumpen-Effekt ohne Score-Kollaps.
+
+Changelog v4.26 — Entry-Queue Robustness (30-Min-Fenster + Logging):
+  R1: save_state() wird jetzt unmittelbar nach jeder Mutation von
+      last_h2_signal_time aufgerufen — beim Setzen neuer H2-Zeitstempel
+      (H2_SIGNAL-Empfang mit anschliessendem 35-Min-Cleanup) UND beim
+      Löschen nach Consume (HARSI_EXIT Queue-Pfad, HARSI_EXIT Fallback-
+      Pfad, H2_SIGNAL harsi_warn=0 Queue-Pfad). Bisher wurde die
+      Serialisierung nur implizit beim nächsten BTC_DIR/Trade-Event
+      mitgeschrieben — bei Railway-Redeploy innerhalb des 30-Min-Fensters
+      war das H2-TS damit verloren und der folgende HARSI_EXIT bekam
+      "Kein H2-Signal gespeichert". Mit v4.26 überlebt das Fenster jeden
+      Redeploy, solange < 30 Min alt (load_state() filtert automatisch).
+  R2: Erweitertes ENTRY-QUEUE Dedup-Log. enqueue_entry() vergleicht bei
+      Re-Trigger (gleicher symbol_direction) die Felder source/warn_line/
+      timing_elapsed_min/harsi_warn zwischen alter und neuer Entry und
+      loggt den Diff — z.B. "source: 'H2_SIGNAL'→'HARSI_EXIT' | elapsed:
+      0→12". Hilft bei Forensik, welche Signal-Quelle den Batch zuletzt
+      überschrieben hat.
+  R3: HARSI_EXIT-ohne-H2-Warnung wird jetzt als strukturierter Log-
+      Eintrag mit Dump aller aktuell offenen H2-Fenster-Keys geschrieben
+      ("[HARSI_EXIT-ohne-H2] SYMBOL_DIR — Aktive H2-Fenster: [...]").
+      Erleichtert Nachforschung, ob der fehlende H2-TS ein Bug ist oder
+      eine echte TV-Out-of-Order-Lieferung.
+  R4: HARSI_EXIT-Enqueue trägt jetzt expliziten "source": "HARSI_EXIT"-
+      Marker (bisher implizit). H2_SIGNAL hatte "source": "H2_SIGNAL"
+      bereits seit v4.22. Damit ist der R2-Dedup-Diff aussagekräftig.
 
 Changelog v4.25 — Button-Driven Entry-Rangliste (One-Message-UX):
   B1: Die Entry-Rangliste ist keine seitenlange Text-Liste mehr, sondern
@@ -498,6 +632,20 @@ if not _raw_eq:
     _raw_eq = "1"
 ENTRY_QUEUE_ENABLED    = _raw_eq not in ("0", "false", "no", "off")
 ENTRY_QUEUE_WINDOW_SEC = _env_int("ENTRY_QUEUE_WINDOW_SEC", 90)
+
+# v4.28: Stufe B — One-Click-Execution (🚀 Trade jetzt-Button)
+# AUTO_TRADE_ENABLED ("1"/"0"/"true"/"false") — default AUS aus Safety-Gründen.
+# Muss auf Railway explizit auf "1" gesetzt werden damit der Button erscheint
+# und execute_trade_order() Orders tatsächlich platzieren darf.
+# AUTO_TRADE_CONFIRM_TTL_SEC — Sekunden in denen der zweite Tap die Bestätigung
+# darstellt (Two-Tap-Confirm). Default 10s. Nach Ablauf ist wieder erster Tap
+# nötig, der den State frisch setzt.
+# MAX_AUTO_TRADE_USDT — Hard-Cap für initiale Market-Order-Margin (pro Trade).
+# 0 = kein Extra-Cap (nur Half-Kelly/3 und 10%-Regel greifen).
+_raw_at = os.environ.get("AUTO_TRADE_ENABLED", "0").strip().lower()
+AUTO_TRADE_ENABLED        = _raw_at in ("1", "true", "yes", "on")
+AUTO_TRADE_CONFIRM_TTL_SEC = _env_int("AUTO_TRADE_CONFIRM_TTL_SEC", 10)
+MAX_AUTO_TRADE_USDT       = _env_float("MAX_AUTO_TRADE_USDT", 0.0)
 
 BASE_URL = "https://api.bitget.com"
 
@@ -2614,6 +2762,264 @@ def place_dca_orders(symbol: str, entry: float, sl: float,
 
     return results
 
+
+# ═══════════════════════════════════════════════════════════════
+# v4.28 STUFE B — ONE-CLICK-EXECUTION
+# ═══════════════════════════════════════════════════════════════
+# Zweck: Button 🚀 Trade jetzt in der Detail-Ansicht platziert Market-Order
+# + SL direkt auf Bitget — ohne Browser-Umweg. DCA + TPs übernimmt der
+# bestehende Main-Loop über setup_new_trade() sobald die Position gesehen wird.
+#
+# Sicherheits-Architektur (Fail-Closed):
+#   1) AUTO_TRADE_ENABLED Gate — Feature kann Env-gesteuert deaktiviert werden
+#   2) Two-Tap-Confirmation — erster Tap speichert Signatur, zweiter Tap führt aus
+#   3) SL-Side-Validierung — Long SL < Entry, Short SL > Entry
+#   4) Hebel-Cap auf MAX_LEVERAGE (default 25x)
+#   5) Half-Kelly-Sizing mit 10%-Margin-Limit als Hard-Cap
+#   6) Post-Order 3s-Verifikation via _get_all_positions_raw (kein Cache)
+#   7) SL-Set-Fehler nach Position-Open → PANIC-Telegram mit Handlungsanweisung
+# ═══════════════════════════════════════════════════════════════
+
+def set_leverage_on_bitget(symbol: str, direction: str, leverage: int) -> dict:
+    """v4.28 — Setzt den Hebel für ein Symbol auf Bitget.
+
+    Bitget speichert Hebel pro Seite (long/short) getrennt in isolated-Modus.
+    Wir setzen nur die relevante Seite. Bei Fehler nur loggen — Bitget
+    verwendet dann den Account-Default. Die Funktion ist idempotent.
+
+    Returns: Response-Dict von Bitget (code, msg, data).
+    """
+    res = api_post("/api/v2/mix/account/set-leverage", {
+        "symbol":      symbol,
+        "productType": PRODUCT_TYPE,
+        "marginCoin":  MARGIN_COIN,
+        "leverage":    str(int(leverage)),
+        "holdSide":    direction,
+    })
+    if res.get("code") != "00000":
+        log(f"  ⚠ set-leverage({symbol} {direction} {leverage}x) "
+            f"fehlgeschlagen: {res.get('msg', res)}")
+    else:
+        log(f"  ✓ Hebel {leverage}x gesetzt ({symbol} {direction})")
+    return res
+
+
+def execute_trade_order(symbol: str, direction: str, leverage: int,
+                         entry: float, sl: float) -> dict:
+    """v4.28 — Platziert Market-Order + SL für einen Trade-Vorschlag.
+
+    Schritte:
+      1. Pre-Validierung (Feature-Gate, SL-Seite, Hebel-Cap, Balance)
+      2. Sizing: Half-Kelly-Total → Initial = Total / 5 (20/30/50-Schema).
+         Gekappt auf max_margin/3 (10%-Regel) und optional MAX_AUTO_TRADE_USDT.
+      3. Hebel auf Bitget setzen (nicht fatal bei Fehler).
+      4. Market-Order platzieren (tradeSide=open, orderType=market).
+      5. 3s warten, dann _get_all_positions_raw() → verifizieren dass Position
+         tatsächlich existiert (bypasst 5s-Cache).
+      6. SL via place-pos-tpsl setzen. Bei Fehler → PANIC-Status.
+
+    Returns: {"ok": True|"partial"|False, "reason": str, "orderId": str,
+              "qty": str, "leverage": int, "entry": float, "sl": str,
+              "initial_margin": float}
+    """
+    # ── 1a. Feature-Gate ────────────────────────────────────────
+    if not AUTO_TRADE_ENABLED:
+        return {"ok": False,
+                "reason": "AUTO_TRADE_ENABLED=false — Feature ist deaktiviert"}
+
+    direction = direction.lower()
+    if direction not in ("long", "short"):
+        return {"ok": False, "reason": f"Ungültige Richtung: {direction!r}"}
+
+    # ── 1b. SL-Seite validieren ─────────────────────────────────
+    if direction == "long" and sl >= entry:
+        return {"ok": False,
+                "reason": f"SL {sl} >= Entry {entry} bei LONG — ungültig"}
+    if direction == "short" and sl <= entry:
+        return {"ok": False,
+                "reason": f"SL {sl} <= Entry {entry} bei SHORT — ungültig"}
+
+    # ── 1c. Hebel-Cap ───────────────────────────────────────────
+    leverage = int(leverage)
+    if leverage < 1:
+        return {"ok": False, "reason": f"Hebel {leverage} < 1"}
+    if leverage > MAX_LEVERAGE:
+        log(f"  ⚠ Hebel {leverage}x > MAX_LEVERAGE {MAX_LEVERAGE}x — gecappt")
+        leverage = MAX_LEVERAGE
+
+    # ── 1d. Balance holen ───────────────────────────────────────
+    balance = get_futures_balance()
+    if balance <= 0:
+        return {"ok": False,
+                "reason": f"Balance {balance} — Konto leer oder API-Fehler"}
+
+    # ── 2. Sizing: Half-Kelly / 5 (Initial in 20/30/50-Schema) ──
+    kelly         = kelly_recommendation(balance, WINRATE)
+    target_total  = kelly.get("half_kelly_usdt", 0) or 0
+    initial_margin = target_total / 5.0
+
+    # Hard-Cap 1: 10%-Margin-Regel (max_margin / 3 pro Order)
+    max_margin = balance * 0.10
+    cap_10pct  = max_margin / 3.0
+    if initial_margin > cap_10pct:
+        log(f"  Initial-Margin {initial_margin:.2f} USDT > 10%/3-Cap "
+            f"{cap_10pct:.2f} — capped")
+        initial_margin = cap_10pct
+
+    # Hard-Cap 2: MAX_AUTO_TRADE_USDT (optional)
+    if MAX_AUTO_TRADE_USDT > 0 and initial_margin > MAX_AUTO_TRADE_USDT:
+        log(f"  Initial-Margin {initial_margin:.2f} > "
+            f"MAX_AUTO_TRADE_USDT {MAX_AUTO_TRADE_USDT:.2f} — capped")
+        initial_margin = MAX_AUTO_TRADE_USDT
+
+    if initial_margin < 1.0:
+        return {"ok": False,
+                "reason": f"Initial-Margin {initial_margin:.2f} < 1 USDT — "
+                          f"Half-Kelly liefert zu wenig (Balance {balance:.2f}, "
+                          f"Winrate {WINRATE})"}
+
+    # Kontrakt-Grösse (Quantität in Base-Coin)
+    contracts_raw = (initial_margin * leverage) / entry
+    qty           = snap_qty(symbol, contracts_raw)
+    if qty <= 0:
+        return {"ok": False,
+                "reason": f"Qty {qty} nach snap_qty (raw {contracts_raw:.6f}) "
+                          f"— zu klein für Symbol-Precision"}
+    qty_str = round_qty(symbol, qty)
+    notional = qty * entry
+
+    log(f"══ AUTO-TRADE START: {symbol} ══")
+    log(f"  {direction.upper()} | Entry={entry} | SL={sl} | Hebel={leverage}x")
+    log(f"  Initial-Margin: {initial_margin:.2f} USDT | Qty: {qty_str} | "
+        f"Notional: {notional:.2f} USDT")
+
+    # ── 3. Hebel auf Bitget setzen ──────────────────────────────
+    set_leverage_on_bitget(symbol, direction, leverage)
+
+    # ── 4. Market-Order platzieren ──────────────────────────────
+    side = "buy" if direction == "long" else "sell"
+    ord_res = api_post("/api/v2/mix/order/place-order", {
+        "symbol":      symbol,
+        "productType": PRODUCT_TYPE,
+        "marginMode":  "isolated",
+        "marginCoin":  MARGIN_COIN,
+        "size":        qty_str,
+        "side":        side,
+        "tradeSide":   "open",
+        "orderType":   "market",
+        "force":       "gtc",
+    })
+    if ord_res.get("code") != "00000":
+        err = ord_res.get("msg", str(ord_res))
+        log(f"  ✗ Market-Order Fehler: {err}")
+        return {"ok": False, "reason": f"Market-Order rejected: {err}"}
+
+    order_id = (ord_res.get("data") or {}).get("orderId") or "?"
+    log(f"  ✓ Market-Order platziert — orderId={order_id} | "
+        f"Qty={qty_str} | Side={side}")
+
+    # ── 5. 3s Verifikation — Position muss sichtbar sein ───────
+    time.sleep(3)
+    try:
+        positions = _get_all_positions_raw()   # bypasst Cache
+    except Exception as ex:
+        positions = []
+        log(f"  ⚠ Position-Read nach Order fehlgeschlagen: {ex}")
+
+    pos_match = next(
+        (p for p in positions
+         if p.get("symbol") == symbol
+         and p.get("holdSide") == direction
+         and float(p.get("total", 0)) > 0),
+        None,
+    )
+    if not pos_match:
+        log(f"  ✗ PANIC: Position nach 3s nicht sichtbar — "
+            f"Order evtl. rejected oder Fill-Race")
+        return {"ok": False,
+                "reason": f"Position nicht verifiziert nach 3s — orderId "
+                          f"{order_id}, Qty {qty_str} — manuell bei Bitget prüfen!",
+                "orderId": order_id}
+
+    filled_qty = float(pos_match.get("total", 0))
+    avg_price  = float(pos_match.get("openPriceAvg", entry))
+    log(f"  ✓ Position verifiziert: Qty={filled_qty} @ Avg={avg_price}")
+
+    # ── 6. SL setzen ────────────────────────────────────────────
+    decimals = get_price_decimals(symbol)
+    sl_str   = round_price(sl, decimals)
+    sl_res   = api_post("/api/v2/mix/order/place-pos-tpsl", {
+        "symbol":               symbol,
+        "productType":          PRODUCT_TYPE,
+        "marginCoin":           MARGIN_COIN,
+        "holdSide":             direction,
+        "stopLossTriggerPrice": sl_str,
+        "stopLossTriggerType":  "mark_price",
+    })
+    if sl_res.get("code") != "00000":
+        err = sl_res.get("msg", str(sl_res))
+        log(f"  ✗ PANIC: SL-Set fehlgeschlagen — Position offen ohne SL! {err}")
+        try:
+            telegram(
+                f"🚨 <b>PANIC — {symbol}</b>\n"
+                f"Market-Order wurde platziert, aber SL-Set "
+                f"<b>fehlgeschlagen</b>!\n\n"
+                f"Position: {direction.upper()} {filled_qty} @ {avg_price}\n"
+                f"Geplanter SL: {sl_str} USDT\n"
+                f"Fehler: {err}\n\n"
+                f"⚠️ <b>SL jetzt manuell auf Bitget setzen!</b>",
+                reply_markup=build_setup_buttons(symbol),
+            )
+        except Exception:
+            pass
+        return {"ok": "partial",
+                "reason": f"Position offen, SL-Set-Fehler: {err}",
+                "orderId": order_id, "qty": qty_str,
+                "leverage": leverage, "entry": avg_price}
+
+    log(f"  ✓ SL @ {sl_str} gesetzt — Main-Loop übernimmt DCA+TPs")
+    return {"ok": True,
+            "orderId":        order_id,
+            "qty":            qty_str,
+            "leverage":       leverage,
+            "entry":          avg_price,
+            "sl":             sl_str,
+            "initial_margin": round(initial_margin, 2),
+            "notional":       round(notional, 2)}
+
+
+# ═══════════════════════════════════════════════════════════════
+# v4.28 — Two-Tap-Confirm State (in-memory, 10s TTL)
+# ═══════════════════════════════════════════════════════════════
+# Key: (msg_id, payload_sig) — Wert: expires_ts (float Unix)
+# Erster Tap eines "exec:"-Buttons legt (msg_id, sig) an mit expires = now + TTL.
+# Zweiter Tap innerhalb TTL führt aus und cleart den Eintrag.
+# Abgelaufene Einträge werden beim nächsten Zugriff gecleant (lazy).
+_exec_confirm: dict = {}
+_exec_confirm_lock = threading.Lock()
+
+
+def _exec_confirm_check_and_consume(msg_id: int, payload_sig: str) -> bool:
+    """Prüft ob derselbe payload_sig bereits im Fenster liegt.
+    True → zweiter Tap, ausführen + State cleanen.
+    False → erster Tap oder abgelaufen; State neu setzen."""
+    now = time.time()
+    key = (int(msg_id), payload_sig)
+    with _exec_confirm_lock:
+        # Lazy-Cleanup abgelaufener Einträge
+        for _k in list(_exec_confirm.keys()):
+            if _exec_confirm[_k] < now:
+                del _exec_confirm[_k]
+        exp = _exec_confirm.get(key)
+        if exp is not None and exp >= now:
+            # Bestätigung — State cleanen und ausführen
+            del _exec_confirm[key]
+            return True
+        # Erster Tap (oder Re-Tap nach TTL) — State setzen
+        _exec_confirm[key] = now + AUTO_TRADE_CONFIRM_TTL_SEC
+        return False
+
+
 def tv_chart_links(symbol: str) -> dict:
     """
     Generiert TradingView Chart-Links mit gespeichertem Layout lX5eDAis
@@ -3405,15 +3811,24 @@ def score_entry(e: dict) -> dict:
     """Quality-Score (0-100) für ein Entry-Signal. Rückgabe:
       {"score": int, "is_premium": bool, "breakdown": [...], "warnings": [...]}
 
-    Gewichte (siehe Changelog v4.19):
+    Gewichte (v4.27 — Formel-Fix + Hebel-Glockenkurve + Gegen-Trend-Malus):
       +30  Makro-Premium aktiv (Extremzone richtungskonform)
       +20  BTC_DIR + T2_DIR beide konform (nur eine: +10)
-      +15  enger SL-Abstand (0.5%=15pt, 2%=7pt, 5%=1pt, linear)
-      +10  Hebel-Qualität (Proxy für ATR-Range; 12x+ = volle Punkte)
-      +15  historische Win-Rate (0.40=0pt, 0.55=7pt, 0.70+=15pt)
+      +15  enger SL-Abstand (Slope −3/%; 0.5%=15pt, 2%=10pt, 5%=2pt)
+      +10  Hebel-Sweet-Spot (Glockenkurve um 12x Peak;
+                            Unten steiler: 5x=3pt, 8x=6pt;
+                            Oben flacher: 18x=6pt, 25x=1pt, 30x+=0pt)
+      +15  historische Win-Rate (0.40=0pt, 0.55=8pt, 0.70+=15pt)
        +5  harsi_warn=0 (keine HARSI-Divergenz)
        +5  Timing (<5 min ab H2 = 5pt, >30 min = 0pt)
-      -10  Korrelations-Malus (≥2 offene Positionen gleicher Richtung)
+       -5  Gegen Makro-Trend (BTC/T2 in Gegenrichtung, ohne Recovering-Ausnahme)
+    −10/−15 Korrelations-Malus (≥2 offen=−10, ≥3=−15)
+
+    SL+Hebel-Entkopplung: Da Hebel = 25/SL% in DOMINUS gilt, messen beide
+    Kriterien im Linear-Modell dasselbe. Die Glockenkurve auf Hebel behebt das:
+    extreme Scalps (SL 0.5%, 50x) bekommen 15pt statt 25pt, der Sweet-Spot
+    (SL 2%, 12x) bleibt bei 20pt kombiniert. Dadurch echte R:R-Qualität.
+
     Premium-Gate: Makro-Premium UND BTC/T2 mindestens einmal konform.
     """
     direction = e.get("direction", "")
@@ -3459,6 +3874,11 @@ def score_entry(e: dict) -> dict:
         score += 10
         breakdown.append(f"+10 {'BTC' if m_btc else 'T2'} konform")
     elif _btc or _t2:
+        # v4.27: Gegen-Trend-Malus (−5) — bisher nur Warnung ohne Punkt-Abzug.
+        # Recovering-Zustände werden durch _dir_matches() bereits als "konform"
+        # gewertet; dieser Zweig feuert nur bei echtem Gegen-Trend.
+        score -= 5
+        breakdown.append("−5 Gegen Makro-Trend")
         warnings.append("Makro-Richtung nicht konform")
 
     # 3) SL-Abstand → enger = bessere R:R (+15 bis 0)
@@ -3467,9 +3887,18 @@ def score_entry(e: dict) -> dict:
         score += sl_pts
         breakdown.append(f"+{sl_pts} SL {sl_pct:.2f}%")
 
-    # 4) Hebel-Qualität (+10 bis 0)
+    # 4) Hebel-Sweet-Spot — Glockenkurve um 12x (v4.27)
+    #    Unten steiler (niedriger Hebel = wider SL = schlechteres R:R):
+    #      Faktor 1.0 pro Stufe, 5x=3pt, 8x=6pt, 10x=8pt, 12x=10pt (Peak)
+    #    Oben flacher (hoher Hebel = tight SL, aber Noise-Risiko):
+    #      Faktor 0.7 pro Stufe, 15x=8pt, 18x=6pt, 25x=1pt, 30x+=0pt
+    #    Entkoppelt SL+Hebel, weil DOMINUS-Formel Hebel=25/SL% sonst doppelt zählt.
     if leverage > 0:
-        lev_pts = max(0, min(10, leverage - 2))
+        if leverage >= 12:
+            _raw = 10 - (leverage - 12) * 0.7
+        else:
+            _raw = 10 - (12 - leverage) * 1.0
+        lev_pts = max(0, min(10, int(round(_raw))))
         score += lev_pts
         breakdown.append(f"+{lev_pts} {leverage}x Hebel")
 
@@ -3497,7 +3926,10 @@ def score_entry(e: dict) -> dict:
         if t_pts > 0:
             breakdown.append(f"+{t_pts} Timing {elapsed_m}min")
 
-    # 8) Korrelations-Malus (−10 bei ≥2 offenen Positionen gleicher Richtung)
+    # 8) Korrelations-Malus — linear gestaffelt (v4.27)
+    #    2 offene gleichartige Positionen = −10 (wie bisher)
+    #    3+ offene = −15 (Cap)
+    #    Verhindert Klumpen-Risiko stärker als Binary-Malus.
     try:
         same_dir = 0
         for pos in get_all_positions():
@@ -3506,8 +3938,9 @@ def score_entry(e: dict) -> dict:
             if (pos.get("holdSide") or "").lower() == direction:
                 same_dir += 1
         if same_dir >= 2:
-            score -= 10
-            breakdown.append(f"-10 {same_dir}x {direction.upper()} offen")
+            _corr_malus = min(15, 10 + (same_dir - 2) * 5)
+            score -= _corr_malus
+            breakdown.append(f"−{_corr_malus} {same_dir}x {direction.upper()} offen")
     except Exception:
         pass
 
@@ -3528,14 +3961,26 @@ def score_entry(e: dict) -> dict:
 def enqueue_entry(entry: dict) -> None:
     """Fügt ein Entry-Signal zur Queue hinzu und startet den Flush-Timer
     beim ersten Eintrag jeder Batch. Dubletten (gleicher sig_key) erhöhen
-    confirm_count und aktualisieren die Daten, ohne eine 2. Zeile zu erzeugen."""
+    confirm_count und aktualisieren die Daten, ohne eine 2. Zeile zu erzeugen.
+
+    v4.26: Erweitertes Logging — bei Dedup werden geänderte Felder sichtbar
+    gemacht (source/warn_line/elapsed_min), damit man im Log erkennt, welche
+    Signal-Quelle den Batch zuletzt überschrieben hat."""
     global _entry_flush_timer, _entry_flush_started_ts
     sig_key = f"{entry['symbol']}_{entry['direction']}"
     with pending_entries_lock:
         existing = pending_entries.get(sig_key)
         if existing:
             entry["confirm_count"] = existing.get("confirm_count", 1) + 1
-            log(f"  ENTRY-QUEUE: {sig_key} bestätigt ({entry['confirm_count']}x)")
+            # v4.26: Dedup-Diff anzeigen (welche Felder ändern sich durchs Re-Trigger)
+            _diff_fields = []
+            for _f in ("source", "warn_line", "timing_elapsed_min", "harsi_warn"):
+                _ov, _nv = existing.get(_f), entry.get(_f)
+                if _ov != _nv:
+                    _diff_fields.append(f"{_f}: {_ov!r}→{_nv!r}")
+            _diff_str = " | ".join(_diff_fields) if _diff_fields else "keine Änderung"
+            log(f"  ENTRY-QUEUE: {sig_key} bestätigt ({entry['confirm_count']}x) "
+                f"— dedup-diff: {_diff_str}")
         else:
             entry["confirm_count"] = 1
         pending_entries[sig_key] = entry
@@ -3547,7 +3992,7 @@ def enqueue_entry(entry: dict) -> None:
             _entry_flush_timer.daemon = True
             _entry_flush_timer.start()
             log(f"  ENTRY-QUEUE: Fenster gestartet ({ENTRY_QUEUE_WINDOW_SEC}s) "
-                f"— 1. Signal: {sig_key}")
+                f"— 1. Signal: {sig_key} (source={entry.get('source','HARSI_EXIT')})")
 
 
 def flush_entries() -> None:
@@ -3910,6 +4355,20 @@ def _encode_calc_payload(entry: dict) -> str:
     return f"calc:{sym}:{dr}:{lev}:{entry_px:.5f}:{sl:.5f}"
 
 
+def _encode_exec_payload(entry: dict) -> str:
+    """v4.28 — callback_data für 🚀 Trade jetzt Button.
+    Format: exec:SYM:DIR:LEV:ENTRY:SL. Maximal-Länge ≈ 41 Byte (Limit 64).
+    Identisches Payload-Format wie _encode_calc_payload, nur Prefix unterschied
+    — die Signatur hinter dem Prefix wird für Two-Tap-Confirm-Dedup genutzt."""
+    sugg     = entry.get("sugg") or {}
+    sym      = entry.get("symbol", "")
+    dr       = entry.get("direction", "")
+    lev      = int(sugg.get("leverage", 0) or 0)
+    entry_px = float(entry.get("entry", 0) or 0)
+    sl       = float(sugg.get("sl", 0) or 0)
+    return f"exec:{sym}:{dr}:{lev}:{entry_px:.5f}:{sl:.5f}"
+
+
 def _coin_button_label(idx: int, entry: dict, is_open: bool) -> str:
     """Kompakter Button-Label: '⭐1 AVAX 82' / '▾ AVAX 82' (aktiv)."""
     s  = entry.get("_scored") or {}
@@ -3968,7 +4427,15 @@ def build_slot_keyboard(state: dict, open_symbol: str = None,
                 {"text": "📈 BTC H2", "url": links["btc_h2"]},
                 {"text": "🔀 Total2", "url": links["total2"]},
             ])
-            # Reihe 4: Schliessen
+            # Reihe 4: 🚀 Trade jetzt (nur wenn v4.28 Auto-Trade aktiv ist +
+            # komplettes Setup vorliegt). Two-Tap-Confirm schützt vor Fat-Finger.
+            if (AUTO_TRADE_ENABLED and sugg.get("leverage")
+                    and open_entry.get("entry") and sugg.get("sl")):
+                rows.append([{
+                    "text": f"🚀 Trade jetzt {base_coin} (Auto)",
+                    "callback_data": _encode_exec_payload(open_entry),
+                }])
+            # Reihe 5: Schliessen
             rows.append([
                 {"text": "❌ Schliessen", "callback_data": "close"},
             ])
@@ -4065,6 +4532,96 @@ def handle_callback_query(update: dict) -> None:
                 f"❌ Berechnung fehlgeschlagen: {ex}",
                 show_alert=True,
             )
+        return
+
+    # v4.28 — Two-Tap-Confirm + One-Click-Execution via Bitget-API
+    if data.startswith("exec:"):
+        if not AUTO_TRADE_ENABLED:
+            telegram_answer_callback(
+                callback_id,
+                "⛔ Auto-Trade ist in den Railway-Env auf 'False' gesetzt.",
+                show_alert=True,
+            )
+            return
+        try:
+            _, sym, dr, lev_s, entry_s, sl_s = data.split(":", 5)
+            lev      = int(lev_s)
+            entry_px = float(entry_s)
+            sl_px    = float(sl_s)
+        except Exception as ex:
+            log(f"[callback exec] Parse-Fehler: {ex} | data={data!r}")
+            telegram_answer_callback(
+                callback_id,
+                f"❌ Payload-Parse-Fehler: {ex}",
+                show_alert=True,
+            )
+            return
+
+        # payload_sig — identifiziert denselben Trade-Vorschlag für Two-Tap
+        payload_sig = f"{sym}|{dr}|{lev}|{entry_px:.5f}|{sl_px:.5f}"
+        confirmed   = _exec_confirm_check_and_consume(msg_id, payload_sig)
+
+        if not confirmed:
+            # Erster Tap — State gesetzt, Alert anzeigen
+            telegram_answer_callback(
+                callback_id,
+                f"⚠️ TRADE AUSFÜHREN? {sym} {dr.upper()} {lev}x\n"
+                f"Entry {entry_px} | SL {sl_px}\n"
+                f"Nochmals tippen zur Bestätigung — "
+                f"läuft in {AUTO_TRADE_CONFIRM_TTL_SEC}s ab.",
+                show_alert=True,
+            )
+            log(f"[exec] First-Tap {payload_sig} — wartet auf Confirm")
+            return
+
+        # Zweiter Tap innerhalb TTL — ausführen
+        log(f"[exec] Confirmed — starte execute_trade_order {payload_sig}")
+        telegram_answer_callback(
+            callback_id,
+            f"🚀 Führe aus: {sym} {dr.upper()} {lev}x ...",
+        )
+        # execute_trade_order ist blocking (~3s für Verifikation) — ok, da im
+        # Callback-Handler-Thread. Telegram hat das Alert schon gezeigt.
+        try:
+            result = execute_trade_order(sym, dr, lev, entry_px, sl_px)
+        except Exception as ex:
+            log(f"[exec] Exception in execute_trade_order: {ex}")
+            try:
+                telegram(
+                    f"❌ <b>Auto-Trade Fehler — {sym}</b>\n"
+                    f"Unbekannte Exception: <code>{ex}</code>",
+                    reply_markup=build_setup_buttons(sym),
+                )
+            except Exception:
+                pass
+            return
+
+        # Ergebnis an den User melden
+        try:
+            if result.get("ok") is True:
+                telegram(
+                    f"✅ <b>Auto-Trade ausgeführt — {sym}</b>\n"
+                    f"Richtung: {dir_icon(dr)} {dr.upper()} | "
+                    f"Hebel: {result.get('leverage')}x\n"
+                    f"Entry: {result.get('entry')} | SL: {result.get('sl')}\n"
+                    f"Qty: {result.get('qty')} | "
+                    f"Margin: {result.get('initial_margin')} USDT | "
+                    f"Notional: {result.get('notional')} USDT\n"
+                    f"Order-ID: <code>{result.get('orderId')}</code>\n\n"
+                    f"<i>DCA + TPs setzt der Main-Loop automatisch.</i>",
+                    reply_markup=build_setup_buttons(sym),
+                )
+            elif result.get("ok") == "partial":
+                # PANIC wurde bereits aus execute_trade_order geschickt
+                log(f"[exec] Partial success — PANIC schon gesendet: {result}")
+            else:
+                telegram(
+                    f"❌ <b>Auto-Trade abgebrochen — {sym}</b>\n"
+                    f"Grund: <code>{result.get('reason')}</code>",
+                    reply_markup=build_setup_buttons(sym),
+                )
+        except Exception as ex:
+            log(f"[exec] Telegram-Report-Fehler: {ex}")
         return
 
     # Navigations-Callbacks — alle mutieren state + editen Message
@@ -4189,6 +4746,28 @@ def _parse_iso_utc(s: str) -> float:
     Dev-Umgebung dasselbe Ergebnis liefern. Raises bei invalidem Format."""
     return datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(
         tzinfo=timezone.utc).timestamp()
+
+
+def _ensure_aware_utc(dt):
+    """v4.29 — Gibt dt als timezone-aware UTC zurück.
+
+    Seit v4.29 werden alle neu erzeugten datetimes mit timezone=UTC erstellt
+    (datetime.now(timezone.utc) statt datetime.utcnow()). Der In-Memory-Store
+    last_h2_signal_time kann aber nach einem Railway-Redeploy mit einem alten
+    State-File geladen werden, in dem Werte noch als naive ISO-Strings ("...
+    T00:00:00" ohne +00:00) serialisiert waren — fromisoformat() liefert
+    dann naive datetimes. Subtraktion aware-minus-naive raised TypeError.
+
+    Dieser Shim setzt bei naive-Werten tzinfo=UTC und lässt aware-Werte
+    unverändert. Der Aufruf ist günstig (Typ-Check + optional .replace) und
+    kann defensiv überall gebraucht werden, wo ein Wert aus dem Dict (oder
+    ein extern reingereichter dt) subtrahiert/verglichen wird.
+    """
+    if dt is None:
+        return datetime.now(timezone.utc)
+    if getattr(dt, "tzinfo", None) is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 def _entry_log_ensure_file() -> None:
@@ -4844,8 +5423,8 @@ def cmd_makro():
     else:
         overall = "❓ Noch kein Makro-Webhook empfangen"
 
-    from datetime import datetime as _dt
-    ts = _dt.utcnow().strftime("%d.%m.%Y %H:%M UTC")
+    # v4.29: datetime.utcnow() Deprecation-Fix — timezone-aware UTC
+    ts = datetime.now(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
 
     reply(
         f"📡 <b>Makro-Kontext — BTC &amp; Total2</b>\n"
@@ -4898,7 +5477,8 @@ def _alarm_window_status(symbol: str, direction: str) -> tuple:
             "startet sobald Alarm 2/2b das nächste Mal feuert.</i>",
             False,
         )
-    elapsed_sec = (datetime.utcnow() - ts).total_seconds()
+    # v4.29: timezone-aware; _ensure_aware_utc(ts) schützt vor Legacy-Dict-Werten
+    elapsed_sec = (datetime.now(timezone.utc) - _ensure_aware_utc(ts)).total_seconds()
     elapsed_min = int(elapsed_sec // 60)
     if elapsed_sec > 1800:
         return (
@@ -5058,8 +5638,10 @@ def build_alarm_h4_trigger(direction: str) -> str:
 def _list_active_harsi_windows() -> list:
     """Liste (symbol, direction, remaining_min, expiry_str) aller aktiven Fenster."""
     out = []
-    now = datetime.utcnow()
+    # v4.29: timezone-aware UTC — Werte aus Dict bei Bedarf shim'en
+    now = datetime.now(timezone.utc)
     for key, ts in list(last_h2_signal_time.items()):
+        ts = _ensure_aware_utc(ts)
         elapsed_min = int((now - ts).total_seconds() // 60)
         if elapsed_min > 30:
             continue
@@ -6140,6 +6722,14 @@ def start_webhook_server():
             else:
                 new_dir = direction
 
+            # v4.30: Nur bei echtem Wechsel loggen, state speichern und Telegram
+            # senden. TV-Alarm kann mehrfach pro Bar feuern (z.B. "once_per_bar"
+            # triggert bei jedem Tick innerhalb der Bar). Bisher kam jeder
+            # Tick als eigene Telegram-Message + vollständige Positions-Warnung
+            # durch — das klang wie ein Flip, war aber nur ein Re-Trigger.
+            if new_dir == prev:
+                log(f"📡 {label} DOM-DIR Tick (unverändert: {new_dir.upper()}) — ignoriert")
+                return  # ok: identisch zu vorher, keine Aktion
             if signal_type == "BTC_DIR":
                 btc_dir = new_dir
             else:
@@ -6276,6 +6866,12 @@ def start_webhook_server():
 
             if h2_ts is None:
                 # Kein H2_SIGNAL für dieses Symbol/Richtung bekannt
+                # v4.26: deutlich sichtbarer Log-Eintrag + aktiver H2-Fenster-Bestand
+                #        für Forensik (welche Symbole HABEN ein offenes H2-Fenster?)
+                _other_keys = sorted(last_h2_signal_time.keys())
+                log(f"[HARSI_EXIT-ohne-H2] {sig_key} — KEIN H2-TS gespeichert. "
+                    f"Aktive H2-Fenster ({len(_other_keys)}): {_other_keys[:10]}"
+                    + (" ..." if len(_other_keys) > 10 else ""))
                 warn_line = (
                     "⚠️ <b>Kein H2-Signal gespeichert</b> — Timing unbekannt.\n"
                     "Bitte manuell prüfen ob ein H2-Signal vorlag!"
@@ -6283,7 +6879,9 @@ def start_webhook_server():
                 timing_ok = False
                 elapsed_min = None
             else:
-                elapsed_sec = (datetime.utcnow() - h2_ts).total_seconds()
+                # v4.29: timezone-aware Subtraktion; h2_ts aus Dict kann legacy-naive sein
+                elapsed_sec = (datetime.now(timezone.utc)
+                               - _ensure_aware_utc(h2_ts)).total_seconds()
                 elapsed_min = int(elapsed_sec // 60)
                 if elapsed_sec > 1800:   # > 30 Minuten
                     warn_line = (
@@ -6318,11 +6916,14 @@ def start_webhook_server():
                     "sling_sl":           data.get("sling_sl"),
                     "atr":                data.get("atr"),
                     "xinfo":              _xinfo,
+                    "source":             "HARSI_EXIT",   # v4.26: explizite Quelle für Dedup-Diff-Log
                     "ts":                 time.time(),
                 })
                 # Timestamp löschen — verhindert Doppel-Enqueue beim nächsten Re-Trigger
+                # v4.26: save_state() nach Mutation → überlebt Railway-Redeploys
                 if sig_key in last_h2_signal_time:
                     del last_h2_signal_time[sig_key]
+                    save_state()
                 return  # ok: HARSI_EXIT in Queue
 
             # Fallback-Pfad (Queue disabled ODER Timing abgelaufen) → wie bisher
@@ -6355,8 +6956,10 @@ def start_webhook_server():
             telegram("\n".join(msg_parts), reply_markup=build_setup_buttons(symbol))
 
             # Nach Eintritt: Zeitstempel löschen (verhindert Doppel-Warnungen)
+            # v4.26: save_state() nach Mutation → überlebt Railway-Redeploys
             if sig_key in last_h2_signal_time:
                 del last_h2_signal_time[sig_key]
+                save_state()
             return  # ok: HARSI_EXIT handled
 
         # H4 Trigger → gepuffert, nach 5 Min gebündelt senden
@@ -6385,12 +6988,15 @@ def start_webhook_server():
 
         # H2 Signal → H4 Puffer flushen dann sofort senden
         # 30-Min-Fenster starten: Zeitstempel für HARSI_EXIT-Prüfung speichern
-        last_h2_signal_time[f"{symbol}_{direction}"] = datetime.utcnow()
+        # v4.29: timezone-aware UTC
+        last_h2_signal_time[f"{symbol}_{direction}"] = datetime.now(timezone.utc)
         # Altes Einträge aufräumen (Memory-Leak verhindern): nur letzte 30 Min behalten
-        _cutoff = datetime.utcnow() - timedelta(minutes=35)
+        _cutoff = datetime.now(timezone.utc) - timedelta(minutes=35)
         for _k in list(last_h2_signal_time.keys()):
-            if last_h2_signal_time[_k] < _cutoff:
+            if _ensure_aware_utc(last_h2_signal_time[_k]) < _cutoff:
                 del last_h2_signal_time[_k]
+        # v4.26: State persistieren → H2-Fenster überlebt Railway-Redeploys
+        save_state()
 
         # Makro-Kontext aus Webhook auslesen (vom DOM-ORC Plot-Werten)
         harsi_warn_val  = int(float(data.get("harsi_warn",  0) or 0))
@@ -6437,8 +7043,10 @@ def start_webhook_server():
             # H4-Puffer trotzdem flushen (gebündelte H4-Trigger-Nachricht)
             flush_h4_buffer()
             # Fenster-Marker entfernen — Queue-Flush übernimmt die Darstellung
+            # v4.26: save_state() nach Mutation → überlebt Railway-Redeploys
             if f"{symbol}_{direction}" in last_h2_signal_time:
                 del last_h2_signal_time[f"{symbol}_{direction}"]
+                save_state()
             log(f"  H2_SIGNAL {symbol} {direction} → Entry-Queue (harsi_warn=0)")
             return  # ok: H2_SIGNAL queued
 
@@ -6497,7 +7105,9 @@ def start_webhook_server():
         # Timer-Zeile abhängig von harsi_warn und recovering-Zustand
         if harsi_warn_val != 0:
             # Ablaufzeitpunkt: H2-Zeitstempel + 30 Min (oder "jetzt + 30 Min" als Fallback)
-            _h2_ts      = last_h2_signal_time.get(f"{symbol}_{direction}", datetime.utcnow())
+            # v4.29: timezone-aware Default + Shim für Legacy-Dict-Werte
+            _h2_ts      = _ensure_aware_utc(last_h2_signal_time.get(
+                f"{symbol}_{direction}", datetime.now(timezone.utc)))
             _expiry_utc = _h2_ts + timedelta(minutes=30)
             _expiry_str = _expiry_utc.strftime("%d.%m.%Y %H:%M UTC")
             # v4.22: HARSI_EXIT kommt automatisch über DOM-ORC v2.4.2 Intrabar-
@@ -6647,10 +7257,14 @@ def load_state():
         sling_sl.update(s.get("sling_sl", {}))
         dca_void.update(s.get("dca_void", {}))
         # last_h2_signal_time: ISO-Strings → datetime (nur Einträge < 30 Min laden)
-        now_utc = datetime.utcnow()
+        # v4.29: Migrations-kompatibel — alte State-Files enthalten naive ISO-Strings
+        # ("2026-04-22T00:00:00"), neue enthalten aware ("...+00:00"). Shim über
+        # _ensure_aware_utc setzt bei naive-Werten tzinfo=UTC, damit die Subtraktion
+        # mit now_utc nicht mit TypeError crasht.
+        now_utc = datetime.now(timezone.utc)
         for k, v in s.get("last_h2_signal_time", {}).items():
             try:
-                ts = datetime.fromisoformat(v)
+                ts = _ensure_aware_utc(datetime.fromisoformat(v))
                 if (now_utc - ts).total_seconds() < 1800:
                     last_h2_signal_time[k] = ts  # nur noch gültige Fenster laden
             except Exception:
