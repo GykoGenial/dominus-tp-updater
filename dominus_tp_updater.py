@@ -1,5 +1,5 @@
 """
-DOMINUS Trade-Automatisierung v4.23
+DOMINUS Trade-Automatisierung v4.24
 ══════════════════════════════════════════════════════════════
 Vollautomatisches Setup nach DOMINUS-Strategie (Handbuch März 2026)
 Finanzmathematische Optimierungen:
@@ -13,6 +13,28 @@ Finanzmathematische Optimierungen:
   ⑧ Entry-Queue       — H2_SIGNAL + HARSI_EXIT gemeinsam als Rangliste (v4.22)
   ⑨ Queue-Tracking    — entry_queue_log.csv + R-Multiple-Outcome (v4.20)
   ⑩ Klick-UX          — Inline-Buttons in allen Signal-Messages (v4.22)
+
+Changelog v4.24 — Ghost-Flag-Fix (kein fälschliches "♻️ TPs nach DCA" mehr):
+  G1: Discriminator in main()-Polling-Loop gehärtet. Bisher entschied allein
+      new_trade_done[sym] über "Neuer Trade vs. Nachkauf". Wenn eine
+      vorherige Position via Bitget-GUI oder Race-Condition geschlossen wurde
+      ohne dass handle_position_closed() das Flag zurücksetzen konnte, blieb
+      new_trade_done=True im State hängen. Folge-Fill eines NEUEN Trades
+      wurde dann als DCA behandelt → "♻️ TPs nach DCA"-Message, kein
+      setup_new_trade, fehlende DCA-Limits, CSV-Log, trade_data, Trailing-
+      SL-Init, Kelly/R:R-Check, Auto-SL-Fallback.
+      Neu: is_known_pos = (last_known_size > 0 AND last_known_avg > 0 AND
+      sym in trade_data). Nur wenn alle drei konsistent vorhanden sind,
+      gilt's als Nachkauf. Sonst wird der Ghost-State gewarnt, weggeputzt
+      und setup_new_trade() läuft sauber.
+  G2: Startup-Cleanup — nach load_state() + get_all_positions() gleicht der
+      Bot den persistent-state mit der Bitget-Live-Position-Liste ab. Alle
+      Symbole mit new_trade_done=True aber ohne aktive Position werden als
+      verwaiste Ghost-Flags erkannt und komplett entfernt (new_trade_done,
+      last_known_avg/size, sl_at_entry, trailing_sl_level, harsi_sl,
+      sling_sl, dca_void, trade_data) und der bereinigte State wird sofort
+      persistiert. Damit kommt kein Ghost-State mehr nach einem Railway-
+      Restart in den Polling-Loop.
 
 Changelog v4.23 — TV-Coin-Button + ✅-Checkliste (Pine-geprüft):
   T1: build_setup_buttons(symbol) Row 1 um zweiten Button erweitert — neben
@@ -5960,7 +5982,7 @@ def start_webhook_server():
     @app.route("/", methods=["GET"])
     @app.route("/health", methods=["GET"])
     def health():
-        return jsonify({"status": "running", "version": "v4.23"}), 200
+        return jsonify({"status": "running", "version": "v4.24"}), 200
 
     port = _env_int("PORT", 8080)
     # WICHTIG: Token NICHT ins Log schreiben — er landet sonst in Railway-Logs.
@@ -6855,7 +6877,7 @@ def main():
         log("In Railway → Variables eintragen.")
         return
 
-    log("DOMINUS Trade-Automatisierung v4.23 gestartet — mit finanzmathematischen Optimierungen")
+    log("DOMINUS Trade-Automatisierung v4.24 gestartet — mit finanzmathematischen Optimierungen")
     log(f"Intervall: {POLL_INTERVAL}s")
     log("Warte auf neue Trades...")
     log("─" * 55)
@@ -6883,6 +6905,29 @@ def main():
         log("Gefundene Probleme wurden per Telegram gemeldet → /refresh SYMBOL zum Reparieren")
     else:
         log("Keine offenen Positionen. Warte auf ersten Trade...")
+
+    # v4.24: Verwaiste State-Einträge aufräumen.
+    # Symbole mit new_trade_done=True im State-File, die aber laut Bitget
+    # keine offene Position haben, waren die Ursache des "♻️ TPs nach DCA"-
+    # Bugs (neue Trades wurden als Nachkauf interpretiert). Beim Startup
+    # gleichen wir state-File mit Bitget-Live-State ab und entfernen Ghosts.
+    _active_syms = {p.get("symbol") for p in positions if p.get("symbol")}
+    _orphans = [s for s in list(new_trade_done.keys()) if s not in _active_syms]
+    if _orphans:
+        log(f"  ⚠ {len(_orphans)} verwaiste(s) Ghost-Flag(s) gefunden: "
+            f"{', '.join(_orphans)} — wird bereinigt")
+        for _o in _orphans:
+            new_trade_done.pop(_o, None)
+            last_known_avg.pop(_o, None)
+            last_known_size.pop(_o, None)
+            sl_at_entry.pop(_o, None)
+            trailing_sl_level.pop(_o, None)
+            harsi_sl.pop(_o, None)
+            sling_sl.pop(_o, None)
+            dca_void.pop(_o, None)
+            trade_data.pop(_o, None)
+        save_state()
+        log(f"  ✓ Ghost-State bereinigt und persistiert")
 
     last_check_ms = int(time.time() * 1000)
 
@@ -6929,8 +6974,33 @@ def main():
                     if sym not in affected:
                         continue
 
-                    # Neuer Trade oder Nachkauf?
-                    if not new_trade_done.get(sym, False):
+                    # v4.24: Neuer Trade oder Nachkauf?
+                    # Discriminator basiert NICHT mehr nur auf new_trade_done —
+                    # das Flag blieb in v4.23 nach Bitget-GUI-Closes als Ghost
+                    # hängen und liess danach neue Trades fälschlich als DCA
+                    # durchlaufen (→ "♻️ TPs nach DCA" statt "Neuer Trade",
+                    # kein setup_new_trade → fehlende DCA-Limits, CSV-Log,
+                    # Trade-Data, Trailing-SL-Init). Jetzt müssen zusätzlich
+                    # last_known_size + last_known_avg + trade_data konsistent
+                    # vorhanden sein, sonst wird der Fill als neuer Trade
+                    # behandelt — auch wenn new_trade_done noch True ist.
+                    is_known_pos = (
+                        last_known_size.get(sym, 0) > 0
+                        and last_known_avg.get(sym, 0) > 0
+                        and sym in trade_data
+                    )
+                    if not is_known_pos:
+                        if new_trade_done.get(sym, False):
+                            log(f"  ⚠ Ghost-Flag entdeckt: new_trade_done[{sym}]=True "
+                                f"ohne last_known_size/avg/trade_data — wird als "
+                                f"neuer Trade behandelt")
+                            # Verwaisten State wegputzen bevor setup_new_trade läuft
+                            new_trade_done.pop(sym, None)
+                            sl_at_entry.pop(sym, None)
+                            trailing_sl_level.pop(sym, None)
+                            harsi_sl.pop(sym, None)
+                            sling_sl.pop(sym, None)
+                            dca_void.pop(sym, None)
                         log(f"Neuer Trade via Fill erkannt: {sym}")
                         setup_new_trade(pos)
                     else:
