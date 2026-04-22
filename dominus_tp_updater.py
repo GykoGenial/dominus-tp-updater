@@ -1,5 +1,5 @@
 """
-DOMINUS Trade-Automatisierung v4.22
+DOMINUS Trade-Automatisierung v4.23
 ══════════════════════════════════════════════════════════════
 Vollautomatisches Setup nach DOMINUS-Strategie (Handbuch März 2026)
 Finanzmathematische Optimierungen:
@@ -13,6 +13,19 @@ Finanzmathematische Optimierungen:
   ⑧ Entry-Queue       — H2_SIGNAL + HARSI_EXIT gemeinsam als Rangliste (v4.22)
   ⑨ Queue-Tracking    — entry_queue_log.csv + R-Multiple-Outcome (v4.20)
   ⑩ Klick-UX          — Inline-Buttons in allen Signal-Messages (v4.22)
+
+Changelog v4.23 — TV-Coin-Button + ✅-Checkliste (Pine-geprüft):
+  T1: build_setup_buttons(symbol) Row 1 um zweiten Button erweitert — neben
+      🟠 Bitget {COIN} jetzt 📊 TV {COIN} H2. Link öffnet den Coin direkt im
+      gespeicherten DOMINUS-Layout (lX5eDAis) auf H2-Timeframe. Greift
+      automatisch in allen Signal-Messages (H2_SIGNAL, HARSI_EXIT, Extreme-
+      Zone-Info, /berechnen, /trade, Close-Summary, Auto-SL).
+  T2: DOMINUS-Checkliste in H2-Signal: die zwei hardcodierten ☐ (Impuls-
+      Extremzone / H4-Trigger) sind jetzt ✅ "(Pine-geprüft)". Grund: Pine
+      erzwingt diese Bedingungen bereits im Orchestrator (h4_imp_hit + h4_bar_
+      confirmed → h4_long_active → h2_entry_long), bevor überhaupt ein
+      H2_SIGNAL losgeschickt wird. Leere Kästchen waren irreführend, da sie
+      bereits per Konstruktion true sind.
 
 Changelog v4.22 — Unified Entry-Queue + Auto-HARSI_EXIT + Button-Konsistenz:
   V1: H2_SIGNAL mit harsi_warn=0 wird jetzt ebenfalls in die Entry-Queue
@@ -2469,19 +2482,23 @@ def build_setup_buttons(symbol: str = "") -> dict:
     """
     Baut das Telegram Inline-Keyboard für Trade-Setups und Auto-SL-Meldungen.
 
-    Layout (Wunsch Felix, 2026-04-21):
-      Row 1:  🟠 Bitget {COIN}          ← primäre Aktion
-      Row 2:  📈 BTC H2   🔀 Total2     ← Makro-Kontext
+    Layout (Wunsch Felix, 2026-04-22):
+      Row 1:  🟠 Bitget {COIN}   📊 TV {COIN} H2   ← primäre Aktionen
+      Row 2:  📈 BTC H2          🔀 Total2        ← Makro-Kontext
 
-    Die H2/H4-Buttons des eigenen Coins sind bewusst weggelassen — Timeframe
-    lässt sich in TradingView mit einem Klick umschalten. Wenn kein Symbol
-    übergeben wird, fehlt die Bitget-Zeile (z.B. für Macro-only-Reports).
+    Der TV-Button öffnet den Coin direkt im gespeicherten DOMINUS-Layout
+    (lX5eDAis) auf H2 — Timeframe lässt sich in TradingView mit einem Klick
+    auf H4 umschalten. Wenn kein Symbol übergeben wird, fehlt die Coin-Zeile
+    (z.B. für Macro-only-Reports).
     """
     links = tv_chart_links(symbol if symbol else "BTCUSDT")
     rows = []
     if symbol:
         base_coin = symbol.upper().replace("USDT", "").replace(".P", "")
-        rows.append([{"text": f"🟠 Bitget {base_coin}", "url": links["bitget"]}])
+        rows.append([
+            {"text": f"🟠 Bitget {base_coin}",  "url": links["bitget"]},
+            {"text": f"📊 TV {base_coin} H2",   "url": links["coin_h2"]},
+        ])
     rows.append([
         {"text": "📈 BTC H2",  "url": links["btc_h2"]},
         {"text": "🔀 Total2",  "url": links["total2"]},
@@ -5917,8 +5934,8 @@ def start_webhook_server():
             f"Kurs: {entry}",
             "",
             "📋 <b>DOMINUS Checkliste:</b>",
-            "☐ DOMINUS Impuls Extremzone erreicht?",
-            "☐ H4 Trigger bestätigt?",
+            "✅ DOMINUS Impuls Extremzone erreicht (Pine-geprüft)",
+            "✅ H4 Trigger bestätigt (Pine-geprüft)",
             f"{harsi_icon} {harsi_txt}",
             f"{btc_t2_icon} {btc_t2_txt}",
             f"{premium_icon} {premium_txt}",
@@ -5943,7 +5960,7 @@ def start_webhook_server():
     @app.route("/", methods=["GET"])
     @app.route("/health", methods=["GET"])
     def health():
-        return jsonify({"status": "running", "version": "v4.22"}), 200
+        return jsonify({"status": "running", "version": "v4.23"}), 200
 
     port = _env_int("PORT", 8080)
     # WICHTIG: Token NICHT ins Log schreiben — er landet sonst in Railway-Logs.
@@ -6838,7 +6855,7 @@ def main():
         log("In Railway → Variables eintragen.")
         return
 
-    log("DOMINUS Trade-Automatisierung v4.22 gestartet — mit finanzmathematischen Optimierungen")
+    log("DOMINUS Trade-Automatisierung v4.23 gestartet — mit finanzmathematischen Optimierungen")
     log(f"Intervall: {POLL_INTERVAL}s")
     log("Warte auf neue Trades...")
     log("─" * 55)
