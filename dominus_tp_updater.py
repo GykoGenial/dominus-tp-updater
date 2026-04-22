@@ -1,5 +1,5 @@
 """
-DOMINUS Trade-Automatisierung v4.21
+DOMINUS Trade-Automatisierung v4.22
 ══════════════════════════════════════════════════════════════
 Vollautomatisches Setup nach DOMINUS-Strategie (Handbuch März 2026)
 Finanzmathematische Optimierungen:
@@ -10,9 +10,30 @@ Finanzmathematische Optimierungen:
   ⑤ Telegram Polling  — /berechnen /trade /status /hilfe /alarm
   ⑥ Sling-SL Trailing — Swing-Pivot-basierter SL (nur protektiv)
   ⑦ Exposure-Cap 25%  — max. Gesamt-Einsatz inkl. Hebel pro Trade
-  ⑧ Entry-Queue       — mehrere HARSI_EXIT-Signale als Rangliste (v4.19)
+  ⑧ Entry-Queue       — H2_SIGNAL + HARSI_EXIT gemeinsam als Rangliste (v4.22)
   ⑨ Queue-Tracking    — entry_queue_log.csv + R-Multiple-Outcome (v4.20)
-  ⑩ Klick-UX          — Inline-Buttons, klickbare Alarm-Templates (v4.21)
+  ⑩ Klick-UX          — Inline-Buttons in allen Signal-Messages (v4.22)
+
+Changelog v4.22 — Unified Entry-Queue + Auto-HARSI_EXIT + Button-Konsistenz:
+  V1: H2_SIGNAL mit harsi_warn=0 wird jetzt ebenfalls in die Entry-Queue
+      eingespeist (bisher nur HARSI_EXIT). Damit erscheinen mehrere gleichzeitige
+      Einstiegs-Signale — unabhängig davon ob sie über H2_SIGNAL oder HARSI_EXIT
+      reinkommen — als EINE konsolidierte Rangliste im ENTRY_QUEUE_WINDOW_SEC-
+      Fenster. H2_SIGNAL mit harsi_warn=1 bleibt Einzel-Message mit 30-Min-Timer
+      (dort ist die Pro-Coin-Timer-Info relevant).
+  V2: Der alte "Alarm 3 manuell anlegen"-Block beim H2-Signal mit harsi_warn=1
+      wurde entfernt. Seit DOM-ORC v2.4.2 (Intrabar alert.freq_once_per_bar)
+      feuert HARSI_EXIT automatisch über den Watchlist-Master-Alarm ("Any alert()
+      function call"). Der User muss keinen separaten TV-Alarm mehr pro Coin
+      anlegen — die timer_line verweist nur noch darauf, dass der Exit
+      automatisch eintrudelt.
+  V3: Button-Konsistenz — build_setup_buttons(symbol) (Bitget + BTC H2 + Total2)
+      wird jetzt an ALLE Signal-Messages angehängt: H2_SIGNAL, HARSI_EXIT-
+      Fallback, Extreme-Zone-Info, Entry-Rangliste (Top-1 Bitget). Damit ist
+      der Klick-UX-Standard aus v4.21 durchgängig in der Signal-Pipeline.
+  V4: Entry-Message enthält keine URL-Link-Zeilen mehr (H2/H4/BTC/Total2) —
+      diese sind via Inline-Buttons abgedeckt. Weniger Text-Rauschen, bessere
+      Mobile-Lesbarkeit.
 
 Changelog v4.21 — Klick-UX, CSV-Dedup, Token-Redact, utcfromtimestamp-Fix:
   U1: Inline-Keyboard-Buttons für Trade-Setups — telegram() und reply() nehmen
@@ -3392,7 +3413,11 @@ def flush_entries() -> None:
             balance = 0.0
 
         msg = format_ranked_list(ranked, balance, len(batch))
-        telegram(msg)
+        # v4.22: Button-Zeile mit Top-1-Bitget + BTC H2 + Total2, damit der User
+        # direkt auf den Top-Score-Coin springen kann. Die restlichen Kandidaten
+        # sind im Text als /trade-Copy-Commands verfügbar (einer pro Zeile).
+        _top_sym = ranked[0]["symbol"] if ranked else ""
+        telegram(msg, reply_markup=build_setup_buttons(_top_sym))
         log(f"  ENTRY-QUEUE: Flush gesendet — {len(ranked)} Signale "
             f"({n_premium} Premium)")
     except Exception as ex:
@@ -5704,7 +5729,7 @@ def start_webhook_server():
                     "Warte auf nächsten H2-Signal-Alarm.",
                 ]
 
-            telegram("\n".join(msg_parts))
+            telegram("\n".join(msg_parts), reply_markup=build_setup_buttons(symbol))
 
             # Nach Eintritt: Zeitstempel löschen (verhindert Doppel-Warnungen)
             if sig_key in last_h2_signal_time:
@@ -5733,7 +5758,7 @@ def start_webhook_server():
         _xinfo = extreme_warn(direction)
         _xmsg  = format_extreme_info_msg(symbol, direction, _xinfo, "H2_SIGNAL")
         if _xmsg:
-            telegram(_xmsg)
+            telegram(_xmsg, reply_markup=build_setup_buttons(symbol))
 
         # H2 Signal → H4 Puffer flushen dann sofort senden
         # 30-Min-Fenster starten: Zeitstempel für HARSI_EXIT-Prüfung speichern
@@ -5749,21 +5774,57 @@ def start_webhook_server():
         btc_t2_warn_val = int(float(data.get("btc_t2_warn", 0) or 0))
         premium_val     = int(float(data.get("premium",     0) or 0))
 
-        # v4.12: Sling-SL + ATR(14) für berechneten /trade-Vorschlag
-        _trade_sugg = build_trade_suggestion(
-            symbol, direction, entry,
-            data.get("sling_sl"), data.get("atr"),
-        )
-
-        # Makro-Richtung des Signals speichern (BTC/Total2 als letzten bekannten Stand)
-        # btc_t2_warn=0 bedeutet: BTC & Total2 passten zur Signal-Richtung
-        # WICHTIG: "recovering"/"recovering_short" NICHT überschreiben
-        # → Zustand bleibt bis BTC_DIR 0-Kreuzungs-Alarm kommt (Alarm 5)
+        # ─────────────────────────────────────────────────────────────
+        # v4.22: H2_SIGNAL mit harsi_warn=0 → in Entry-Queue (Option 1)
+        # ─────────────────────────────────────────────────────────────
+        # Bei harsi_warn=0 ist HARSI bereits außerhalb der Extremzone —
+        # das H2_SIGNAL IST der Einstiegs-Trigger (nicht mehr nur Vorwarnung).
+        # Damit mehrere gleichzeitige H2-Einstiege als Rangliste erscheinen
+        # (statt einzeln pro Coin), wird das Signal hier in dieselbe Queue
+        # eingespeist wie HARSI_EXIT. flush_entries() scored & rendert beide
+        # Signal-Quellen zusammen nach Premium-Bucket + Score absteigend.
+        #
+        # WICHTIG: btc_dir / t2_dir werden vorher gesetzt (unten), damit die
+        # Queue-Scoring-Funktion aktuelle Makro-Richtungen sieht.
         if btc_t2_warn_val == 0:
             if btc_dir not in ("recovering", "recovering_short"):
                 btc_dir = direction
             if t2_dir  not in ("recovering", "recovering_short"):
                 t2_dir  = direction
+
+        if harsi_warn_val == 0 and ENTRY_QUEUE_ENABLED:
+            _sugg_q = build_trade_suggestion(
+                symbol, direction, entry,
+                data.get("sling_sl"), data.get("atr"),
+            )
+            enqueue_entry({
+                "symbol":             symbol,
+                "direction":          direction,
+                "entry":              entry,
+                "warn_line":          "✅ H2 ready — HARSI OK, sofort einsteigbar",
+                "timing_elapsed_min": 0,
+                "sugg":               _sugg_q,
+                "harsi_warn":         0,
+                "sling_sl":           data.get("sling_sl"),
+                "atr":                data.get("atr"),
+                "xinfo":              _xinfo,
+                "source":             "H2_SIGNAL",
+                "ts":                 time.time(),
+            })
+            # H4-Puffer trotzdem flushen (gebündelte H4-Trigger-Nachricht)
+            flush_h4_buffer()
+            # Fenster-Marker entfernen — Queue-Flush übernimmt die Darstellung
+            if f"{symbol}_{direction}" in last_h2_signal_time:
+                del last_h2_signal_time[f"{symbol}_{direction}"]
+            log(f"  H2_SIGNAL {symbol} {direction} → Entry-Queue (harsi_warn=0)")
+            return  # ok: H2_SIGNAL queued
+
+        # v4.12: Sling-SL + ATR(14) für berechneten /trade-Vorschlag
+        # (btc_dir / t2_dir wurden bereits oben v4.22-Block gesetzt)
+        _trade_sugg = build_trade_suggestion(
+            symbol, direction, entry,
+            data.get("sling_sl"), data.get("atr"),
+        )
 
         flush_h4_buffer()
         balance   = get_futures_balance()
@@ -5816,16 +5877,20 @@ def start_webhook_server():
             _h2_ts      = last_h2_signal_time.get(f"{symbol}_{direction}", datetime.utcnow())
             _expiry_utc = _h2_ts + timedelta(minutes=30)
             _expiry_str = _expiry_utc.strftime("%d.%m.%Y %H:%M UTC")
-            # Richtungsabhängiger HTML-Anker
+            # v4.22: HARSI_EXIT kommt automatisch über DOM-ORC v2.4.2 Intrabar-
+            # Alert (Pine alert.freq_once_per_bar) → Watchlist-Master-Alarm.
+            # Kein manuelles Alarm-3-Anlegen mehr nötig. Stattdessen: Timer +
+            # kurzer Hinweis, dass der HARSI_EXIT automatisch eintrudeln wird.
             _anker  = "sec-alarm3" if direction == "long" else "sec-alarm3b"
-            _anchor_label = "Alarm 3 Long HARSI Exit" if direction == "long" else "Alarm 3b Short HARSI Exit"
+            _anchor_label = "Alarm 3 — Doku" if direction == "long" else "Alarm 3b — Doku"
             if DOCS_URL:
-                _docs_link = f'\n🔗 <a href="{DOCS_URL}#{_anker}">{_anchor_label} — Anleitung</a>'
+                _docs_link = f'\n🔗 <a href="{DOCS_URL}#{_anker}">{_anchor_label}</a>'
             else:
-                _docs_link = f"\n🔗 Anker: #{_anker} in Dominus_Alarm_Templates.html"
+                _docs_link = ""
             timer_line = (
-                f"⚠️ <b>HARSI in Extremzone — jetzt Alarm 3 erstellen!</b>\n"
-                f"⏰ Signal läuft ab: <b>{_expiry_str}</b>"
+                f"⏳ <b>HARSI noch in Extremzone — warten auf Intrabar-Exit</b>\n"
+                f"⏰ Fenster läuft ab: <b>{_expiry_str}</b>\n"
+                f"🤖 HARSI_EXIT-Alarm kommt automatisch (Pine v2.4.2 Intrabar)"
                 f"{_docs_link}"
             )
         elif _recovering_long and premium_val != 1:
@@ -5863,31 +5928,22 @@ def start_webhook_server():
             "",
             timer_line,
             format_trade_suggestion(symbol, direction, _trade_sugg),
-            "",
-            "📈 Charts:",
-            f"H2 {symbol}: {links['coin_h2']}",
-            f"H4 {symbol}: {links['coin_h4']}",
-            f"BTC H2: {links['btc_h2']}",
-            f"Total2: {links['total2']}",
         ]
-        telegram("\n".join(msg_parts))
+        # v4.22: Charts werden via Inline-Buttons angeboten — keine Link-URLs
+        # mehr im Message-Text (weniger Rauschen, bessere Mobile-UX). Buttons
+        # liefert build_setup_buttons(symbol) als Bitget + BTC H2 + Total2.
+        telegram("\n".join(msg_parts), reply_markup=build_setup_buttons(symbol))
 
-        # ── v4.8: HARSI in Extremzone → kopierbare Alarm-3/3b-Vorlage mitschicken ──
-        # Spart dem User den Weg ins HTML-Handbuch: die Message-JSON, der Alarm-Name
-        # und die Webhook-URL kommen hier schon fertig zum Copy-Paste in TV.
-        # Die Fenster-Logik ist in build_alarm_harsi_exit() eingebaut und prüft
-        # last_h2_signal_time[symbol_direction] (wurde oben in diesem Handler gesetzt).
-        if harsi_warn_val == 1:
-            try:
-                telegram(build_alarm_harsi_exit(symbol, direction))
-            except Exception as _alarm_err:
-                log(f"[alarm-inline] Fehler: {_alarm_err}")
+        # v4.22: Der frühere "Alarm 3 manuell anlegen"-Block (build_alarm_harsi_exit)
+        # ist obsolet: Pine v2.4.2 feuert HARSI_EXIT intrabar, der Watchlist-Master-
+        # Alarm ("Any alert() function call") fängt ihn automatisch ab und Railway
+        # leitet ihn in die Entry-Queue. Kein User-Action nötig.
         return  # ok: H2_SIGNAL processed
 
     @app.route("/", methods=["GET"])
     @app.route("/health", methods=["GET"])
     def health():
-        return jsonify({"status": "running", "version": "v4.21"}), 200
+        return jsonify({"status": "running", "version": "v4.22"}), 200
 
     port = _env_int("PORT", 8080)
     # WICHTIG: Token NICHT ins Log schreiben — er landet sonst in Railway-Logs.
@@ -6782,7 +6838,7 @@ def main():
         log("In Railway → Variables eintragen.")
         return
 
-    log("DOMINUS Trade-Automatisierung v4.21 gestartet — mit finanzmathematischen Optimierungen")
+    log("DOMINUS Trade-Automatisierung v4.22 gestartet — mit finanzmathematischen Optimierungen")
     log(f"Intervall: {POLL_INTERVAL}s")
     log("Warte auf neue Trades...")
     log("─" * 55)
