@@ -149,7 +149,7 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#111114;color:#de
 <div class="wrap">
 
 <div class="page-title">DOMINUS Alarm-Templates</div>
-<div class="page-sub">TradingView &rarr; Railway Webhook &rarr; Telegram &middot; DOM-ORC v2.4.2 &middot; Railway v4.21 &mdash; Dark Mode &mdash; Stand April 2026</div>
+<div class="page-sub">TradingView &rarr; Railway Webhook &rarr; Telegram &middot; DOM-ORC v2.4.2 &middot; Railway v4.30 &mdash; Dark Mode &mdash; Stand April 2026</div>
 
 <!-- ======================================== -->
 <!-- 1. EINSTELLUNGEN / SETUP                  -->
@@ -295,31 +295,34 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#111114;color:#de
     <!-- Schritt B1 -->
     <div style="position:relative;margin-bottom:12px">
       <div style="position:absolute;left:-32px;width:20px;height:20px;border-radius:50%;background:#162a16;color:#5EC45E;font-size:10px;font-weight:600;display:flex;align-items:center;justify-content:center">B1</div>
-      <div style="font-size:13px;font-weight:500;color:#5EC45E">harsi_warn: 0 &mdash; sofort einsteigen</div>
-      <div style="font-size:12px;color:#888;margin-top:2px">BTC &amp; Total2 Impuls-Farbe manuell pr&uuml;fen &rarr; Trade er&ouml;ffnen</div>
+      <div style="font-size:13px;font-weight:500;color:#5EC45E">harsi_warn: 0 &mdash; Slot sofort tappbar</div>
+      <div style="font-size:12px;color:#888;margin-top:2px">Kandidat erscheint direkt in der Entry-Rangliste mit Score + Badges &rarr; antippen &rarr; Detail-Ansicht &rarr; Setup pr&uuml;fen</div>
       <div style="margin-top:5px">
-        <a href="#sec-telegram" style="font-size:11px;padding:2px 8px;border-radius:4px;background:#0d2820;color:#4ECBA0;text-decoration:none">&#x2192; /trade Befehl</a>
+        <a href="#sec-telegram-preview" style="font-size:11px;padding:2px 8px;border-radius:4px;background:#0d2820;color:#4ECBA0;text-decoration:none">&#x2192; Rangliste &amp; Detail-Ansicht</a>
       </div>
     </div>
 
     <!-- Schritt B2 -->
     <div style="position:relative;margin-bottom:12px">
       <div style="position:absolute;left:-32px;width:20px;height:20px;border-radius:50%;background:#2a1c08;color:#E09040;font-size:10px;font-weight:600;display:flex;align-items:center;justify-content:center">B2</div>
-      <div style="font-size:13px;font-weight:500;color:#E09040">harsi_warn: 1 &mdash; warten</div>
-      <div style="font-size:12px;color:#888;margin-top:2px">Sofort Alarm 3 / 3b auf H2-Chart erstellen &mdash; <strong style="color:#F07070">Zeitfenster: 30 Minuten!</strong></div>
+      <div style="font-size:13px;font-weight:500;color:#E09040">harsi_warn: 1 &mdash; Auto-Wait</div>
+      <div style="font-size:12px;color:#888;margin-top:2px">Script haelt den Kandidaten intern fest &mdash; <strong style="color:#deded8">kein manueller Alarm 3 mehr n&ouml;tig</strong> (ab v4.22). Sobald HARSI_EXIT via Alarm 4c / Sling-SL reinkommt, wird der Slot in der Rangliste freigeschaltet. <strong style="color:#F07070">Zeitfenster: 30 Min ab H2-Signal.</strong></div>
       <div style="margin-top:5px;display:flex;gap:6px;flex-wrap:wrap">
-        <a href="#sec-alarm3" style="font-size:11px;padding:2px 8px;border-radius:4px;background:#0d2820;color:#4ECBA0;text-decoration:none">&#x2192; Alarm 3 Long HARSI Exit</a>
-        <a href="#sec-alarm3b" style="font-size:11px;padding:2px 8px;border-radius:4px;background:#2e1616;color:#F07070;text-decoration:none">&#x2192; Alarm 3b Short HARSI Exit</a>
+        <a href="#sec-alarm4c" style="font-size:11px;padding:2px 8px;border-radius:4px;background:#2a1b3d;color:#C28AF5;text-decoration:none">&#x2192; HARSI-SL Universal</a>
+        <a href="#sec-sling-sl" style="font-size:11px;padding:2px 8px;border-radius:4px;background:#1a2e1a;color:#8AE66A;text-decoration:none">&#x2192; Sling-SL Universal</a>
       </div>
     </div>
 
     <!-- Schritt C -->
     <div style="position:relative;margin-bottom:12px">
       <div style="position:absolute;left:-32px;width:20px;height:20px;border-radius:50%;background:#0e1f33;color:#7BB8F5;font-size:11px;font-weight:600;display:flex;align-items:center;justify-content:center">C</div>
-      <div style="font-size:13px;font-weight:500;color:#deded8">HARSI frei &mdash; Trade er&ouml;ffnen</div>
-      <div style="font-size:12px;color:#888;margin-top:2px">BTC &amp; Total2 pr&uuml;fen &rarr; /trade &rarr; Market Order + SL auf Bitget</div>
+      <div style="font-size:13px;font-weight:500;color:#deded8">Trade er&ouml;ffnen &mdash; zwei Wege</div>
+      <div style="font-size:12px;color:#888;margin-top:2px">
+        <strong style="color:#deded8">Manuell</strong>: Detail-Ansicht &rarr; Bitget-Button &rarr; Market Order + SL selber setzen.<br>
+        <strong style="color:#5EC45E">&#x1F680; Auto</strong> (wenn <code>AUTO_TRADE_ENABLED=1</code>): Detail-Ansicht &rarr; <strong style="color:#5EC45E">&#x1F680; Trade jetzt</strong>-Button &rarr; Two-Tap-Confirm &rarr; Script er&ouml;ffnet automatisch + setzt SL.
+      </div>
       <div style="margin-top:5px">
-        <a href="#sec-telegram" style="font-size:11px;padding:2px 8px;border-radius:4px;background:#0d2820;color:#4ECBA0;text-decoration:none">&#x2192; /trade Befehl</a>
+        <a href="#sec-telegram-preview" style="font-size:11px;padding:2px 8px;border-radius:4px;background:#0d2820;color:#4ECBA0;text-decoration:none">&#x2192; Detail-Ansicht-Vorschau</a>
       </div>
     </div>
 
@@ -336,6 +339,7 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#111114;color:#de
     <div style="font-size:11px;color:#555;letter-spacing:.05em;text-transform:uppercase;margin-bottom:7px">Sektionen</div>
     <div style="display:flex;flex-wrap:wrap;gap:6px">
       <a href="#sec-setup"    style="font-size:12px;padding:4px 10px;border-radius:6px;background:#0d2820;color:#4ECBA0;text-decoration:none;border:0.5px solid rgba(78,203,160,0.25)">&#x2699; Einstellungen &amp; Token</a>
+      <a href="#sec-whatsnew" style="font-size:12px;padding:4px 10px;border-radius:6px;background:#2a1b3d;color:#C28AF5;text-decoration:none;border:0.5px solid rgba(194,138,245,0.25)">&#x2728; Was ist neu (v4.22&ndash;v4.30)</a>
       <a href="#sec-harsi"    style="font-size:12px;padding:4px 10px;border-radius:6px;background:#252528;color:#909090;text-decoration:none;border:0.5px solid rgba(0,0,0,0.09)">&#x26A0; HARSI-Konzept</a>
       <a href="#sec-alarm2"   style="font-size:12px;padding:4px 10px;border-radius:6px;background:#162a16;color:#5EC45E;text-decoration:none;border:0.5px solid rgba(0,0,0,0.06)">2 Long Entry</a>
       <a href="#sec-alarm2b"  style="font-size:12px;padding:4px 10px;border-radius:6px;background:#2e1616;color:#F07070;text-decoration:none;border:0.5px solid rgba(0,0,0,0.06)">2b Short Entry</a>
@@ -356,13 +360,81 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#111114;color:#de
       <a href="#sec-trailing" style="font-size:12px;padding:4px 10px;border-radius:6px;background:#0d2820;color:#4ECBA0;text-decoration:none;border:0.5px solid rgba(0,0,0,0.06)">&#x1F4C8; Trailing SL</a>
       <a href="#sec-deviation" style="font-size:12px;padding:4px 10px;border-radius:6px;background:#2a1c08;color:#E09040;text-decoration:none;border:0.5px solid rgba(0,0,0,0.06)">&#x26A0;&#xFE0F; Abweichungswarnungen</a>
       <a href="#sec-telegram" style="font-size:12px;padding:4px 10px;border-radius:6px;background:#252528;color:#909090;text-decoration:none;border:0.5px solid rgba(0,0,0,0.09)">&#x2709; Telegram Befehle</a>
-      <a href="#sec-telegram-preview" style="font-size:12px;padding:4px 10px;border-radius:6px;background:#0e1f33;color:#7BB8F5;text-decoration:none;border:0.5px solid rgba(0,0,0,0.06)">&#x1F4F1; Telegram Vorschau</a>
+      <a href="#sec-telegram-preview-queue" style="font-size:12px;padding:4px 10px;border-radius:6px;background:#2a1b3d;color:#C28AF5;text-decoration:none;border:0.5px solid rgba(194,138,245,0.25)">&#x1F4CB; Rangliste &amp; Detail (v4.25)</a>
+      <a href="#sec-telegram-preview" style="font-size:12px;padding:4px 10px;border-radius:6px;background:#0e1f33;color:#7BB8F5;text-decoration:none;border:0.5px solid rgba(0,0,0,0.06)">&#x1F4F1; Einzelnachricht</a>
       <a href="#sec-workflow" style="font-size:12px;padding:4px 10px;border-radius:6px;background:#252528;color:#909090;text-decoration:none;border:0.5px solid rgba(0,0,0,0.09)">&#x2630; Vollst. Workflow</a>
     </div>
   </div>
 </div>
 
 <!-- (Webhook-URL &amp; Token: wurde in Abschnitt 1 &laquo;Einstellungen&raquo; oben integriert) -->
+
+<!-- ======================================== -->
+<!-- WAS IST NEU IN v4.22 - v4.30              -->
+<!-- ======================================== -->
+<div class="card" id="sec-whatsnew" style="border-left:3px solid #C28AF5">
+  <div class="card-head">
+    <div class="step-badge" style="background:#2a1b3d;color:#C28AF5">&#x2728;</div>
+    <div>
+      <div class="h2">Was ist neu in v4.22 &ndash; v4.30</div>
+      <div class="sub">Seit der letzten Doku-Revision (v4.21) sind neun Versionen dazu gekommen &mdash; hier das Wesentliche</div>
+    </div>
+  </div>
+
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+    <!-- v4.22 -->
+    <div style="background:#0d1a1e;border:1px solid rgba(78,203,160,0.25);border-radius:10px;padding:10px 12px">
+      <div style="font-size:11px;font-weight:700;color:#4ECBA0;text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px">v4.22 &middot; Entry-Rangliste</div>
+      <div style="font-size:12px;color:#B8B8C0;line-height:1.6">
+        H2_SIGNAL und HARSI_EXIT landen jetzt gemeinsam in einer gerankten Rangliste. <strong style="color:#deded8">Alarm 3 / 3b muss nicht mehr manuell erstellt werden</strong> &mdash; der HARSI-Exit wird automatisch eingespeist, sortiert nach Score und erscheint in Telegram als tappbare Slot-Liste.
+      </div>
+    </div>
+
+    <!-- v4.25 -->
+    <div style="background:#0e1f33;border:1px solid rgba(123,184,245,0.25);border-radius:10px;padding:10px 12px">
+      <div style="font-size:11px;font-weight:700;color:#7BB8F5;text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px">v4.25 &middot; Klick-UX</div>
+      <div style="font-size:12px;color:#B8B8C0;line-height:1.6">
+        Button-Driven Rangliste: jede Zeile wird zu einem Slot-Button. Antippen &rarr; <strong style="color:#deded8">Detail-Ansicht</strong> mit Score-Breakdown (SL/Hebel/Makro/Premium/R:R-Punkte rechtsb&uuml;ndig), DCA-Preisen, TP-Leveln, Kelly und Chart-Links. Kein Copy-Paste von <code>/trade</code> mehr n&ouml;tig.
+      </div>
+    </div>
+
+    <!-- v4.27 -->
+    <div style="background:#0e1f33;border:1px solid rgba(123,184,245,0.18);border-radius:10px;padding:10px 12px">
+      <div style="font-size:11px;font-weight:700;color:#7BB8F5;text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px">v4.27 &middot; Score-Refactor</div>
+      <div style="font-size:12px;color:#B8B8C0;line-height:1.6">
+        Score-Formel entzerrt: SL und Hebel waren zuvor doppelt gewichtet (Hebel = 25 / SL% &rarr; Double-Counting bei Scalps). Jetzt asymmetrische Glockenkurve um 12&times; Peak, plus <strong style="color:#deded8">Gegen-Trend-Malus &minus;5</strong> statt nur Warnung.
+      </div>
+    </div>
+
+    <!-- v4.28 -->
+    <div style="background:#0d1f0d;border:1px solid rgba(94,196,94,0.30);border-radius:10px;padding:10px 12px">
+      <div style="font-size:11px;font-weight:700;color:#5EC45E;text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px">v4.28 &middot; &#x1F680; One-Click-Exec</div>
+      <div style="font-size:12px;color:#B8B8C0;line-height:1.6">
+        Neuer <strong style="color:#5EC45E">&#x1F680; Trade jetzt</strong>-Button in der Detail-Ansicht mit <strong style="color:#deded8">Two-Tap-Confirm</strong> (Fat-Finger-Schutz, 10s TTL). Pipeline: Leverage setzen &rarr; Market Order &rarr; 3s Position-Verify &rarr; SL setzen &rarr; Telegram-Report. <strong style="color:#E09040">Default AUS</strong> &mdash; erst aktiv wenn <code>AUTO_TRADE_ENABLED=1</code> in Railway.
+      </div>
+    </div>
+
+    <!-- v4.29 -->
+    <div style="background:#252528;border:1px solid rgba(255,255,255,0.08);border-radius:10px;padding:10px 12px">
+      <div style="font-size:11px;font-weight:700;color:#888;text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px">v4.29 &middot; datetime-Migration</div>
+      <div style="font-size:12px;color:#B8B8C0;line-height:1.6">
+        Alle <code>datetime.utcnow()</code>-Aufrufe auf <code>datetime.now(timezone.utc)</code> migriert (Python 3.12+ Deprecation, 3.15 Removal). <strong style="color:#888">Kein User-Impact</strong> &mdash; interne Futureproofing.
+      </div>
+    </div>
+
+    <!-- v4.30 -->
+    <div style="background:#2a1c08;border:1px solid rgba(224,144,64,0.25);border-radius:10px;padding:10px 12px">
+      <div style="font-size:11px;font-weight:700;color:#E09040;text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px">v4.30 &middot; DOM-DIR-Cosmetic</div>
+      <div style="font-size:12px;color:#B8B8C0;line-height:1.6">
+        BTC/Total2 Impuls-Meldung in Telegram feuert jetzt <strong style="color:#deded8">nur bei echtem Richtungs-Wechsel</strong>. TV-Alarme k&ouml;nnen pro Bar mehrfach triggern &mdash; bisher kam jeder Tick als volle Flip-Nachricht durch. Bei Gleichstand nur noch knappe Log-Zeile.
+      </div>
+    </div>
+  </div>
+
+  <div class="info" style="margin-top:12px">
+    <strong>&#x1F4A1; Praxis:</strong> Du musst nach wie vor keinen Alarm umkonfigurieren &mdash; die TradingView-Templates unten sind ab v4.21 stabil. Die Neuerungen sind alle <em>script-seitig</em> oder in der Telegram-Ausgabe. Wenn du <code>AUTO_TRADE_ENABLED=1</code> noch nicht gesetzt hast, ist dein Workflow unver&auml;ndert.
+  </div>
+</div>
 
 <!-- ======================================== -->
 <!-- 3. ALARME                                 -->
@@ -1945,6 +2017,13 @@ if barstate.isconfirmed and not na(pl)
         <div class="field-value mono">/report</div>
       </div>
       <div style="font-size:11px;color:#888;line-height:1.55;margin-top:4px;padding:0 2px">Wird t&auml;glich um 23:59 automatisch gesendet. Enth&auml;lt: Tages-P&amp;L, abgeschlossene Trades, laufende Positionen, Monats-Kumulativ.</div>
+      <div class="field" style="margin-top:12px">
+        <div class="field-label"><span>Queue-Statistik <span class="new-badge">v4.22</span></span>
+          <button class="copy-btn" onclick="copyText('/queue_stats',this)">Kopieren</button>
+        </div>
+        <div class="field-value mono">/queue_stats</div>
+        <div style="font-size:11px;color:#888;line-height:1.55;margin-top:4px;padding:0 2px">Auswertung aus <code>entry_queue_log.csv</code>: Win-Rate, E[R] pro Score-Bucket, Wilson-Intervall, Kelly-Optimum. Basis f&uuml;r die Rangliste-Sortierung.</div>
+      </div>
     </div>
     <div>
       <div class="field">
@@ -1983,13 +2062,119 @@ Beispiel:
   <div class="success" style="margin-top:8px"><strong>&#x1F4A1; Klickbare Befehle:</strong> Alle Kommandos mit Unterstrichen (z.&nbsp;B. <code>/alarm_harsi_BTC_LONG</code>, <code>/dedup_apply</code>) sind in Telegram <b>direkt antippbar</b> &mdash; kein Copy-Paste, kein Tippfehler. Der Router zerlegt den Underscore-Suffix in Tokens und dispatcht wie ein normaler Befehl mit Argumenten.</div>
 </div>
 
-<!-- TELEGRAM VORSCHAU -->
+<!-- TELEGRAM VORSCHAU - RANGLISTE + DETAIL-ANSICHT (v4.22 / v4.25 / v4.28) -->
+<div class="card" id="sec-telegram-preview-queue" style="border-left:3px solid #C28AF5">
+  <div class="card-head">
+    <div class="step-badge" style="background:#2a1b3d;color:#C28AF5">&#x1F4CB;</div>
+    <div>
+      <div class="h2">Entry-Rangliste &amp; Detail-Ansicht <span class="new-badge" style="background:#2a1b3d;color:#C28AF5;border-color:rgba(194,138,245,0.3)">v4.25 Klick-UX</span></div>
+      <div class="sub">H2_SIGNAL + HARSI_EXIT als gerankte Slot-Liste &mdash; Detail per Tap &mdash; &#x1F680; optional One-Click-Execution</div>
+    </div>
+  </div>
+
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+    <!-- Links: Rangliste-Message -->
+    <div>
+      <div style="font-size:11px;color:#666;text-transform:uppercase;letter-spacing:.04em;margin-bottom:6px">Message 1 &middot; Rangliste (flush_entries)</div>
+      <div style="background:#0d0d10;border-radius:10px;padding:12px 14px;font-family:'SF Mono','Fira Mono',monospace;font-size:12px;color:#e0e0e0;line-height:1.7">
+        <span style="color:#C28AF5">📋 <b>Entry-Rangliste &mdash; 3 Kandidaten</b></span><br>
+        <span style="color:#888">Sortiert nach Score &middot; Tap &rarr; Detail</span><br>
+        ━━━━━━━━━━━━━━<br>
+        <span style="color:#888">Makro: BTC 🟢 &middot; Total2 🟢</span>
+      </div>
+      <!-- Slot-Buttons -->
+      <div style="display:grid;grid-template-columns:1fr;gap:4px;margin-top:6px">
+        <div style="background:#162a16;color:#deded8;border:1px solid rgba(94,196,94,0.3);border-radius:6px;padding:6px 10px;font-size:11.5px;display:flex;justify-content:space-between;align-items:center">
+          <span><b>ETHUSDT</b> LONG &middot; <span style="color:#5EC45E">⭐ 74pt</span></span>
+          <span style="color:#5EC45E">▶</span>
+        </div>
+        <div style="background:#1a1a1e;color:#deded8;border:1px solid rgba(255,255,255,0.08);border-radius:6px;padding:6px 10px;font-size:11.5px;display:flex;justify-content:space-between;align-items:center">
+          <span><b>SOLUSDT</b> LONG &middot; <span style="color:#7BB8F5">58pt</span></span>
+          <span style="color:#888">▶</span>
+        </div>
+        <div style="background:#1a1a1e;color:#deded8;border:1px solid rgba(255,255,255,0.08);border-radius:6px;padding:6px 10px;font-size:11.5px;display:flex;justify-content:space-between;align-items:center">
+          <span><b>AVAXUSDT</b> SHORT &middot; <span style="color:#E09040">42pt</span></span>
+          <span style="color:#888">▶</span>
+        </div>
+        <div style="background:#252528;color:#888;border:1px solid rgba(255,255,255,0.06);border-radius:6px;padding:5px 10px;font-size:11px;text-align:center;margin-top:2px">
+          📊 /queue_stats
+        </div>
+      </div>
+      <div style="margin-top:8px;font-size:11px;color:#666;line-height:1.55">
+        Jeder Slot-Button ist tappbar &mdash; callback_data <code>slot:SYMBOL</code>. Premium-Kandidaten erhalten ⭐, gesperrte Slots werden ausgegraut.
+      </div>
+    </div>
+
+    <!-- Rechts: Detail-Ansicht -->
+    <div>
+      <div style="font-size:11px;color:#666;text-transform:uppercase;letter-spacing:.04em;margin-bottom:6px">Message 2 &middot; Detail-Ansicht (nach Tap)</div>
+      <div style="background:#0d0d10;border-radius:10px;padding:12px 14px;font-family:'SF Mono','Fira Mono',monospace;font-size:11.5px;color:#e0e0e0;line-height:1.65">
+        <span style="color:#5DCAA5">🟢↗️ <b>ETHUSDT LONG &middot; 74pt ⭐</b></span><br>
+        ━━━━━━━━━━━━━━<br>
+        Kurs: <b>2850.00</b> &middot; SL: 2793.00<br><br>
+        <span style="color:#888">Score-Breakdown:</span><br>
+        &nbsp;&nbsp;SL-Abstand&nbsp;&nbsp;2.0% <span style="color:#5EC45E">+10</span><br>
+        &nbsp;&nbsp;Hebel&nbsp;12x&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span style="color:#5EC45E">+10</span><br>
+        &nbsp;&nbsp;Makro BTC+T2&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span style="color:#5EC45E">+20</span><br>
+        &nbsp;&nbsp;Premium (HARSI)&nbsp;&nbsp;&nbsp;<span style="color:#5EC45E">+15</span><br>
+        &nbsp;&nbsp;R:R 2.4&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span style="color:#5EC45E">+19</span><br>
+        <br>
+        💰 DCA1 2765.00 &middot; DCA2 2680.00<br>
+        🎯 TP1 2907 &middot; TP2 2964 &middot; TP3 3021<br>
+        📊 Kelly: 4.2% &middot; Half: 2.1%
+      </div>
+      <!-- Detail-Buttons -->
+      <div style="display:grid;grid-template-columns:1fr;gap:4px;margin-top:6px">
+        <div style="background:#0d2820;color:#4ECBA0;border:1px solid rgba(78,203,160,0.35);border-radius:6px;padding:6px 10px;font-size:11.5px;text-align:center;font-weight:600">🚀 Trade jetzt (Auto) <span style="color:#888;font-weight:400">&middot; v4.28</span></div>
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:4px">
+          <div style="background:#E09040;color:#0d0d10;border-radius:6px;padding:5px 8px;font-size:11px;text-align:center;font-weight:600">🟠 Bitget</div>
+          <div style="background:#2b5278;color:#fff;border-radius:6px;padding:5px 8px;font-size:11px;text-align:center">📈 BTC</div>
+          <div style="background:#2b5278;color:#fff;border-radius:6px;padding:5px 8px;font-size:11px;text-align:center">🔀 Total2</div>
+        </div>
+        <div style="background:#252528;color:#888;border:1px solid rgba(255,255,255,0.06);border-radius:6px;padding:5px 8px;font-size:11px;text-align:center">❌ Schliessen</div>
+      </div>
+      <div style="margin-top:8px;font-size:11px;color:#666;line-height:1.55">
+        Punkte-Spalte rechtsb&uuml;ndig, monospaced. Die &#x1F680; <b>Trade jetzt</b>-Reihe erscheint nur bei <code>AUTO_TRADE_ENABLED=1</code>.
+      </div>
+    </div>
+  </div>
+
+  <!-- Trade-jetzt Confirm-Flow -->
+  <div style="margin-top:14px;padding-top:12px;border-top:0.5px solid rgba(255,255,255,0.06)">
+    <div style="font-size:11px;color:#5EC45E;text-transform:uppercase;letter-spacing:.05em;font-weight:600;margin-bottom:8px">&#x1F680; One-Click-Execution &mdash; Two-Tap-Flow (v4.28)</div>
+    <div style="display:grid;grid-template-columns:1fr auto 1fr auto 1fr;gap:6px;align-items:center">
+      <div style="background:#0d2820;color:#4ECBA0;border-radius:8px;padding:8px 10px;font-size:11.5px;text-align:center;line-height:1.45">
+        <b>Tap 1</b><br>🚀 Trade jetzt
+      </div>
+      <div style="font-size:16px;color:#b0b0a8;text-align:center">→</div>
+      <div style="background:#2a1c08;color:#E09040;border-radius:8px;padding:8px 10px;font-size:11px;text-align:center;line-height:1.45">
+        <b>Confirm-Alert</b><br>TRADE AUSF&Uuml;HREN?<br>ETHUSDT LONG 12x<br>Nochmals tippen &middot; 10s
+      </div>
+      <div style="font-size:16px;color:#b0b0a8;text-align:center">→</div>
+      <div style="background:#162a16;color:#5EC45E;border-radius:8px;padding:8px 10px;font-size:11.5px;text-align:center;line-height:1.45">
+        <b>Tap 2 (innerhalb 10s)</b><br>&rarr; Leverage &middot; Market &middot; SL
+      </div>
+    </div>
+    <div class="hint" style="margin-top:10px">
+      <strong>&#x1F6E1; Fat-Finger-Schutz:</strong> Erster Tap &ouml;ffnet nur einen Bestaetigungs-Alert. Der eigentliche Trade feuert erst beim zweiten Tap innerhalb der TTL (<code>AUTO_TRADE_CONFIRM_TTL_SEC</code>, default 10s). Nach Ablauf: Reset zum ersten Tap &mdash; <strong>keine Versehen m&ouml;glich</strong>.
+    </div>
+    <div class="warn" style="margin-top:6px">
+      <strong>&#x26A0; Standard: AUS.</strong> Der 🚀-Button erscheint nur wenn <code>AUTO_TRADE_ENABLED=1</code> in Railway &rarr; Variables gesetzt ist. Optional auch <code>MAX_AUTO_TRADE_USDT</code> (Hard-Cap Initial-Margin pro Auto-Trade) und <code>AUTO_TRADE_CONFIRM_TTL_SEC</code> (Tap-Fenster).
+    </div>
+  </div>
+
+  <div class="info" style="margin-top:12px">
+    <strong>&#x1F4A1; Ablauf im Alltag:</strong> Feuert Alarm 2 / 2b (H2) oder Alarm 4c / Sling-SL (HARSI_EXIT), landet der Kandidat automatisch in der Rangliste. Du tippst den Slot, pr&uuml;fst Score-Breakdown + Bitget-Chart, und entscheidest manuell (Bitget-Button) oder per 🚀-Button (Auto). <strong>Kein Copy-Paste von <code>/trade</code> mehr n&ouml;tig.</strong>
+  </div>
+</div>
+
+<!-- TELEGRAM VORSCHAU - EINZELNACHRICHTEN (Auto-SL, SL-on-Entry, /trade, Close-Summary) -->
 <div class="card" id="sec-telegram-preview">
   <div class="card-head">
     <div class="step-badge" style="background:#0e1f33;color:#7BB8F5">&#x1F4F1;</div>
     <div>
-      <div class="h2">Telegram Nachricht &mdash; Vorschau <span class="upd-badge">v4.21</span></div>
-      <div class="sub">Neue 3-Button-Reihe: direkter Bitget-Sprung + Makro-Kontext (BTC H2, Total2)</div>
+      <div class="h2">Telegram Nachricht &mdash; Einzelformat <span class="upd-badge">v4.21</span></div>
+      <div class="sub">F&uuml;r Auto-SL-Meldungen, SL-auf-Entry, <code>/trade</code>-Berechnung &amp; Close-Summary &mdash; mit 3-Button-Reihe (Bitget + Makro)</div>
     </div>
   </div>
   <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
@@ -2061,27 +2246,29 @@ Beispiel:
     </div>
     <div class="step-row">
       <div class="step-n">1</div>
-      <div class="step-t"><strong>H2 Entry feuert</strong> (Alarm 2 / 2b) &rarr; Telegram: Setup-Details + harsi_warn &middot; <em><strong style="color:#F07070">sofort reagieren &mdash; max. 30 Min!</strong></em></div>
+      <div class="step-t"><strong>H2 Entry feuert</strong> (Alarm 2 / 2b) &rarr; Script schreibt Kandidaten in die <strong>Entry-Rangliste</strong> &middot; Telegram: gerankte Slot-Liste. <em><strong style="color:#F07070">max. 30 Min Reaktionszeit</strong></em></div>
     </div>
     <div class="step-row">
       <div class="step-n" style="background:#162a16;color:#5EC45E">2a</div>
-      <div class="step-t"><strong>harsi_warn: 0</strong> &rarr; BTC &amp; Total2 Impuls-Farbe manuell pr&uuml;fen &rarr; bei &Uuml;bereinstimmung: sofort zu Schritt 4</div>
+      <div class="step-t"><strong>harsi_warn: 0</strong> &rarr; Slot sofort tappbar in der Rangliste (Score + Badges sichtbar). Tap &rarr; Detail-Ansicht &rarr; BTC/Total2-Badges, Score-Breakdown, DCA, TPs, Kelly.</div>
     </div>
     <div class="step-row">
       <div class="step-n" style="background:#2a1c08;color:#E09040">2b</div>
-      <div class="step-t"><strong>harsi_warn: 1</strong> &rarr; H2-Chart dieses Coins &ouml;ffnen &rarr; <strong>Alarm 3 / 3b sofort erstellen + 30-Min-Timer starten</strong> &rarr; auf Feuern warten &middot; <strong style="color:#F07070">Alarm nach 30 Min l&ouml;schen wenn kein Exit</strong></div>
+      <div class="step-t"><strong>harsi_warn: 1</strong> &rarr; Script h&auml;lt den Kandidaten intern fest. <strong style="color:#5EC45E">Ab v4.22 kein manueller Alarm 3 mehr n&ouml;tig</strong> &mdash; HARSI_EXIT wird automatisch &uuml;ber Alarm 4c / Sling-SL eingespeist und schaltet den Slot frei. <strong style="color:#F07070">Alarm wird nach 30 Min verworfen wenn kein Exit.</strong></div>
     </div>
     <div class="step-row">
       <div class="step-n" style="background:#0e1f33;color:#7BB8F5">3</div>
-      <div class="step-t"><strong>HARSI-Exit-Alarm feuert</strong> (nur bei 2b, innerhalb 30 Min) &rarr; BTC &amp; Total2 Impuls-Farbe pr&uuml;fen &rarr; bei &Uuml;bereinstimmung: weiter zu Schritt 4</div>
+      <div class="step-t"><strong>HARSI_EXIT-Webhook</strong> (innerhalb 30 Min, via 4c / Sling-SL) &rarr; Slot wird gr&uuml;n &rarr; Detail-Ansicht zeigt alle Setup-Parameter.</div>
     </div>
     <div class="step-row">
       <div class="step-n">4</div>
-      <div class="step-t">Telegram: <code>/trade ETHUSDT LONG 10 2850 2700</code> &rarr; vollst&auml;ndige Setup-Vorschau (R:R, Hebel, DCA, TPs, Kelly)</div>
+      <div class="step-t"><strong>Detail-Ansicht pr&uuml;fen</strong> &rarr; R:R, Score-Breakdown, DCA, TPs, Kelly, Chart-Links. Zwei Wege zum Entry:<br>
+      &nbsp;&nbsp;<strong>A</strong> Manuell: 🟠 Bitget-Button &rarr; Market Order + SL selber setzen.<br>
+      &nbsp;&nbsp;<strong>B</strong> Auto: <strong style="color:#5EC45E">&#x1F680; Trade jetzt</strong>-Button (nur bei <code>AUTO_TRADE_ENABLED=1</code>) &rarr; Two-Tap-Confirm &rarr; Script setzt Leverage, &ouml;ffnet Position, legt SL.</div>
     </div>
     <div class="step-row">
       <div class="step-n">5</div>
-      <div class="step-t"><strong>Market Order + SL</strong> auf Bitget setzen &rarr; Railway erkennt Trade automatisch</div>
+      <div class="step-t">Railway erkennt die neue Position &mdash; unabh&auml;ngig davon ob manuell oder per 🚀-Button er&ouml;ffnet.</div>
     </div>
     <div class="step-row">
       <div class="step-n">6</div>
@@ -2100,8 +2287,9 @@ Beispiel:
       <div class="step-t">TP3 ausgel&ouml;st &rarr; <strong>Trailing SL auf TP2-Preis</strong> (TP2-Gewinn gesichert) &nbsp;<a href="#sec-trailing" style="font-size:11px;padding:1px 6px;border-radius:4px;background:#0d2820;color:#4ECBA0;text-decoration:none">&#x2192; Trailing SL</a></div>
     </div>
   </div>
-  <div class="info" style="margin-top:12px"><strong>Automatisiert durch Railway:</strong> DCA-Orders &middot; TP1&ndash;TP4 (15/20/25/40%) &middot; SL auf Entry nach TP1 &middot; TP-Anpassung nach Nachkauf &middot; Auto-SL (&minus;25%) bei fehlendem Stop Loss &middot; Trailing SL: TP2&rarr;SL@TP1-Preis, TP3&rarr;SL@TP2-Preis &middot; Daily P&amp;L Report um 23:59 &middot; HARSI SL-Anpassung via Alarm 4/4b &middot; <strong>Abweichungswarnungen (Hebel / Kelly / R:R)</strong> &middot; Telegram bei jedem Schritt.</div>
+  <div class="info" style="margin-top:12px"><strong>Automatisiert durch Railway:</strong> Entry-Rangliste-Scoring (v4.22) &middot; DCA-Orders &middot; TP1&ndash;TP4 (15/20/25/40%) &middot; SL auf Entry nach TP1 &middot; TP-Anpassung nach Nachkauf &middot; Auto-SL (&minus;25%) bei fehlendem Stop Loss &middot; Trailing SL: TP2&rarr;SL@TP1-Preis, TP3&rarr;SL@TP2-Preis &middot; Daily P&amp;L Report um 23:59 &middot; HARSI SL-Anpassung via Alarm 4c / Sling-SL &middot; <strong>Abweichungswarnungen (Hebel / Kelly / R:R)</strong> &middot; Telegram bei jedem Schritt.</div>
   <div class="hint" style="margin-top:8px"><strong>H4-Alarme (1/1b) optional:</strong> k&ouml;nnen als fr&uuml;he Vorlaufbenachrichtigung aktiv bleiben, sind aber f&uuml;r den Ablauf nicht mehr zwingend n&ouml;tig.</div>
+  <div class="success" style="margin-top:8px"><strong>&#x1F4A1; Manueller Alarm 3 / 3b obsolet:</strong> Ab v4.22 wird HARSI_EXIT automatisch &uuml;ber die universellen Alarme 4c (HARSI-SL) und Sling-SL in die Entry-Queue eingespeist. Die alten Alarme 3 / 3b sind weiter dokumentiert f&uuml;r historischen Kontext, aber <strong>nicht mehr aktiv zu erstellen</strong>.</div>
 </div>
 
 </div>
