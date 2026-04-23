@@ -1,5 +1,5 @@
 """
-DOMINUS Trade-Automatisierung v4.33
+DOMINUS Trade-Automatisierung v4.34
 ══════════════════════════════════════════════════════════════
 Vollautomatisches Setup nach DOMINUS-Strategie (Handbuch März 2026)
 Finanzmathematische Optimierungen:
@@ -14,6 +14,34 @@ Finanzmathematische Optimierungen:
   ⑨ Queue-Tracking    — entry_queue_log.csv + R-Multiple-Outcome (v4.20)
   ⑩ Klick-UX          — Button-Driven Rangliste mit adaptivem Keyboard (v4.25)
   ⑪ One-Click-Exec    — 🚀 Trade jetzt Button mit Two-Tap-Confirm (v4.28)
+
+Changelog v4.34 — trades.csv via Telegram transferieren:
+  T1: Neuer Befehl /trades sendet die aktuelle trades.csv als Telegram-
+      Dokument (via sendDocument + multipart-Upload). Caption enthält
+      Zeilen-Anzahl (Header + Datenzeilen), Dateigrösse und Mtime, damit
+      man vor dem Editieren lokal weiss, was man gerade runterlädt.
+      Nutzen: Railway hat keinen File-Browser für Volumes — bisher war
+      der einzige Weg `railway run cat /app/data/trades.csv`. Jetzt
+      reicht ein Tap im Telegram-Chat.
+  T2: Neuer Befehl /restore_trades zeigt Anleitung, wie man eine
+      bereinigte CSV zurück aufs Volume bringt: Datei an den Bot
+      anhängen und als Bildunterschrift /restore_trades setzen.
+      poll_telegram_commands() prüft bei jedem Document-Message jetzt
+      die Caption — nur mit exaktem /restore_trades-Caption wird der
+      Upload verarbeitet (sonst Silent-Ignore, damit normale Media-
+      Posts nicht aus Versehen die CSV überschreiben).
+  T3: handle_trades_restore() validiert die hochgeladene Datei:
+      → Filename muss auf .csv enden (getFile via Bot-API,
+        Download-URL = api.telegram.org/file/bot<token>/<file_path>).
+      → Erste Zeile muss den Semikolon-getrennten _CSV_HEADER enthalten
+        (Datum;Zeit (UTC);Symbol;…;Jahr) — sonst Abbruch.
+      → Vor dem Überschreiben wird die bestehende TRADES_CSV nach
+        TRADES_CSV.backup_YYYYMMDD-HHMMSS.csv gesichert.
+      → Danach wird atomar via os.replace() auf TRADES_CSV geschrieben.
+      Bestätigungs-Telegram enthält: alte vs. neue Zeilenzahl,
+      Backup-Pfad und Hinweis auf /report für Plausibilitäts-Check.
+  T4: /hilfe-Block um den Abschnitt "Archiv-Transfer" ergänzt.
+      /health + Startup-Banner auf v4.34.
 
 Changelog v4.33 — Daily-Report Break-even-Klassifikation:
   R1: build_daily_report() klassifiziert Trades jetzt rein P&L-basiert.
@@ -605,6 +633,7 @@ import html
 import threading
 import requests
 import math
+import shutil
 from datetime import datetime, timedelta, timezone
 try:
     from flask import Flask, request as flask_request, jsonify
@@ -1253,6 +1282,37 @@ def telegram_answer_callback(
         )
     except Exception:
         pass
+
+
+def telegram_document(file_path: str, caption: str = "",
+                      filename: str = None) -> bool:
+    """v4.34 — Schickt eine Datei per sendDocument an TELEGRAM_CHAT_ID.
+    Wird für /trades (trades.csv → Chat) verwendet. Rückgabe True bei
+    Erfolg, False sonst (inkl. "Datei nicht vorhanden")."""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return False
+    if not os.path.isfile(file_path):
+        return False
+    fname = filename or os.path.basename(file_path)
+    try:
+        with open(file_path, "rb") as fh:
+            r = requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument",
+                data={
+                    "chat_id":    TELEGRAM_CHAT_ID,
+                    "caption":    caption or "",
+                    "parse_mode": "HTML",
+                },
+                files={"document": (fname, fh, "text/csv")},
+                timeout=30,
+            )
+        try:
+            return bool(r.json().get("ok"))
+        except Exception:
+            return False
+    except Exception as ex:
+        log(f"[telegram_document] Upload fehlgeschlagen: {ex}")
+        return False
 
 
 def sign(timestamp: str, method: str, path: str, body: str = "") -> str:
@@ -6027,6 +6087,11 @@ def cmd_hilfe():
         "/dedup_trades [apply] — Duplikate im Trade-Archiv suchen\n"
         "   ohne Argument: Dry-Run | mit <code>apply</code>: bereinigen\n"
         "\n"
+        "📦 <b>Archiv-Transfer (v4.34):</b>\n"
+        "/trades — trades.csv als Telegram-Dokument herunterladen\n"
+        "/restore_trades — Anleitung: bereinigte CSV wieder hochladen\n"
+        "   (Datei anhängen + Caption <code>/restore_trades</code>)\n"
+        "\n"
         "🔔 <b>Alarm-Vorlagen (Copy-Paste für TradingView):</b>\n"
         "/alarm — Übersicht + aktive HARSI-Fenster\n"
         "/alarm SYMBOL LONG|SHORT — Kurzform → Alarm 3/3b (HARSI Exit)\n"
@@ -6599,6 +6664,186 @@ def cmd_report():
         reply(f"❌ Report Fehler: {e}")
 
 
+def cmd_trades():
+    """v4.34 — /trades: schickt die aktuelle trades.csv als Telegram-Dokument
+    zurück. Caption enthält Zeilenzahl, Dateigrösse und Mtime, damit man
+    vor dem Edit lokal weiss, welche Version man in den Händen hält."""
+    if not TRADES_CSV:
+        reply("❌ TRADES_CSV ist nicht konfiguriert.")
+        return
+    if not os.path.isfile(TRADES_CSV):
+        reply(f"❌ trades.csv nicht gefunden: <code>{TRADES_CSV}</code>")
+        return
+    try:
+        size_bytes = os.path.getsize(TRADES_CSV)
+        mtime_str  = datetime.fromtimestamp(os.path.getmtime(TRADES_CSV)) \
+                        .strftime("%Y-%m-%d %H:%M:%S")
+        # Zeilen zählen (ohne ganze Datei in den RAM zu laden)
+        line_count = 0
+        with open(TRADES_CSV, "r", encoding="utf-8") as fh:
+            for _ in fh:
+                line_count += 1
+        data_rows = max(0, line_count - 1)  # erste Zeile = Header
+
+        # Human-readable Grösse
+        if size_bytes < 1024:
+            size_str = f"{size_bytes} B"
+        elif size_bytes < 1024 * 1024:
+            size_str = f"{size_bytes / 1024:.1f} KB"
+        else:
+            size_str = f"{size_bytes / (1024 * 1024):.2f} MB"
+
+        fname   = f"trades_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        caption = (
+            "📦 <b>Trade-Archiv</b>\n"
+            f"━━━━━━━━━━━━\n"
+            f"Datei:   <code>{os.path.basename(TRADES_CSV)}</code>\n"
+            f"Trades:  <b>{data_rows}</b> Zeile(n) + Header\n"
+            f"Grösse:  {size_str}\n"
+            f"Mtime:   {mtime_str} (lokal)\n"
+            "\n"
+            "Zurückspielen: Datei anhängen, Bildunterschrift "
+            "<code>/restore_trades</code>."
+        )
+        ok = telegram_document(TRADES_CSV, caption=caption, filename=fname)
+        if not ok:
+            reply("❌ sendDocument fehlgeschlagen — siehe Railway-Logs.")
+    except Exception as e:
+        reply(f"❌ /trades Fehler: {e}")
+
+
+def handle_trades_restore(document: dict) -> None:
+    """v4.34 — /restore_trades: nimmt die an die Nachricht angehängte CSV,
+    validiert Header + Endung, legt Backup an und ersetzt TRADES_CSV atomar.
+    Aufrufer garantiert, dass `document` gesetzt ist UND die Caption
+    genau /restore_trades (case-insensitive, erstes Token) lautet."""
+    if not TRADES_CSV:
+        reply("❌ TRADES_CSV ist nicht konfiguriert — Restore abgebrochen.")
+        return
+
+    file_id  = document.get("file_id") or ""
+    fname_in = (document.get("file_name") or "").strip()
+    mime     = (document.get("mime_type") or "").lower()
+    size_in  = int(document.get("file_size") or 0)
+
+    if not file_id:
+        reply("❌ Kein file_id in der Nachricht — Telegram-API-Fehler?")
+        return
+    # Endung prüfen — Telegram gibt mime_type z.T. 'text/csv' oder 'application/vnd.ms-excel'.
+    # Wir verlassen uns primär auf den Dateinamen, weil der verlässlich ist.
+    if not fname_in.lower().endswith(".csv"):
+        reply(f"❌ Datei muss auf <code>.csv</code> enden — erhalten: "
+              f"<code>{fname_in or '(ohne Name)'}</code> ({mime or 'kein MIME'})")
+        return
+    # Telegram-Bot-getFile hat 20 MB Download-Limit. Wir warnen defensiv ab 18 MB.
+    if size_in > 18 * 1024 * 1024:
+        reply(f"❌ Datei zu gross für Bot-Download ({size_in/1024/1024:.1f} MB, "
+              "Limit ≈ 20 MB). Nutze `railway run` für grosse CSVs.")
+        return
+
+    # 1) getFile → file_path holen
+    try:
+        r = requests.get(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getFile",
+            params={"file_id": file_id}, timeout=10,
+        )
+        data = r.json()
+        if not data.get("ok"):
+            reply(f"❌ getFile fehlgeschlagen: "
+                  f"{data.get('description') or 'unbekannt'}")
+            return
+        tg_file_path = data["result"]["file_path"]
+    except Exception as ex:
+        reply(f"❌ getFile-Call fehlgeschlagen: {ex}")
+        return
+
+    # 2) Datei herunterladen
+    try:
+        r = requests.get(
+            f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{tg_file_path}",
+            timeout=30,
+        )
+        if r.status_code != 200:
+            reply(f"❌ Download HTTP {r.status_code}")
+            return
+        content_bytes = r.content
+    except Exception as ex:
+        reply(f"❌ Download fehlgeschlagen: {ex}")
+        return
+
+    # 3) Header-Validierung (erste Zeile muss _CSV_HEADER mit ';' matchen)
+    try:
+        first_line = content_bytes.split(b"\n", 1)[0].decode("utf-8", errors="replace")
+    except Exception as ex:
+        reply(f"❌ UTF-8-Decode fehlgeschlagen: {ex}")
+        return
+    first_line = first_line.strip().lstrip("\ufeff")  # BOM toleranter
+    expected_header = ";".join(_CSV_HEADER)
+    if first_line != expected_header:
+        reply(
+            "❌ <b>Header-Mismatch — Restore abgebrochen</b>\n"
+            f"Erwartet: <code>{expected_header}</code>\n"
+            f"Bekommen: <code>{first_line[:200]}</code>"
+        )
+        return
+
+    # Zeilen der neuen CSV
+    new_line_count = content_bytes.count(b"\n")
+    if content_bytes and not content_bytes.endswith(b"\n"):
+        new_line_count += 1
+    new_data_rows = max(0, new_line_count - 1)
+
+    # 4) Backup der existierenden Datei
+    backup_path = None
+    old_data_rows = 0
+    if os.path.isfile(TRADES_CSV):
+        try:
+            with open(TRADES_CSV, "r", encoding="utf-8") as fh:
+                old_data_rows = max(0, sum(1 for _ in fh) - 1)
+        except Exception:
+            pass
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        backup_path = f"{TRADES_CSV}.backup_{ts}.csv"
+        try:
+            shutil.copy2(TRADES_CSV, backup_path)
+        except Exception as ex:
+            reply(f"❌ Backup fehlgeschlagen ({ex}) — Restore abgebrochen.")
+            return
+
+    # 5) Atomar schreiben (tmp + os.replace)
+    tmp_path = f"{TRADES_CSV}.tmp_restore"
+    try:
+        with open(tmp_path, "wb") as fh:
+            fh.write(content_bytes)
+        os.replace(tmp_path, TRADES_CSV)
+    except Exception as ex:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+        reply(f"❌ Schreiben fehlgeschlagen: {ex}")
+        return
+
+    # 6) Bestätigung
+    delta = new_data_rows - old_data_rows
+    delta_str = (f"+{delta}" if delta > 0 else str(delta)) if delta != 0 else "±0"
+    msg_lines = [
+        "✅ <b>trades.csv restored</b>",
+        "━━━━━━━━━━━━",
+        f"Alte Version:   <b>{old_data_rows}</b> Zeilen",
+        f"Neue Version:   <b>{new_data_rows}</b> Zeilen ({delta_str})",
+        f"Quelle:         <code>{fname_in}</code>",
+    ]
+    if backup_path:
+        msg_lines.append(f"Backup:         <code>{backup_path}</code>")
+    msg_lines += [
+        "",
+        "📋 Jetzt /report prüfen — Win-Rate und PnL müssen passen.",
+    ]
+    telegram("\n".join(msg_lines))
+
+
 def poll_telegram_commands():
     """
     Prüft auf neue Telegram-Nachrichten und führt Befehle aus.
@@ -6627,6 +6872,25 @@ def poll_telegram_commands():
         if chat_id != str(TELEGRAM_CHAT_ID):
             continue
 
+        # v4.34 — Document-Upload: nur mit Caption /restore_trades verarbeiten.
+        # So kippt ein versehentlich an den Bot gesendetes PDF/Bild NICHT
+        # die trades.csv um. Das erste Token der Caption muss exakt
+        # /restore_trades (case-insensitive) sein.
+        document = msg.get("document")
+        caption  = (msg.get("caption") or "").strip()
+        if document:
+            cap_first = caption.split()[0].lower() if caption else ""
+            if cap_first in ("/restore_trades", "/restoretrades"):
+                log(f"Telegram Restore-Upload empfangen: "
+                    f"{document.get('file_name')} ({document.get('file_size')} bytes)")
+                try:
+                    handle_trades_restore(document)
+                except Exception as ex:
+                    log(f"[handle_trades_restore] Fehler: {ex}")
+                    reply(f"❌ Restore fehlgeschlagen: {ex}")
+                continue
+            # anderer Document-Upload → ignorieren (kein Match)
+
         text = msg.get("text", "").strip()
         if not text.startswith("/"):
             continue
@@ -6648,6 +6912,19 @@ def poll_telegram_commands():
             cmd_refresh(parts)
         elif cmd == "/report":
             cmd_report()
+        elif cmd == "/trades":
+            cmd_trades()
+        elif cmd == "/restore_trades" or cmd == "/restoretrades":
+            # ohne angehängte Datei — nur Anleitung zeigen
+            reply(
+                "♻️ <b>trades.csv zurückspielen</b>\n"
+                "━━━━━━━━━━━━\n"
+                "1. Bereinigte <code>trades.csv</code> hier an den Bot anhängen\n"
+                "2. Als Bildunterschrift genau <code>/restore_trades</code>\n"
+                "3. Bot validiert Header, legt Backup an und ersetzt die Datei\n"
+                "\n"
+                "Ohne Caption → Upload wird ignoriert (Unfallschutz)."
+            )
         elif cmd == "/alarm":
             cmd_alarm(parts)
         elif cmd == "/queue_stats" or cmd == "/queuestats":
@@ -7501,7 +7778,7 @@ def start_webhook_server():
     @app.route("/", methods=["GET"])
     @app.route("/health", methods=["GET"])
     def health():
-        return jsonify({"status": "running", "version": "v4.33"}), 200
+        return jsonify({"status": "running", "version": "v4.34"}), 200
 
     port = _env_int("PORT", 8080)
     # WICHTIG: Token NICHT ins Log schreiben — er landet sonst in Railway-Logs.
@@ -8415,7 +8692,7 @@ def main():
         log("In Railway → Variables eintragen.")
         return
 
-    log("DOMINUS Trade-Automatisierung v4.33 gestartet — mit finanzmathematischen Optimierungen")
+    log("DOMINUS Trade-Automatisierung v4.34 gestartet — mit finanzmathematischen Optimierungen")
     log(f"Intervall: {POLL_INTERVAL}s")
     log("Warte auf neue Trades...")
     log("─" * 55)
