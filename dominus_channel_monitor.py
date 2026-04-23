@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-DOMINUS Channel Monitor  v1.5  (2026-04-22)
+DOMINUS Channel Monitor  v1.6  (2026-04-23)
 ════════════════════════════════════════════════════════════════
 Überwacht den Dominus Telegram-Kanal auf neue Coins UND optional
 parallel eine öffentliche TradingView-Watchlist.
@@ -10,6 +10,18 @@ als importierbare .txt-Datei + eine interaktive HTML-Clicklist
 (Delta-Modus: nur Coins, die seit dem letzten master_watchlist.txt
 dazugekommen sind — ein Button je Coin, kopiert BITGET:XYZUSDT.P
 in die Zwischenablage) per Telegram.
+
+Changelog v1.6:
+  • BUG-FIX: Coins aus dem Kanal mit Quote-Suffix (z.B. "AAVEUSDT",
+    "ETHUSDT", "CRVUSDT") wurden als "Nicht auf Bitget/Bybit"
+    gemeldet, obwohl sie verfügbar sind. Ursache: extract_coins()
+    hat den Roh-Ticker weitergereicht, resolve_tv_symbol() hat aber
+    gegen Basiswährungen (AAVE/ETH/CRV) gematcht. Neu: _normalize_ticker()
+    strippt .P, PERP und USDT/USDC/BUSD/USD-Suffix früh in
+    extract_coins() UND defensiv noch mal in resolve_tv_symbol().
+    Empfohlen: einmal mit MONITOR_REBUILD=1 redeployen, damit alte
+    "AAVEUSDT"-Einträge aus state["known_coins"]/["skipped"] raus
+    sind.
 
 Changelog v1.5:
   • ÄNDERUNG: Clicklist zeigt nur noch die DELTA — Coins, die
@@ -137,13 +149,38 @@ def looks_like_coin(word: str) -> bool:
     return bool(COIN_RE.match(word)) and word not in EXCLUDE
 
 
+def _normalize_ticker(raw: str) -> str:
+    """
+    Reduziert Roh-Ticker aus dem Kanal auf die Basiswährung.
+    Beispiele:
+      'AAVEUSDT' → 'AAVE'   'ETH.P'  → 'ETH'
+      'BTCUSDC'  → 'BTC'    'SOLPERP'→ 'SOL'
+      'AAVE'     → 'AAVE'   (schon normalisiert, unverändert)
+    _bitget_syms/_bybit_syms halten Basiswährungen — daher muss die
+    Lookup-Seite immer normalisiert sein, damit 'AAVEUSDT' gegen
+    'AAVE' matcht.
+    """
+    t = raw.upper().strip()
+    if t.endswith(".P"):
+        t = t[:-2]
+    if t.endswith("PERP"):
+        t = t[:-4]
+    for quote in ("USDT", "USDC", "BUSD", "USD"):
+        if t.endswith(quote) and len(t) > len(quote):
+            t = t[: -len(quote)]
+            break
+    return t
+
+
 def extract_coins(text: str) -> list[str]:
-    """Gibt Coin-Liste zurück wenn ≥3 reine Grossbuchstaben-Zeilen gefunden."""
+    """Gibt Coin-Liste zurück wenn ≥3 reine Grossbuchstaben-Zeilen gefunden.
+    Ticker werden direkt hier auf die Basiswährung normalisiert, damit
+    'AAVEUSDT' und 'AAVE' im State dieselbe Entity sind."""
     coins = []
     for line in text.splitlines():
         word = line.strip()
         if looks_like_coin(word):
-            coins.append(word)
+            coins.append(_normalize_ticker(word))
     return list(dict.fromkeys(coins)) if len(coins) >= 3 else []  # dedup, Reihenfolge erhalten
 
 
@@ -271,12 +308,15 @@ def resolve_tv_symbol(coin: str) -> tuple[str, str] | tuple[None, None]:
     """
     Gibt (TradingView-Symbol, Exchange) zurück.
     Priorität: Bitget → Bybit → None
+    Defensiv: nochmals normalisieren, falls ein Call-Site die
+    Normalisierung vergisst (z.B. bei zukünftigen Erweiterungen).
     """
     _ensure_symbols_fresh()
-    if coin in _bitget_syms:
-        return f"BITGET:{coin}USDT.P", "Bitget"
-    if coin in _bybit_syms:
-        return f"BYBIT:{coin}USDT.P", "Bybit"
+    base = _normalize_ticker(coin)
+    if base in _bitget_syms:
+        return f"BITGET:{base}USDT.P", "Bitget"
+    if base in _bybit_syms:
+        return f"BYBIT:{base}USDT.P", "Bybit"
     return None, None
 
 
@@ -732,7 +772,7 @@ async def bootstrap_state(client, channel, state: dict) -> dict:
 
 # ── Hauptprogramm ────────────────────────────────────────────────
 async def main() -> None:
-    log.info("════ Dominus Channel Monitor v1.5 ════")
+    log.info("════ Dominus Channel Monitor v1.6 ════")
     log.info(f"STATE_FILE = {STATE_FILE}")
     log.info(f"SEED_FILE  = {SEED_FILE} (exists={os.path.exists(SEED_FILE)})")
     log.info(f"CHANNEL_HISTORY_LIMIT = {CHANNEL_HISTORY_LIMIT}")
