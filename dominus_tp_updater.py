@@ -1,5 +1,5 @@
 """
-DOMINUS Trade-Automatisierung v4.30
+DOMINUS Trade-Automatisierung v4.31
 ══════════════════════════════════════════════════════════════
 Vollautomatisches Setup nach DOMINUS-Strategie (Handbuch März 2026)
 Finanzmathematische Optimierungen:
@@ -14,6 +14,38 @@ Finanzmathematische Optimierungen:
   ⑨ Queue-Tracking    — entry_queue_log.csv + R-Multiple-Outcome (v4.20)
   ⑩ Klick-UX          — Button-Driven Rangliste mit adaptivem Keyboard (v4.25)
   ⑪ One-Click-Exec    — 🚀 Trade jetzt Button mit Two-Tap-Confirm (v4.28)
+
+Changelog v4.31 — Observability & SL-Status-Wahrheit:
+  O1: Neuer Helper infer_trailing_level(symbol, direction, entry, leverage)
+      liest den IST-SL auf Bitget (via get_sl_price) und leitet daraus den
+      Trailing-Level (0=unter Entry · 1=Entry · 2=TP1 · 3=TP2) ab. Wird in
+      /status, /berechnen und build_daily_report anstelle des blinden
+      Dict-Lookups trailing_sl_level[sym] aufgerufen. Heilt den State-Dict
+      nach oben, wenn die Wahrheit höher liegt (save_state). Rückstufungen
+      bleiben dem regulären Flow vorbehalten — stale SL-Read → Dict-Fallback.
+      Grund: Nach Railway-Redeploy oder manuellem SL-Move auf Bitget hatte
+      das Dict den realen Fortschritt verpasst — /status zeigte z.B.
+      "SL=Entry" obwohl der SL längst auf TP1 stand.
+  O2: Werkzeug-Access-Log runtergedreht: werkzeug-Logger.setLevel(WARNING).
+      Grund: 80 von 83 "error"-Zeilen im 6h-Railway-Log waren reine
+      "POST /webhook 200"-Access-Log-Einträge, die Werkzeug auf stderr
+      schreibt und die in Railway als error-Severity landen. Damit waren
+      echte Fehler im Rauschen nicht sichtbar. Token-Redact-Filter bleibt
+      defensiv drauf, falls Werkzeug mal auf WARNING-Level eine URL loggt.
+  O3: Drop-Logging im Webhook-Dispatcher. Fünf Pfade, die vorher silent
+      returnten, schreiben jetzt eine "⏭"-markierte Log-Zeile (Forensik
+      ermöglicht ohne Telegram-Noise):
+        · HARSI_SL/SLING_SL ohne offene Position (Auto-Direction leer)
+        · HARSI_SL ohne Preis
+        · HARSI_SL ohne offene Position
+        · SLING_SL ohne Pivot
+        · SLING_SL ohne matching Position
+      Grund: 6h-Log-Analyse zeigte 191 Alerts aus 73 Symbolen, aber 0
+      "ignoriert"-Einträge → jede "Warum hat Symbol X nicht getriggert?"-
+      Frage endete bisher in Rätselraten.
+  O4: /health-Endpoint liefert jetzt die korrekte Version v4.31 (war seit
+      v4.25 hardkodiert stehen geblieben).
+  O5: Startup-Banner auf v4.31 gebumpt.
 
 Changelog v4.30 — Kosmetik: BTC/Total2 DOM-DIR-Meldung nur bei echtem Wechsel:
   K1: BTC_DIR/T2_DIR-Webhook-Handler sendet Telegram-Message + save_state()
@@ -3605,7 +3637,9 @@ def cmd_berechnen():
             drct = pos.get("holdSide", "?").upper()
             pnl  = float(pos.get("unrealizedPL", 0))
 
-            trl  = trailing_sl_level.get(sym, 0)
+            # v4.31: Trailing-Level aus IST-SL auf Bitget ableiten (heilt
+            # State nach Redeploy oder manuellem SL-Move auf Bitget).
+            trl  = infer_trailing_level(sym, drct.lower(), avg, lev)
             sec  = sl_at_entry.get(sym, False) or trl >= 1
 
             if trl >= 3:
@@ -5858,6 +5892,85 @@ def cmd_hilfe():
     )
 
 
+def infer_trailing_level(symbol: str, direction: str,
+                         entry: float, leverage: int) -> int:
+    """
+    v4.31 — Leitet den Trailing-SL-Level aus dem IST-SL auf Bitget ab und
+    heilt den State-Dict `trailing_sl_level[symbol]` falls er hinterherhinkt.
+
+    Hintergrund: Nach einem Railway-Redeploy, nach manuellem SL-Move auf
+    Bitget oder bei einem TP-Cascade-Miss (z.B. das Script war kurz offline)
+    kann `trailing_sl_level[symbol]` den tatsächlichen SL-Stand unter-
+    schätzen. `/status` und `/berechnen` bauten ihre Anzeige auf dem Dict
+    auf — Resultat: "SL=Entry", obwohl der reale SL bereits auf TP1 stand.
+
+    Rückgabe-Levels:
+      0 = SL unter Entry (ungesichert)     — noch kein TP gehittet
+      1 = SL @ Entry (Break-even)          — TP1 erreicht
+      2 = SL @ TP1   (Gewinn gesichert)    — TP2 erreicht
+      3 = SL @ TP2   (fett gesichert)      — TP3 erreicht
+
+    Heilung erfolgt nur **nach oben**: ein kurzzeitig fehlender SL (z.B.
+    während einer Neusetzung) darf nicht zu Rückstufung führen.
+
+    Fallback: Ist der SL nicht lesbar (Bitget-API-Fehler, keine Order),
+    wird der bisherige State-Dict-Wert zurückgegeben — Status-Anzeige
+    bleibt dann "stale aber bekannt", nicht "falsch konservativ".
+    """
+    stored = trailing_sl_level.get(symbol, 0)
+    if entry <= 0 or leverage <= 0 or direction not in ("long", "short"):
+        return stored
+    try:
+        sl = get_sl_price(symbol, direction)
+    except Exception as _e:
+        log(f"  ⚠ infer_trailing_level({symbol}): get_sl_price fehlgeschlagen: {_e}")
+        return stored
+    if sl <= 0:
+        # Kein lesbarer SL → Dict-Wert behalten (nicht auf 0 zurückfallen).
+        return stored
+
+    tp1 = calc_tp_price(entry, TP1_ROI, direction, leverage)
+    tp2 = calc_tp_price(entry, TP2_ROI, direction, leverage)
+
+    # Toleranz: Bitget rundet TP-Preise auf Tick-Decimals und der SL wird
+    # oft in round_price() getrimmt → 0.25% Toleranz deckt das ab.
+    TOL_ENTRY = 0.0015
+    TOL_TP    = 0.0025
+
+    if direction == "long":
+        # Je höher der SL, desto weiter getrailt.
+        if sl >= tp2 * (1 - TOL_TP):
+            level = 3
+        elif sl >= tp1 * (1 - TOL_TP):
+            level = 2
+        elif sl >= entry * (1 - TOL_ENTRY):
+            level = 1
+        else:
+            level = 0
+    else:  # short
+        if sl <= tp2 * (1 + TOL_TP):
+            level = 3
+        elif sl <= tp1 * (1 + TOL_TP):
+            level = 2
+        elif sl <= entry * (1 + TOL_ENTRY):
+            level = 1
+        else:
+            level = 0
+
+    if level > stored:
+        trailing_sl_level[symbol] = level
+        if level >= 1:
+            sl_at_entry[symbol] = True
+        try:
+            save_state()
+        except Exception:
+            pass
+        log(f"  🔧 SL-Level geheilt: {symbol} → Level {level} "
+            f"(SL={sl} · Entry={entry:.6g} · TP1={tp1:.6g} · TP2={tp2:.6g})")
+        return level
+    return stored
+
+
 def cmd_status():
     """Kurzer Positionsstatus + v4.10 DOMINUS Premium-Zonen."""
     # v4.10: Makro-Premium-Zonen vorab auflisten (auch ohne offene Positionen relevant)
@@ -5884,8 +5997,11 @@ def cmd_status():
         lev      = int(float(pos.get("leverage", 10)))
         pnl      = float(pos.get("unrealizedPL", 0))
         mark     = get_mark_price(sym)
-        secured  = sl_at_entry.get(sym, False)
-        trl_lvl  = trailing_sl_level.get(sym, 0)
+        # v4.31: Trailing-Level aus IST-SL auf Bitget ableiten (heilt State
+        # nach Railway-Redeploy oder manuellem SL-Move direkt auf Bitget).
+        _entry_avg = float(pos.get("openPriceAvg", 0) or 0)
+        trl_lvl  = infer_trailing_level(sym, drct.lower(), _entry_avg, lev)
+        secured  = sl_at_entry.get(sym, False) or trl_lvl >= 1
         trl_tag  = {0: "", 1: " · SL=Entry", 2: " · Trail→TP1", 3: " · Trail→TP2"}.get(trl_lvl, "")
         icon     = "🔒" if secured else "📈"
         base     = get_base_coin(sym)
@@ -6072,7 +6188,9 @@ def build_daily_report(date_str: str = None) -> str:
             drct = pos.get("holdSide", "?").upper()
             lev  = int(float(pos.get("leverage", 10)))
             pnl  = float(pos.get("unrealizedPL", 0))
-            trl  = trailing_sl_level.get(sym, 0)
+            # v4.31: IST-SL live abfragen statt Dict blind zu glauben
+            _avg = float(pos.get("openPriceAvg", 0) or 0)
+            trl  = infer_trailing_level(sym, drct.lower(), _avg, lev)
             trl_tag = {0: "", 1: " SL=Entry", 2: " Trail→TP1", 3: " Trail→TP2"}.get(trl, "")
             lines.append(f"  • {sym} {drct} {lev}x | PnL={pnl:+.2f}{trl_tag}")
     else:
@@ -6477,6 +6595,12 @@ def start_webhook_server():
 
     _wz_logger = _logging.getLogger("werkzeug")
     _wz_logger.addFilter(_TokenRedactFilter())
+    # v4.31: Access-Log-Spam entfernen. Flask/Werkzeug schreibt jede "POST
+    # /webhook 200"-Zeile auf stderr — die landet in Railway im error-Bucket
+    # und maskiert echte Fehler (bei 6h-Log-Analyse: 80 von 83 "error"-
+    # Einträgen waren reine 200-OK-Access-Logs). WARNING schluckt Access-
+    # Log-INFO-Zeilen, liefert aber Fehler/Exceptions weiter.
+    _wz_logger.setLevel(_logging.WARNING)
 
     app = Flask(__name__)
 
@@ -6631,6 +6755,10 @@ def start_webhook_server():
                         break
             if direction not in ("long", "short"):
                 # Kein offener Trade → silent ignore, Watchlist-Rauschen unterdrücken
+                # v4.31: aus "silent" → "dezent loggen" (Forensik ermöglichen,
+                # trotzdem ohne Telegram-Noise). "⏭" ist der Drop-Marker, nach
+                # dem sich im Railway-Log suchen lässt.
+                log(f"  ⏭ {signal_type} ignoriert: keine offene Position für {symbol}")
                 return  # ignored: no open position
 
         if not symbol or direction not in ("long", "short"):
@@ -6803,6 +6931,8 @@ def start_webhook_server():
             #                            HARSI_SL   = SL-Anpassung bei offenem Trade (Alarm 4/4b)
             harsi_price = float(data.get("price", 0) or data.get("sl", 0) or 0)
             if harsi_price == 0:
+                # v4.31: Drop-Marker im Log für Forensik
+                log(f"  ⏭ HARSI_SL ignoriert: kein Preis im Payload ({symbol} {direction.upper()})")
                 return  # ignored: no price
             cur_size = 0
             for pos in get_all_positions():
@@ -6810,6 +6940,8 @@ def start_webhook_server():
                     cur_size = float(pos.get("total", 0))
                     break
             if cur_size == 0:
+                # v4.31: Drop-Marker im Log für Forensik
+                log(f"  ⏭ HARSI_SL ignoriert: keine offene Position ({symbol} {direction.upper()})")
                 return  # ignored: no open position
             set_sl_harsi(symbol, direction, harsi_price, cur_size=cur_size)
             cache_invalidate("all_positions")
@@ -6826,6 +6958,8 @@ def start_webhook_server():
             pivot_price = float(data.get("pivot", 0) or data.get("price", 0) or 0)
             atr_raw     = float(data.get("atr", 0) or 0)
             if pivot_price == 0:
+                # v4.31: Drop-Marker im Log für Forensik
+                log(f"  ⏭ SLING_SL ignoriert: kein Pivot im Payload ({symbol} {direction.upper()})")
                 return  # ignored: no pivot
 
             # Offene Position suchen — Richtung MUSS zur Pine-side passen
@@ -6838,6 +6972,8 @@ def start_webhook_server():
             if cur_size == 0:
                 # Pine sendet Pivot für jedes Symbol — hier ignorieren wir alles
                 # ohne passende offene Position (Watchlist-Rauschen).
+                # v4.31: Drop-Marker im Log für Forensik
+                log(f"  ⏭ SLING_SL ignoriert: keine matching Position ({symbol} {direction.upper()})")
                 return  # ignored: no matching position
 
             set_sl_sling(symbol, direction, pivot_price,
@@ -7176,7 +7312,7 @@ def start_webhook_server():
     @app.route("/", methods=["GET"])
     @app.route("/health", methods=["GET"])
     def health():
-        return jsonify({"status": "running", "version": "v4.25"}), 200
+        return jsonify({"status": "running", "version": "v4.31"}), 200
 
     port = _env_int("PORT", 8080)
     # WICHTIG: Token NICHT ins Log schreiben — er landet sonst in Railway-Logs.
@@ -8075,7 +8211,7 @@ def main():
         log("In Railway → Variables eintragen.")
         return
 
-    log("DOMINUS Trade-Automatisierung v4.25 gestartet — mit finanzmathematischen Optimierungen")
+    log("DOMINUS Trade-Automatisierung v4.31 gestartet — mit finanzmathematischen Optimierungen")
     log(f"Intervall: {POLL_INTERVAL}s")
     log("Warte auf neue Trades...")
     log("─" * 55)
