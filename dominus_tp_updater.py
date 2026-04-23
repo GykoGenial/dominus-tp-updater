@@ -1,5 +1,5 @@
 """
-DOMINUS Trade-Automatisierung v4.32
+DOMINUS Trade-Automatisierung v4.33
 ══════════════════════════════════════════════════════════════
 Vollautomatisches Setup nach DOMINUS-Strategie (Handbuch März 2026)
 Finanzmathematische Optimierungen:
@@ -14,6 +14,20 @@ Finanzmathematische Optimierungen:
   ⑨ Queue-Tracking    — entry_queue_log.csv + R-Multiple-Outcome (v4.20)
   ⑩ Klick-UX          — Button-Driven Rangliste mit adaptivem Keyboard (v4.25)
   ⑪ One-Click-Exec    — 🚀 Trade jetzt Button mit Two-Tap-Confirm (v4.28)
+
+Changelog v4.33 — Daily-Report Break-even-Klassifikation:
+  R1: build_daily_report() klassifiziert Trades jetzt rein P&L-basiert.
+      Bisher galt alles mit net_pnl ≤ 0 als "Loss" (Zeile 2164: won =
+      net_pnl > 0, plus Zeile 6281: losses = count - wins). Trades mit
+      net_pnl == 0 (Break-even / Phantom-Close-Artefakte vor v4.32-Fix)
+      landeten deshalb im 🔴-Bucket und verfälschten die Win-Rate.
+      Neue Regel: pnl>0 = 🏆 Win, pnl<0 = 🔴 Loss, pnl==0 = ⚪ Break-even.
+      Win-Rate-Nenner = wins+losses (Break-evens werden ignoriert, damit
+      flache Trades die Quote nicht künstlich drücken). Break-even-Zähler
+      erscheint in der Summary-Zeile nur wenn > 0 — an normalen Tagen
+      ändert sich an der Optik nichts.
+  R2: Trade-Liste im Report zeigt ⚪ statt 🔴 für +0.00-Einträge.
+  R3: /health + Startup-Banner auf v4.33.
 
 Changelog v4.32 — Phantom-Close-Guard (LDOUSDT-Bug-Fix):
   P1: Double-Check vor Close-Booking. Wenn ein Symbol plötzlich aus
@@ -6274,23 +6288,33 @@ def build_daily_report(date_str: str = None) -> str:
     ]
 
     def _summary(trades: list) -> dict:
+        # v4.33: Break-even (net_pnl == 0) zählt nicht mehr als Verlust.
+        # Bisher wurde losses = len - wins gerechnet → Phantom-Close-Artefakte
+        # (net_pnl=0) landeten fälschlich im Loss-Bucket und verfälschten die
+        # Win-Rate. Jetzt wird rein P&L-basiert klassifiziert: >0 = Win,
+        # <0 = Loss, =0 = Break-even (extra ausgewiesen).
+        # Win-Rate ignoriert Break-evens im Nenner, damit flache Trades die
+        # Quote nicht künstlich drücken.
         if not trades:
-            return {"count": 0, "wins": 0, "losses": 0, "total_pnl": 0.0,
-                    "win_rate": 0.0, "best": 0.0, "worst": 0.0}
-        wins    = sum(1 for t in trades if t.get("won", False))
-        losses  = len(trades) - wins
-        pnls    = [float(t.get("net_pnl", 0)) for t in trades]
-        total   = sum(pnls)
-        best    = max(pnls) if pnls else 0.0
-        worst   = min(pnls) if pnls else 0.0
+            return {"count": 0, "wins": 0, "losses": 0, "breakeven": 0,
+                    "total_pnl": 0.0, "win_rate": 0.0, "best": 0.0, "worst": 0.0}
+        pnls      = [float(t.get("net_pnl", 0)) for t in trades]
+        wins      = sum(1 for p in pnls if p > 0)
+        losses    = sum(1 for p in pnls if p < 0)
+        breakeven = sum(1 for p in pnls if p == 0)
+        decided   = wins + losses   # nur Trades mit echtem Outcome
+        total     = sum(pnls)
+        best      = max(pnls) if pnls else 0.0
+        worst     = min(pnls) if pnls else 0.0
         return {
-            "count":    len(trades),
-            "wins":     wins,
-            "losses":   losses,
+            "count":     len(trades),
+            "wins":      wins,
+            "losses":    losses,
+            "breakeven": breakeven,
             "total_pnl": total,
-            "win_rate": wins / len(trades) * 100 if trades else 0.0,
-            "best":     best,
-            "worst":    worst,
+            "win_rate":  wins / decided * 100 if decided else 0.0,
+            "best":      best,
+            "worst":     worst,
         }
 
     day_s   = _summary(day_trades)
@@ -6299,12 +6323,20 @@ def build_daily_report(date_str: str = None) -> str:
     # Offene Positionen
     open_positions = get_all_positions()
 
+    # v4.33: Summary-Zeile fügt Break-even nur hinzu wenn > 0, damit normale
+    # Tage (alle entschieden) visuell unverändert bleiben.
+    def _summary_line(s: dict) -> str:
+        base = f"Trades: {s['count']}  |  🏆 {s['wins']} / 🔴 {s['losses']}"
+        if s.get("breakeven", 0) > 0:
+            base += f" / ⚪ {s['breakeven']} Break-even"
+        return base
+
     lines = [
         f"📊 <b>DOMINUS Daily Report — {date_str}</b>",
         "━━━━━━━━━━━━",
         f"",
         f"📅 <b>Heute ({date_str}):</b>",
-        f"Trades: {day_s['count']}  |  🏆 {day_s['wins']} / 🔴 {day_s['losses']}",
+        _summary_line(day_s),
         f"Win-Rate: {day_s['win_rate']:.0f}%",
         f"Netto P&L: {day_s['total_pnl']:+.2f} USDT",
         f"Bester: {day_s['best']:+.2f} USDT  |  Schlechtester: {day_s['worst']:+.2f} USDT",
@@ -6314,17 +6346,25 @@ def build_daily_report(date_str: str = None) -> str:
         lines.append("")
         lines.append("📋 <b>Trades heute:</b>")
         for t in day_trades:
-            icon = "🏆" if t.get("won") else "🔴"
+            # v4.33: Icon rein P&L-basiert. Break-even (0.00) = ⚪,
+            # damit Phantom-Artefakte nicht mehr fälschlich als 🔴 erscheinen.
+            _pnl = float(t.get('net_pnl', 0))
+            if _pnl > 0:
+                icon = "🏆"
+            elif _pnl < 0:
+                icon = "🔴"
+            else:
+                icon = "⚪"
             lines.append(
                 f"  {icon} {t['symbol']} {t.get('direction','?').upper()} "
-                f"| {float(t.get('net_pnl',0)):+.2f} USDT "
+                f"| {_pnl:+.2f} USDT "
                 f"| {t.get('hold_str','?')}"
             )
 
     lines += [
         "",
         f"📆 <b>Monat ({month_str}):</b>",
-        f"Trades: {month_s['count']}  |  🏆 {month_s['wins']} / 🔴 {month_s['losses']}",
+        _summary_line(month_s),
         f"Win-Rate: {month_s['win_rate']:.0f}%",
         f"Netto P&L: {month_s['total_pnl']:+.2f} USDT",
     ]
@@ -7461,7 +7501,7 @@ def start_webhook_server():
     @app.route("/", methods=["GET"])
     @app.route("/health", methods=["GET"])
     def health():
-        return jsonify({"status": "running", "version": "v4.32"}), 200
+        return jsonify({"status": "running", "version": "v4.33"}), 200
 
     port = _env_int("PORT", 8080)
     # WICHTIG: Token NICHT ins Log schreiben — er landet sonst in Railway-Logs.
@@ -8375,7 +8415,7 @@ def main():
         log("In Railway → Variables eintragen.")
         return
 
-    log("DOMINUS Trade-Automatisierung v4.32 gestartet — mit finanzmathematischen Optimierungen")
+    log("DOMINUS Trade-Automatisierung v4.33 gestartet — mit finanzmathematischen Optimierungen")
     log(f"Intervall: {POLL_INTERVAL}s")
     log("Warte auf neue Trades...")
     log("─" * 55)
