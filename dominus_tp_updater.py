@@ -1,5 +1,5 @@
 """
-DOMINUS Trade-Automatisierung v4.31
+DOMINUS Trade-Automatisierung v4.32
 ══════════════════════════════════════════════════════════════
 Vollautomatisches Setup nach DOMINUS-Strategie (Handbuch März 2026)
 Finanzmathematische Optimierungen:
@@ -14,6 +14,37 @@ Finanzmathematische Optimierungen:
   ⑨ Queue-Tracking    — entry_queue_log.csv + R-Multiple-Outcome (v4.20)
   ⑩ Klick-UX          — Button-Driven Rangliste mit adaptivem Keyboard (v4.25)
   ⑪ One-Click-Exec    — 🚀 Trade jetzt Button mit Two-Tap-Confirm (v4.28)
+
+Changelog v4.32 — Phantom-Close-Guard (LDOUSDT-Bug-Fix):
+  P1: Double-Check vor Close-Booking. Wenn ein Symbol plötzlich aus
+      get_all_positions() verschwindet, wird jetzt zuerst der Cache
+      invalidiert und ein frischer Raw-API-Call gemacht. Nur wenn der
+      2. Read das Symbol ebenfalls nicht enthält, wird
+      handle_position_closed() gefeuert. Grund: Am 2026-04-23 07:48:43
+      UTC hat Bitget bei LDOUSDT (SHORT 7x @ 0.38963) für einen einzigen
+      Tick keine Position gemeldet → Bot buchte einen falschen +0.00-
+      Close, stornierte TPs und re-seedete bei 07:49:06 als "neuer Trade"
+      mit identischem Entry, aber frischem -25 %-SL. Echter Profit von
+      ~13 USDT ging als 0 in die CSV, Trailing-Fortschritt auf TP1 war
+      weg. Der zweite API-Call kostet im Normalfall nichts (Cache), im
+      Phantom-Fall ein einziger zusätzlicher REST-Roundtrip.
+  P2: Setup-Guard gegen Phantom-Reopen. setup_new_trade() prüft jetzt
+      vor jedem neuen Setup, ob recent_closes[symbol] einen Eintrag
+      innerhalb der letzten PHANTOM_REOPEN_TTL_SEC (120s) enthält UND
+      der neue Entry bit-identisch (±0.1 %) zum gemerkten Close-Entry
+      ist UND die Richtung gleich. Trifft das zu → State rollback
+      (trailing_sl_level, sl_at_entry, trade_data) statt Neu-Setup.
+      Keine neuen DCAs, kein -25 %-Auto-SL, kein zerstörter Trailing-
+      Progress. Telegram-Nachricht ♻️ "Phantom-Reopen abgefangen"
+      macht das für den Operator sichtbar. Zweite Sicherheitsebene
+      falls der Raw-API-Read aus P1 ausnahmsweise auch leer kommt.
+  P3: Neuer In-Memory-State recent_closes + PHANTOM_REOPEN_TTL_SEC /
+      PHANTOM_ENTRY_TOLERANCE Konstanten. Snapshot wird in
+      handle_position_closed() VOR dem State-Reset geschrieben und
+      überlebt Railway-Redeploys via save_state/load_state (Einträge
+      ausserhalb des TTL-Fensters werden beim Speichern/Laden verworfen,
+      um dominus_state.json klein zu halten).
+  P4: /health + Startup-Banner auf v4.32.
 
 Changelog v4.31 — Observability & SL-Status-Wahrheit:
   O1: Neuer Helper infer_trailing_level(symbol, direction, entry, leverage)
@@ -697,6 +728,26 @@ last_update_id:   int  = 0    # Telegram: letzter verarbeiteter Update-ID
 # Trade-Daten für Auswertung bei Abschluss
 # {symbol: {entry, direction, leverage, sl, peak_size, open_ts}}
 trade_data: dict = {}
+
+# v4.32 Phantom-Close-Guard: merkt sich kürzlich geschlossene Trades inkl.
+# ihres letzten State-Snapshots. Wenn innerhalb des TTL-Fensters eine neue
+# Position mit identischem Entry erkannt wird, ist das kein "neuer Trade",
+# sondern der Phantom-Re-Open nach einem einzelnen stale Bitget-Tick.
+# Schema:
+#   {symbol: {
+#       "ts_close":   float  (time.time()),
+#       "entry":      float,
+#       "direction":  str,
+#       "leverage":   int,
+#       "peak_size":  float,
+#       "sl":         float,
+#       "trailing_level": int,
+#       "sl_at_entry":    bool,
+#       "trade_data":     dict  (Kopie des trade_data[symbol] zum Zeitpunkt des Close),
+#   }}
+recent_closes: dict = {}
+PHANTOM_REOPEN_TTL_SEC   = 120   # Zeitfenster für Phantom-Reopen-Detektion
+PHANTOM_ENTRY_TOLERANCE  = 0.001  # 0.1 % — Bitget liefert bei Phantom-Ticks bit-identischen Entry
 
 # H4 Trigger-Puffer: sammelt Alerts, sendet gebündelt nach Zeitfenster
 h4_buffer:     list = []
@@ -2229,6 +2280,26 @@ def handle_position_closed(symbol: str, reason: str = ""):
         )
     except Exception as ex:
         log(f"[update_entry_log_outcome] {ex}")
+    # v4.32 Phantom-Close-Guard: kompletten State-Snapshot vor dem Reset
+    # wegspeichern. Wird in setup_new_trade() als "wurde dieser Entry gerade
+    # eben erst geschlossen?"-Marker gelesen. Bei echtem Re-Open mit neuem
+    # Entry läuft der Normal-Pfad; bei Phantom (identischer Entry innerhalb
+    # PHANTOM_REOPEN_TTL_SEC) wird der State zurückgerollt statt neu gesetzt.
+    try:
+        recent_closes[symbol] = {
+            "ts_close":        time.time(),
+            "entry":           entry,
+            "direction":       direction,
+            "leverage":        leverage,
+            "peak_size":       peak_size,
+            "sl":              sl_price,
+            "trailing_level":  trailing_sl_level.get(symbol, 0),
+            "sl_at_entry":     sl_at_entry.get(symbol, False),
+            "trade_data":      dict(trade_data.get(symbol, {}) or {}),
+        }
+    except Exception as ex:
+        log(f"[recent_closes snapshot] {ex}")
+
     save_state()
 
     # Internen Status zurücksetzen
@@ -3169,6 +3240,17 @@ def setup_new_trade(pos: dict):
     2. DCA1 + DCA2 Limit-Orders setzen
     3. TP1–TP4 setzen
     4. Telegram-Zusammenfassung senden
+
+    v4.32 Fix C — Phantom-Reopen-Guard:
+    Bevor ein Neu-Setup läuft, wird geprüft, ob innerhalb der letzten
+    PHANTOM_REOPEN_TTL_SEC ein Close für dieses Symbol gebucht wurde UND
+    der aktuelle Entry bit-identisch (±PHANTOM_ENTRY_TOLERANCE) zum
+    gemerkten Entry ist. Trifft das zu, ist es kein neuer Trade, sondern
+    ein Phantom-Re-Open: Bitget hatte einen Tick lang die Position
+    versehentlich weggelassen, ist jetzt wieder da. In diesem Fall wird
+    der State aus recent_closes[sym] zurückgerollt (trailing_sl_level,
+    sl_at_entry, trade_data) — keine neuen DCAs, keine neuen TPs, kein
+    zerschossener -25 %-SL.
     """
     symbol    = pos.get("symbol", "?")
     direction = pos.get("holdSide", "long")
@@ -3176,6 +3258,73 @@ def setup_new_trade(pos: dict):
     size      = float(pos.get("total", 0))
     leverage  = int(float(pos.get("leverage", 10)))
     mark      = get_mark_price(symbol)
+
+    # ── v4.32 Phantom-Reopen-Guard ─────────────────────────────────────
+    _prev_close = recent_closes.get(symbol)
+    if _prev_close and entry > 0:
+        try:
+            _age = time.time() - float(_prev_close.get("ts_close", 0))
+            _prev_entry = float(_prev_close.get("entry", 0) or 0)
+            if _prev_entry > 0 and _age < PHANTOM_REOPEN_TTL_SEC:
+                _entry_diff = abs(entry - _prev_entry) / _prev_entry
+                _same_dir   = (_prev_close.get("direction", "") == direction)
+                if _same_dir and _entry_diff <= PHANTOM_ENTRY_TOLERANCE:
+                    # Phantom erkannt → State restaurieren, NICHT neu aufsetzen.
+                    log(f"══ PHANTOM-REOPEN IGNORIERT: {symbol} ══")
+                    log(f"  Close-Alter: {_age:.1f}s | Entry-Diff: {_entry_diff*100:.4f}% "
+                        f"(Tol {PHANTOM_ENTRY_TOLERANCE*100:.1f}%) | same_dir={_same_dir}")
+                    log(f"  → Rolle State zurück auf letzten bekannten Stand, "
+                        f"überspringe Setup (kein neuer Auto-SL, keine DCA-Neuanlage)")
+
+                    _trl_prev = int(_prev_close.get("trailing_level", 0) or 0)
+                    _sle_prev = bool(_prev_close.get("sl_at_entry", False))
+                    _td_prev  = dict(_prev_close.get("trade_data", {}) or {})
+
+                    last_known_avg[symbol]  = entry
+                    last_known_size[symbol] = max(size, float(_prev_close.get("peak_size", 0) or 0))
+                    trailing_sl_level[symbol] = _trl_prev
+                    sl_at_entry[symbol]       = _sle_prev
+                    if _td_prev:
+                        trade_data[symbol] = _td_prev
+                    new_trade_done[symbol]  = True   # verhindert dass der nächste Tick
+                                                     # gleich wieder als neuer Trade triggert
+
+                    # Close-Eintrag invalidieren: wenn derselbe Trade in kurzer Zeit
+                    # erneut schliesst, soll das KEIN weiterer Phantom-Guard-Treffer
+                    # werden — dann ist es ein echter Close. Aber wir behalten den
+                    # Snapshot für den seltenen Fall "Phantom-Reopen unmittelbar
+                    # nach Phantom-Reopen" — einfach den Timer zurücksetzen.
+                    recent_closes.pop(symbol, None)
+
+                    # Telegram-Benachrichtigung: Operator soll sehen, dass der Bot
+                    # hier korrigierend eingegriffen hat (damit der falsche +0.00-
+                    # Close-Report nicht als "echter Verlust" missverstanden wird).
+                    try:
+                        telegram(
+                            f"♻️ <b>Phantom-Reopen abgefangen — {symbol}</b>\n"
+                            f"━━━━━━━━━━━━\n"
+                            f"Bitget hatte {symbol} für einen Tick aus der Position-"
+                            f"Liste weggelassen, ist jetzt wieder aktiv. Der vorige "
+                            f"'Close' war eine API-Phantom-Meldung.\n\n"
+                            f"Rollback: SL-Level {_trl_prev}, sl_at_entry={_sle_prev} "
+                            f"wiederhergestellt. Kein neuer Auto-SL, keine DCA-Neuanlage.\n"
+                            f"Entry: {entry} (±{_entry_diff*100:.4f}% zum letzten bekannten)"
+                        )
+                    except Exception as _tex:
+                        log(f"[phantom-guard telegram] {_tex}")
+
+                    save_state()
+                    return
+        except Exception as ex:
+            log(f"[setup_new_trade phantom-guard] {ex} — fahre mit normalem Setup fort")
+
+    # Phantom-Snapshot nach Ablauf entsorgen (damit er nicht ewig im State hängt)
+    if _prev_close:
+        try:
+            if time.time() - float(_prev_close.get("ts_close", 0)) >= PHANTOM_REOPEN_TTL_SEC:
+                recent_closes.pop(symbol, None)
+        except Exception:
+            pass
 
     log(f"══ NEUER TRADE: {symbol} ══")
     log(f"  {direction.upper()} | Entry={entry} | "
@@ -7312,7 +7461,7 @@ def start_webhook_server():
     @app.route("/", methods=["GET"])
     @app.route("/health", methods=["GET"])
     def health():
-        return jsonify({"status": "running", "version": "v4.31"}), 200
+        return jsonify({"status": "running", "version": "v4.32"}), 200
 
     port = _env_int("PORT", 8080)
     # WICHTIG: Token NICHT ins Log schreiben — er landet sonst in Railway-Logs.
@@ -7365,6 +7514,13 @@ def save_state():
             "t2_dir":                  t2_dir,
             # v4.9 Makro-Extremzonen persistieren (überlebt Railway-Restarts)
             "macro_extreme":           macro_extreme,
+            # v4.32 Phantom-Close-Guard: überlebt Railway-Redeploy.
+            # Nur Einträge innerhalb des TTL-Fensters behalten, sonst wächst
+            # der State-File unnötig.
+            "recent_closes":           {
+                _s: _v for _s, _v in recent_closes.items()
+                if time.time() - float(_v.get("ts_close", 0)) < PHANTOM_REOPEN_TTL_SEC
+            },
         }
         with open(STATE_FILE, "w") as f:
             json.dump(state, f)
@@ -7419,6 +7575,14 @@ def load_state():
                 macro_extreme[_mk]["state"]    = int(_saved.get("state", 0))
                 macro_extreme[_mk]["until_ts"] = _until
             # sonst: abgelaufen oder leer → bleibt auf Defaults (0 / 0.0)
+        # v4.32 Phantom-Close-Guard laden — nur noch gültige Fenster übernehmen
+        for _sym, _snap in (s.get("recent_closes", {}) or {}).items():
+            try:
+                _ts_close = float(_snap.get("ts_close", 0) or 0)
+                if _now_ts - _ts_close < PHANTOM_REOPEN_TTL_SEC:
+                    recent_closes[_sym] = _snap
+            except Exception:
+                pass
         _me_btc = macro_extreme["btc"]["state"]
         _me_t2  = macro_extreme["total2"]["state"]
         log(f"[load_state] State geladen: {len(last_known_avg)} Position(en) | "
@@ -8211,7 +8375,7 @@ def main():
         log("In Railway → Variables eintragen.")
         return
 
-    log("DOMINUS Trade-Automatisierung v4.31 gestartet — mit finanzmathematischen Optimierungen")
+    log("DOMINUS Trade-Automatisierung v4.32 gestartet — mit finanzmathematischen Optimierungen")
     log(f"Intervall: {POLL_INTERVAL}s")
     log("Warte auf neue Trades...")
     log("─" * 55)
@@ -8424,9 +8588,36 @@ def main():
                 # (Position war bekannt, ist jetzt nicht mehr in get_all_positions)
                 # Ursache: SL/TP4 automatisch ODER manuell geschlossen.
                 # In beiden Fällen: TP-Orders + DCA-Orders stornieren → handle_position_closed.
+                #
+                # v4.32 Fix A — Phantom-Close-Guard via Double-Check:
+                # Ein einzelner stale Bitget-Tick (Position fehlt in einem API-Response,
+                # kommt beim nächsten zurück) darf nicht zu einem False-Close führen.
+                # Deshalb: erst Kandidaten sammeln, dann Cache invalidieren und mit
+                # frischem Raw-API-Call gegenprüfen. Nur wenn BEIDE Reads leer sind,
+                # wird handle_position_closed() gefeuert.
                 active_symbols = {p.get("symbol") for p in get_all_positions()}
-                for sym in list(last_known_avg.keys()):
-                    if sym not in active_symbols and last_known_avg.get(sym, 0) > 0:
+                _close_candidates = [
+                    sym for sym in list(last_known_avg.keys())
+                    if sym not in active_symbols and last_known_avg.get(sym, 0) > 0
+                ]
+                if _close_candidates:
+                    try:
+                        cache_invalidate("all_positions")
+                        _raw_positions = _get_all_positions_raw()
+                        _raw_symbols = {p.get("symbol") for p in _raw_positions}
+                    except Exception as _ex:
+                        # Kein belastbarer 2. Read → konservativ auf active_symbols
+                        # zurückfallen (Verhalten wie vor v4.32: Close wird gebucht).
+                        # Fix C in setup_new_trade() ist dann die zweite Sicherheitsnetz-
+                        # Ebene falls gleich darauf ein Phantom-Reopen kommt.
+                        log(f"[phantom-guard raw-check] {_ex} — fahre mit normaler Close-Logik fort")
+                        _raw_symbols = active_symbols
+
+                    for sym in _close_candidates:
+                        if sym in _raw_symbols:
+                            # Phantom — Position ist beim 2. Read wieder sichtbar.
+                            log(f"  ♻ Phantom-Close verhindert: {sym} nach Cache-Refresh wieder aktiv")
+                            continue
                         # Trailing-Level bestimmt Ursache: 0 = vor TP1 → wahrscheinlich manuell
                         trl = trailing_sl_level.get(sym, 0)
                         if trl == 0:
