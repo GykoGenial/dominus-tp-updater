@@ -1,5 +1,5 @@
 """
-DOMINUS Trade-Automatisierung v4.34
+DOMINUS Trade-Automatisierung v4.35
 ══════════════════════════════════════════════════════════════
 Vollautomatisches Setup nach DOMINUS-Strategie (Handbuch März 2026)
 Finanzmathematische Optimierungen:
@@ -14,6 +14,45 @@ Finanzmathematische Optimierungen:
   ⑨ Queue-Tracking    — entry_queue_log.csv + R-Multiple-Outcome (v4.20)
   ⑩ Klick-UX          — Button-Driven Rangliste mit adaptivem Keyboard (v4.25)
   ⑪ One-Click-Exec    — 🚀 Trade jetzt Button mit Two-Tap-Confirm (v4.28)
+
+Changelog v4.35 — DCA Auto-Void Bug-Fix + Lärm-Reduktion + Forensik:
+  D1: BUG-FIX _void_passed_dcas() — falsche Bitget-API.
+      Vor v4.35 fragte die Funktion /api/v2/mix/order/orders-plan-pending
+      ab (TP/SL/Trigger-Plan-Orders). DCAs sind aber reguläre LIMIT-Orders
+      und liegen unter /api/v2/mix/order/orders-pending. Konsequenz:
+      Der Aufruf nach Sling-SL fand nichts und DCA-Orders unterhalb des
+      neuen (long) bzw. oberhalb des neuen (short) SL blieben aktiv.
+      Beobachtet bei QNTUSDT 2026-04-25 08:01 UTC: Sling-SL wurde gesetzt,
+      die zwei DCA-Limits unterhalb des Long-SL blieben aber pending.
+      Jetzt analog zu cancel_open_dca_orders implementiert: filter
+      side ∈ {buy, sell}, tradeSide=="open", orderType=="limit"; Storno
+      via /api/v2/mix/order/cancel-order statt cancel-plan-order.
+  D2: Watchlist-Master Lärm-Reduktion. Pine sendet SLING_SL/HARSI_SL für
+      jedes Watchlist-Symbol; ohne offene Position landeten Drops mit
+      Per-Drop-Log im Railway-Stream (24h-Log: 240 SLING + 43 HARSI =
+      12 Lärm-Zeilen/h). Neuer Helper _track_watchlist_drop() zählt
+      stumm und loggt nur eine Summary alle WATCHLIST_DROP_SUMMARY_EVERY_N
+      Drops (default 50, ≈ alle 4h bei aktueller Lautstärke). Env-Flag
+      WATCHLIST_DROP_VERBOSE=1 stellt das alte Per-Drop-Log wieder her,
+      falls für eine konkrete Forensik benötigt. Vier Call-Sites ersetzt:
+      generic Auto-Direction-Drop, HARSI_SL kein-Preis, HARSI_SL keine-
+      Position, SLING_SL kein-Pivot, SLING_SL keine-matching-Position.
+  D3: Auto-SL -25% Fallback Forensik-Dump. Im 24h-Log feuerte das "Kein
+      SL gefunden — Auto-SL bei -25%"-Fallback 2× (ENSUSDT, SOLUSDT)
+      ohne Diagnose-Möglichkeit. Vor dem Auto-SL-Setzen wird jetzt ein
+      🔬-Forensik-Block geloggt: get_sl_price-Result, Anzahl + planTypes
+      der pending Plan-Orders, trade_data[symbol].sl-Snapshot, direction,
+      leverage. Beim nächsten Auftritt direkt diagnostizierbar ob Webhook,
+      Plan-Order-Persistenz oder eine andere Race-Condition die Ursache war.
+  D4: Min-Qty Edge-Case bei place_tp_orders_after_dca + Reconciliation.
+      Bisher: Qty<4 → kompletter Bail-Out ("manuell überwachen"), kein
+      einziger TP gesetzt. SOLUSDT 2026-04-25: Nachkauf reduzierte die
+      Position auf 3.7 Kontrakte → keine TPs, nur SL als Exit. v4.35:
+      place_tp_orders() hat bereits eingebaute Carry-Forward-Logik (Sub-
+      min-Qty-TPs werden auf den nächsten TP addiert) plus TP4 Full-Close
+      — diese reichen oft auch bei kleinen Positionen. Wrapper versucht
+      jetzt erst Setzen und warnt "manuell" nur wenn count==0
+      zurückkommt. Telegram-Hinweis bei echtem Bail-Out (vorher nur Log).
 
 Changelog v4.34 — trades.csv via Telegram transferieren:
   T1: Neuer Befehl /trades sendet die aktuelle trades.csv als Telegram-
@@ -41,7 +80,8 @@ Changelog v4.34 — trades.csv via Telegram transferieren:
       Bestätigungs-Telegram enthält: alte vs. neue Zeilenzahl,
       Backup-Pfad und Hinweis auf /report für Plausibilitäts-Check.
   T4: /hilfe-Block um den Abschnitt "Archiv-Transfer" ergänzt.
-      /health + Startup-Banner auf v4.34.
+      /health + Startup-Banner auf v4.34. (v4.35 erbt diesen Stack;
+      eigene Banner-Bumps siehe Zeilen oben.)
 
 Changelog v4.33 — Daily-Report Break-even-Klassifikation:
   R1: build_daily_report() klassifiziert Trades jetzt rein P&L-basiert.
@@ -752,6 +792,29 @@ _raw_at = os.environ.get("AUTO_TRADE_ENABLED", "0").strip().lower()
 AUTO_TRADE_ENABLED        = _raw_at in ("1", "true", "yes", "on")
 AUTO_TRADE_CONFIRM_TTL_SEC = _env_int("AUTO_TRADE_CONFIRM_TTL_SEC", 10)
 MAX_AUTO_TRADE_USDT       = _env_float("MAX_AUTO_TRADE_USDT", 0.0)
+
+# v4.35: Watchlist-Master Drop-Logging — Lärm-Reduktion
+# Pine sendet SLING_SL/HARSI_SL für jedes Watchlist-Symbol. Ohne offene Position
+# wird stumm verworfen — bisher mit Per-Drop-Log-Zeile (240+43 Drops in 24h
+# = 12/h Lärm). v4.35: Drops werden gezählt und nur jede N-te Meldung als
+# Summary geloggt. WATCHLIST_DROP_VERBOSE=1 stellt Per-Drop-Logs wieder her.
+_raw_wdv = os.environ.get("WATCHLIST_DROP_VERBOSE", "0").strip().lower()
+WATCHLIST_DROP_VERBOSE          = _raw_wdv in ("1", "true", "yes", "on")
+WATCHLIST_DROP_SUMMARY_EVERY_N  = _env_int("WATCHLIST_DROP_SUMMARY_EVERY_N", 50)
+_watchlist_drop_counter = {"count": 0}
+
+def _track_watchlist_drop(reason: str, symbol: str, signal_type: str, direction: str = ""):
+    """v4.35: zählt Watchlist-Master-Drops und loggt nur eine Summary alle
+    WATCHLIST_DROP_SUMMARY_EVERY_N Events. WATCHLIST_DROP_VERBOSE=1 → altes
+    Per-Drop-Log-Verhalten (für Forensik in Einzel-Diagnosen)."""
+    _watchlist_drop_counter["count"] += 1
+    n = _watchlist_drop_counter["count"]
+    dir_lbl = direction.upper() if direction else "?"
+    if WATCHLIST_DROP_VERBOSE:
+        log(f"  ⏭ {signal_type} ignoriert: {reason} ({symbol} {dir_lbl})")
+    elif WATCHLIST_DROP_SUMMARY_EVERY_N > 0 and n % WATCHLIST_DROP_SUMMARY_EVERY_N == 0:
+        log(f"  🔇 Watchlist-Master: {n} Drops bisher (zuletzt: {signal_type} "
+            f"{symbol} {dir_lbl} — {reason})")
 
 BASE_URL = "https://api.bitget.com"
 
@@ -2692,41 +2755,55 @@ def set_sl_harsi(symbol: str, direction: str, harsi_price: float, cur_size: floa
 
 def _void_passed_dcas(symbol: str, direction: str, new_sl: float) -> list:
     """
-    Auto-Void: wenn der neue SL einen DCA-Level überschreitet (SL bei LONG
+    v4.35: Auto-Void: wenn der neue SL einen DCA-Level überschreitet (SL bei LONG
     über dem DCA-Preis bzw. bei SHORT unter dem DCA-Preis), wird die Order
     storniert. DCA-im-Gewinn ist per Definition unmöglich.
+
+    BUG-FIX v4.35: Bisher wurde /api/v2/mix/order/orders-plan-pending abgefragt
+    (Plan-Orders: TP/SL/Trigger). DCAs sind aber reguläre LIMIT-Orders die unter
+    /api/v2/mix/order/orders-pending liegen. Konsequenz vor v4.35: Funktion
+    fand nichts → DCAs blieben unter dem neuen SL aktiv (siehe QNTUSDT
+    2026-04-25 08:01 UTC). Jetzt analog zu cancel_open_dca_orders implementiert.
 
     Rückgabe: Liste der stornierten DCA-Labels (für Telegram-Nachricht).
     """
     voided = []
     try:
-        orders = _get_plan_orders(symbol)
+        result = api_get("/api/v2/mix/order/orders-pending", {
+            "symbol":      symbol,
+            "productType": PRODUCT_TYPE,
+        })
     except Exception as _e:
-        log(f"  [_void_passed_dcas] _get_plan_orders Fehler: {_e}")
+        log(f"  [_void_passed_dcas] orders-pending Fehler: {_e}")
         return voided
 
-    for o in orders:
-        # Wir interessieren uns nur für offene LIMIT-Einstiegs-Orders (DCA)
-        if (o.get("planType") or "").lower() not in ("normal_plan", "limit_plan", "pos_plan"):
-            # Je nach Bitget-Variante — wir filtern weiter unten nach side/price.
-            pass
-        side_ord = (o.get("side") or "").lower()
-        trade_side = (o.get("tradeSide") or "").lower()
-        # Nur "open"-Seiten (nicht close/TP/SL). Manche Plan-Typen haben keine
-        # explizite tradeSide → fallback auf side ∈ buy/sell & nicht profit/loss.
-        if trade_side and trade_side != "open":
-            continue
-        plan_type = (o.get("planType") or "").lower()
-        if plan_type in ("profit_plan", "loss_plan", "pos_loss", "pos_profit"):
-            continue
+    if (result or {}).get("code") != "00000":
+        log(f"  [_void_passed_dcas] orders-pending Code {result.get('code')}: {result.get('msg', result)}")
+        return voided
+
+    data   = result.get("data") or {}
+    orders = data.get("entrustedList") or [] if isinstance(data, dict) else (data or [])
+
+    # DCAs = Open-Side LIMIT-Orders in Trade-Richtung (LONG → buy, SHORT → sell)
+    side = "buy" if direction == "long" else "sell"
+    dca_orders = [
+        o for o in orders
+        if o.get("side") == side
+        and o.get("tradeSide") == "open"
+        and o.get("orderType") == "limit"
+    ]
+
+    for o in dca_orders:
         try:
-            price = float(o.get("triggerPrice") or o.get("price") or 0)
+            price = float(o.get("price") or 0)
         except (TypeError, ValueError):
             continue
         if price <= 0:
             continue
 
         # Prüfen ob SL diesen DCA überschritten hat
+        # LONG: SL über DCA-Preis  →  DCA wäre im Gewinn (unmöglich)
+        # SHORT: SL unter DCA-Preis →  DCA wäre im Gewinn (unmöglich)
         overshoots = (direction == "long" and new_sl >= price) or \
                      (direction == "short" and new_sl <= price)
         if not overshoots:
@@ -2735,7 +2812,7 @@ def _void_passed_dcas(symbol: str, direction: str, new_sl: float) -> list:
         order_id = o.get("orderId") or o.get("clientOid") or ""
         if not order_id:
             continue
-        res = api_post("/api/v2/mix/order/cancel-plan-order", {
+        res = api_post("/api/v2/mix/order/cancel-order", {
             "symbol":      symbol,
             "productType": PRODUCT_TYPE,
             "marginCoin":  MARGIN_COIN,
@@ -3440,6 +3517,22 @@ def setup_new_trade(pos: dict):
         sl_auto  = float(sl_str)
         sl_dist  = abs(entry - sl_auto) / entry * 100
 
+        # v4.35: Forensik-Dump — warum wurde kein SL gefunden?
+        # 24h-Log zeigte 2× Auto-SL-Fallback (ENSUSDT, SOLUSDT). Ursache war
+        # vorher unklar weil der Log nur "Kein SL gefunden" sagte. Jetzt
+        # dumpen wir Plan-Order-Count + trade_data-Snapshot, damit der
+        # nächste Auftritt direkt diagnostizierbar ist.
+        try:
+            _td_snap     = trade_data.get(symbol, {}) or {}
+            _td_sl       = _td_snap.get("sl", "—")
+            _plan_orders = _get_plan_orders(symbol) or []
+            _plan_kinds  = [(o.get("planType") or "—") for o in _plan_orders]
+            log(f"  🔬 Auto-SL-Forensik [{symbol}]: get_sl_price=0, "
+                f"plan_orders={len(_plan_orders)} ({_plan_kinds}), "
+                f"trade_data.sl={_td_sl}, direction={direction}, leverage={leverage}")
+        except Exception as _fe:
+            log(f"  🔬 Auto-SL-Forensik Fehler: {_fe}")
+
         log(f"  ⚠ Kein SL gefunden — Auto-SL bei -25%: {sl_str} USDT")
 
         res = api_post("/api/v2/mix/order/place-pos-tpsl", {
@@ -3724,19 +3817,31 @@ def update_tp_for_position(pos: dict, reason: str):
 
     log(f"  TPs löschen und neu setzen (Grund: {reason})")
 
-    min_size_for_tps = 4
-    if total < min_size_for_tps:
-        log(f"  ⚠ Position zu klein (Qty={total}, min. {min_size_for_tps}) — "
-            f"TPs manuell überwachen")
-        last_known_avg[symbol]  = avg
-        last_known_size[symbol] = total
-        return
-
+    # v4.35: Min-Qty Edge-Case verbessern. Bisher: Qty<4 → komplettes Bail-Out
+    # ("manuell überwachen"). Ergebnis im Log war SOLUSDT mit Qty=3.7: kein
+    # einziger TP gesetzt, nur SL als Exit. place_tp_orders() hat aber bereits
+    # eingebaute Carry-Forward-Logik (überspringt Sub-min-Qty TPs und addiert
+    # auf den nächsten) plus TP4=Full-Close. Jetzt: erst Versuch starten,
+    # nur bei count==0 als "manuell" warnen.
     cancel_all_tp_orders(symbol)
     time.sleep(1)
     count, prices = place_tp_orders(
         symbol, avg, total, direction, leverage, mark, known_sl=known_sl
     )
+
+    if count == 0 and total < 4:
+        # Echtes Bail-Out nur wenn place_tp_orders auch nichts hingekriegt hat
+        log(f"  ⚠ Position zu klein (Qty={total}, min. 4) — kein TP setzbar — "
+            f"TPs manuell überwachen")
+        telegram(
+            f"⚠️ <b>Position zu klein — {symbol}</b>\n"
+            f"Qty={total} ({direction.upper()}) — keine TPs setzbar.\n"
+            f"SL: {known_sl if known_sl > 0 else '—'} USDT\n"
+            f"Bitte TP manuell überwachen oder Position glattstellen."
+        )
+        last_known_avg[symbol]  = avg
+        last_known_size[symbol] = total
+        return
 
     if count > 0:
         status = "✓ Alle 4" if count == 4 else f"⚠ {count}/4"
@@ -7220,11 +7325,10 @@ def start_webhook_server():
                         log(f"🔎 {signal_type} Auto-Direction: {symbol} → {direction.upper()} (aus offener Position)")
                         break
             if direction not in ("long", "short"):
-                # Kein offener Trade → silent ignore, Watchlist-Rauschen unterdrücken
-                # v4.31: aus "silent" → "dezent loggen" (Forensik ermöglichen,
-                # trotzdem ohne Telegram-Noise). "⏭" ist der Drop-Marker, nach
-                # dem sich im Railway-Log suchen lässt.
-                log(f"  ⏭ {signal_type} ignoriert: keine offene Position für {symbol}")
+                # Kein offener Trade → silent ignore, Watchlist-Rauschen unterdrücken.
+                # v4.31: aus "silent" → "dezent loggen" (Forensik via "⏭"-Marker).
+                # v4.35: Drop-Counter mit Summary statt Per-Drop-Log (Lärm-Reduktion).
+                _track_watchlist_drop("keine offene Position", symbol, signal_type)
                 return  # ignored: no open position
 
         if not symbol or direction not in ("long", "short"):
@@ -7397,8 +7501,8 @@ def start_webhook_server():
             #                            HARSI_SL   = SL-Anpassung bei offenem Trade (Alarm 4/4b)
             harsi_price = float(data.get("price", 0) or data.get("sl", 0) or 0)
             if harsi_price == 0:
-                # v4.31: Drop-Marker im Log für Forensik
-                log(f"  ⏭ HARSI_SL ignoriert: kein Preis im Payload ({symbol} {direction.upper()})")
+                # v4.35: Drop-Counter (Lärm-Reduktion, vorher Per-Drop-Log)
+                _track_watchlist_drop("kein Preis im Payload", symbol, "HARSI_SL", direction)
                 return  # ignored: no price
             cur_size = 0
             for pos in get_all_positions():
@@ -7406,8 +7510,8 @@ def start_webhook_server():
                     cur_size = float(pos.get("total", 0))
                     break
             if cur_size == 0:
-                # v4.31: Drop-Marker im Log für Forensik
-                log(f"  ⏭ HARSI_SL ignoriert: keine offene Position ({symbol} {direction.upper()})")
+                # v4.35: Drop-Counter (Lärm-Reduktion, vorher Per-Drop-Log)
+                _track_watchlist_drop("keine offene Position", symbol, "HARSI_SL", direction)
                 return  # ignored: no open position
             set_sl_harsi(symbol, direction, harsi_price, cur_size=cur_size)
             cache_invalidate("all_positions")
@@ -7424,8 +7528,8 @@ def start_webhook_server():
             pivot_price = float(data.get("pivot", 0) or data.get("price", 0) or 0)
             atr_raw     = float(data.get("atr", 0) or 0)
             if pivot_price == 0:
-                # v4.31: Drop-Marker im Log für Forensik
-                log(f"  ⏭ SLING_SL ignoriert: kein Pivot im Payload ({symbol} {direction.upper()})")
+                # v4.35: Drop-Counter (Lärm-Reduktion, vorher Per-Drop-Log)
+                _track_watchlist_drop("kein Pivot im Payload", symbol, "SLING_SL", direction)
                 return  # ignored: no pivot
 
             # Offene Position suchen — Richtung MUSS zur Pine-side passen
@@ -7436,10 +7540,9 @@ def start_webhook_server():
                     cur_size = float(pos.get("total", 0) or 0)
                     break
             if cur_size == 0:
-                # Pine sendet Pivot für jedes Symbol — hier ignorieren wir alles
-                # ohne passende offene Position (Watchlist-Rauschen).
-                # v4.31: Drop-Marker im Log für Forensik
-                log(f"  ⏭ SLING_SL ignoriert: keine matching Position ({symbol} {direction.upper()})")
+                # Pine sendet Pivot für jedes Symbol — Watchlist-Rauschen.
+                # v4.35: Drop-Counter (Lärm-Reduktion, vorher Per-Drop-Log)
+                _track_watchlist_drop("keine matching Position", symbol, "SLING_SL", direction)
                 return  # ignored: no matching position
 
             set_sl_sling(symbol, direction, pivot_price,
@@ -7778,7 +7881,7 @@ def start_webhook_server():
     @app.route("/", methods=["GET"])
     @app.route("/health", methods=["GET"])
     def health():
-        return jsonify({"status": "running", "version": "v4.34"}), 200
+        return jsonify({"status": "running", "version": "v4.35"}), 200
 
     port = _env_int("PORT", 8080)
     # WICHTIG: Token NICHT ins Log schreiben — er landet sonst in Railway-Logs.
@@ -8509,24 +8612,25 @@ def check_and_repair_position(pos: dict):
             reasons.append("TP4 Full-Close fehlt")
         log(f"  ⚠ TPs inkorrekt ({'; '.join(reasons)}) → neu setzen")
 
-        if size < 4:
-            log(f"  ⚠ Position zu klein (Qty={size}, min. 4) — TPs manuell setzen")
-        else:
-            cancel_all_tp_orders(symbol)
-            time.sleep(1)
-            count, tp_prices = place_tp_orders(
-                symbol, avg, size, direction, leverage, mark, known_sl=sl_price
+        # v4.35: Versuche TP-Setzen auch bei Qty<4 — place_tp_orders carry-forward
+        # + TP4 (Full-Close) reichen oft auch bei kleinen Positionen.
+        cancel_all_tp_orders(symbol)
+        time.sleep(1)
+        count, tp_prices = place_tp_orders(
+            symbol, avg, size, direction, leverage, mark, known_sl=sl_price
+        )
+        if count == 0 and size < 4:
+            log(f"  ⚠ Position zu klein (Qty={size}, min. 4) — kein TP setzbar")
+        status = "✓ Alle" if count == len(state["tps_remaining"]) else f"⚠ {count}"
+        log(f"  {status} TPs gesetzt")
+        if count > 0:
+            telegram(
+                f"🔧 <b>TPs repariert — {symbol}</b>\n"
+                f"Script-Start: TPs fehlend/falsch\n"
+                f"Verbleibende TPs: "
+                f"{', '.join(t['label'] for t in state['tps_remaining'])}\n"
+                + "\n".join(tp_prices)
             )
-            status = "✓ Alle" if count == len(state["tps_remaining"]) else f"⚠ {count}"
-            log(f"  {status} TPs gesetzt")
-            if count > 0:
-                telegram(
-                    f"🔧 <b>TPs repariert — {symbol}</b>\n"
-                    f"Script-Start: TPs fehlend/falsch\n"
-                    f"Verbleibende TPs: "
-                    f"{', '.join(t['label'] for t in state['tps_remaining'])}\n"
-                    + "\n".join(tp_prices)
-                )
     else:
         log(f"  ✓ TPs korrekt")
 
@@ -8692,7 +8796,7 @@ def main():
         log("In Railway → Variables eintragen.")
         return
 
-    log("DOMINUS Trade-Automatisierung v4.34 gestartet — mit finanzmathematischen Optimierungen")
+    log("DOMINUS Trade-Automatisierung v4.35 gestartet — mit finanzmathematischen Optimierungen")
     log(f"Intervall: {POLL_INTERVAL}s")
     log("Warte auf neue Trades...")
     log("─" * 55)
