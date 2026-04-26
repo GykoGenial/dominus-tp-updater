@@ -1,5 +1,5 @@
 """
-DOMINUS Trade-Automatisierung v4.35
+DOMINUS Trade-Automatisierung v4.35.1
 ══════════════════════════════════════════════════════════════
 Vollautomatisches Setup nach DOMINUS-Strategie (Handbuch März 2026)
 Finanzmathematische Optimierungen:
@@ -14,6 +14,36 @@ Finanzmathematische Optimierungen:
   ⑨ Queue-Tracking    — entry_queue_log.csv + R-Multiple-Outcome (v4.20)
   ⑩ Klick-UX          — Button-Driven Rangliste mit adaptivem Keyboard (v4.25)
   ⑪ One-Click-Exec    — 🚀 Trade jetzt Button mit Two-Tap-Confirm (v4.28)
+  ⑫ Inline-Berechnung — 🚀 1. Tap zeigt volle /trade-Vorschau (v4.35.1)
+
+Changelog v4.35.1 — UX: 🚀 1. Tap zeigt volle /trade-Berechnung:
+  U1: Erster Tap auf 🚀 Trade jetzt postet zusätzlich die komplette
+      cmd_trade()-Vorschau als Chat-Message (Margin/Kelly/DCAs/TPs/R:R/
+      Warnungen). Vor v4.35.1 zeigte das Confirm-Alert nur Symbol +
+      Hebel + Entry + SL — Felix musste vorher 🎯 Berechnen separat
+      tippen, um Margin und Kelly-Werte zu sehen. Jetzt ein Schritt
+      weniger im Workflow. cmd_trade() ist in try/except gekapselt
+      damit ein Vorschau-Fehler den Trade-Flow nie blockiert.
+      Confirm-Alert vereinfacht auf "⚠️ Berechnung oben prüfen.
+      Nochmals 🚀 zur Bestätigung — läuft in Ns ab." Two-Tap-Schutz
+      bleibt unverändert (gleicher payload_sig, gleiche TTL).
+      🎯 Berechnen-Button bleibt parallel als Backup für reine
+      Vorschau ohne Trade-Absicht erhalten.
+  U2: iOS-Optimierung Telegram-Bubble-Breite. Trennlinie in der
+      DOMINUS-Entry-Rangliste (Zeile 4673) von 38 auf 24 Em-Dashes
+      gekürzt — vorher überspannte sie auf iPhone-Telegram die
+      sichtbare Bubble. Inline-Button-Divider "Weitere Signale"
+      verkürzt von "━━━━━ Weitere Signale ━━━━━" (27 Zeichen) auf
+      "━ Weitere Signale ━" (19 Zeichen) damit der Button auf
+      iPhone-Breite nicht überstreckt wirkt. Bullet-Padding (Score-
+      Spalte rechtsbündig) bewusst unverändert — würde sonst die
+      Punkte-Ausrichtung brechen, die in v4.25 explizit gewollt war.
+  U3: Long/Short-Emoji auf den Coin-Buttons in der Rangliste.
+      _coin_button_label() prepended jetzt 🟢 (long) bzw. 🔴 (short)
+      vor das Stern/Pfeil-Prefix, sodass Felix beim Scrollen sofort
+      die Trade-Richtung sieht — ohne den Button erst tippen oder
+      die Karte öffnen zu müssen. Fallback ⚪ falls direction leer.
+      Format z.B. "🟢⭐1 AVAX 82" / "🔴 2 OP 78" / "🟢▾ AVAX 82".
 
 Changelog v4.35 — DCA Auto-Void Bug-Fix + Lärm-Reduktion + Forensik:
   D1: BUG-FIX _void_passed_dcas() — falsche Bitget-API.
@@ -4655,7 +4685,8 @@ def format_slot_detail(state: dict, symbol: str) -> str:
     for w in (s.get("warnings") or []):
         lines.append(f"⚠️ {html.escape(str(w))}")
 
-    lines.append("──────────────────────────────────────")
+    # v4.35.1: Trennlinie auf iOS-Telegram-Breite gekürzt (38 → 24 Zeichen)
+    lines.append("────────────────────────")
     lines.append(f"<b>Score{'':<27}{score:>5}</b>")
 
     # Premium-Hinweis aus Extreme-Info
@@ -4732,18 +4763,28 @@ def _encode_exec_payload(entry: dict) -> str:
 
 
 def _coin_button_label(idx: int, entry: dict, is_open: bool) -> str:
-    """Kompakter Button-Label: '⭐1 AVAX 82' / '▾ AVAX 82' (aktiv)."""
+    """Kompakter Button-Label mit Long/Short-Indikator.
+
+    Format: '🟢⭐1 AVAX 82' (Long Premium) / '🔴 2 OP 78' (Short normal)
+            '🟢▾ AVAX 82' (offen Long, aktiv aufgeklappt)
+    v4.35.1: Direction-Emoji 🟢=Long / 🔴=Short als erstes Zeichen
+             damit Felix beim Scrollen sofort sieht, in welche
+             Richtung der Setup geht — ohne den Button erst öffnen
+             zu müssen.
+    """
     s  = entry.get("_scored") or {}
     sc = int(s.get("score", 0))
     sym_short = entry.get("symbol", "").replace("USDT", "")
+    direction = (entry.get("direction") or "").lower()
+    dir_emoji = "🟢" if direction == "long" else ("🔴" if direction == "short" else "⚪")
     prefix = "▾" if is_open else ("⭐" if s.get("is_premium") else "")
     # Rang-Nr nur wenn nicht offen (der aufgeklappte Coin zeigt ▾)
     if is_open:
-        return f"{prefix} {sym_short} {sc}"
-    # Kompakt: "⭐1 AVAX 82" / "2 OP 78"
+        return f"{dir_emoji}{prefix} {sym_short} {sc}"
+    # Kompakt: "🟢⭐1 AVAX 82" / "🔴 2 OP 78"
     if prefix:
-        return f"{prefix}{idx} {sym_short} {sc}"
-    return f"{idx} {sym_short} {sc}"
+        return f"{dir_emoji}{prefix}{idx} {sym_short} {sc}"
+    return f"{dir_emoji} {idx} {sym_short} {sc}"
 
 
 def build_slot_keyboard(state: dict, open_symbol: str = None,
@@ -4803,7 +4844,7 @@ def build_slot_keyboard(state: dict, open_symbol: str = None,
             ])
             # Reihe 5: Divider (noop)
             rows.append([
-                {"text": "━━━━━ Weitere Signale ━━━━━",
+                {"text": "━ Weitere Signale ━",
                  "callback_data": "noop"},
             ])
 
@@ -4924,16 +4965,25 @@ def handle_callback_query(update: dict) -> None:
         confirmed   = _exec_confirm_check_and_consume(msg_id, payload_sig)
 
         if not confirmed:
+            # v4.35.1 — Erster Tap zeigt zusätzlich die volle /trade-
+            # Berechnung als Chat-Message (Margin, Kelly, DCAs, TPs, R:R,
+            # Warnungen). Felix muss nicht mehr 🎯 Berechnen separat tippen.
+            try:
+                cmd_trade(["/trade", sym, dr.upper(), str(lev),
+                           str(entry_px), str(sl_px)])
+            except Exception as ex:
+                log(f"[exec] cmd_trade-Vorschau fehlgeschlagen "
+                    f"(Trade-Flow nicht beeinträchtigt): {ex}")
             # Erster Tap — State gesetzt, Alert anzeigen
             telegram_answer_callback(
                 callback_id,
-                f"⚠️ TRADE AUSFÜHREN? {sym} {dr.upper()} {lev}x\n"
-                f"Entry {entry_px} | SL {sl_px}\n"
-                f"Nochmals tippen zur Bestätigung — "
+                f"⚠️ Berechnung oben prüfen.\n"
+                f"Nochmals 🚀 zur Bestätigung — "
                 f"läuft in {AUTO_TRADE_CONFIRM_TTL_SEC}s ab.",
                 show_alert=True,
             )
-            log(f"[exec] First-Tap {payload_sig} — wartet auf Confirm")
+            log(f"[exec] First-Tap {payload_sig} — Berechnung gepostet, "
+                f"wartet auf Confirm")
             return
 
         # Zweiter Tap innerhalb TTL — ausführen
@@ -7881,7 +7931,7 @@ def start_webhook_server():
     @app.route("/", methods=["GET"])
     @app.route("/health", methods=["GET"])
     def health():
-        return jsonify({"status": "running", "version": "v4.35"}), 200
+        return jsonify({"status": "running", "version": "v4.35.1"}), 200
 
     port = _env_int("PORT", 8080)
     # WICHTIG: Token NICHT ins Log schreiben — er landet sonst in Railway-Logs.
@@ -8796,7 +8846,7 @@ def main():
         log("In Railway → Variables eintragen.")
         return
 
-    log("DOMINUS Trade-Automatisierung v4.35 gestartet — mit finanzmathematischen Optimierungen")
+    log("DOMINUS Trade-Automatisierung v4.35.1 gestartet — mit finanzmathematischen Optimierungen")
     log(f"Intervall: {POLL_INTERVAL}s")
     log("Warte auf neue Trades...")
     log("─" * 55)
