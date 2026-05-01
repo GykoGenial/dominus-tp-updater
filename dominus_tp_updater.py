@@ -757,6 +757,7 @@ POLL_INTERVAL = 20    # Sekunden zwischen Checks
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 WEBHOOK_SECRET   = os.environ.get("WEBHOOK_SECRET", "dominus")  # Token für TradingView
+DEMO_WEBHOOK_URL = os.environ.get("DEMO_WEBHOOK_URL", "")  # Demo-Bot Weiterleitungs-URL
 WEBHOOK_URL      = os.environ.get("WEBHOOK_URL", "")  # optional: vollständige Railway-URL inkl. ?token=… für /alarm-Vorlagen
 DOCS_URL           = os.environ.get("DOCS_URL", "https://GykoGenial.github.io/dominus-tp-updater/Dominus_Alarm_Templates.html")
 GOOGLE_CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS", "")  # Service Account JSON als String
@@ -1270,6 +1271,17 @@ def csv_log_trade(trade: dict):
             log(f"[CSV] Log-Fehler: {e}")
 
     threading.Thread(target=_write, daemon=True).start()
+
+
+def forward_to_demo(payload: dict) -> None:
+    """Leitet Webhook-Signal an Demo-Bot weiter falls DEMO_WEBHOOK_URL gesetzt."""
+    if not DEMO_WEBHOOK_URL:
+        return
+    try:
+        requests.post(DEMO_WEBHOOK_URL, json=payload, timeout=5)
+        log(f"  → Demo-Bot: {payload.get('symbol','?')} {payload.get('signal','?')}")
+    except Exception as e:
+        log(f"  ⚠ Demo-Weiterleitung: {e}")
 
 
 def telegram(msg: str, reply_markup: dict = None, return_id: bool = False):
@@ -7736,6 +7748,24 @@ def start_webhook_server():
                 save_state()
             return  # ok: HARSI_EXIT handled
 
+        # ── LIQ_WARNING → Telegram + Demo weiterleiten ─────────
+        if signal_type == "LIQ_WARNING":
+            liq_tp   = int(float(data.get("liq_tp",   4) or 4))
+            liq_pool = float(data.get("liq_pool", 0) or 0)
+            dir_raw  = int(float(data.get("direction", 0) or 0))
+            d_txt    = "LONG" if dir_raw == 1 else "SHORT" if dir_raw == -1 else "?"
+            tp_emoji = "🔴" if liq_tp == 1 else "🟠" if liq_tp == 2 else "🟡" if liq_tp == 3 else "🟢"
+            log(f"  LIQ_WARNING: {symbol} {d_txt} Pool bei TP{liq_tp}")
+            telegram(
+                f"{tp_emoji} <b>Liquidity Warning \u2014 {symbol}</b>\n"
+                f"Richtung: {d_txt} | Kurs: {entry}\n\n"
+                + (f"Pool bei TP{liq_tp}: {liq_pool:.5f} USDT\n"
+                   f"\u26a0\ufe0f TP-Ziel anpassen!" if liq_tp < 4 else
+                   f"\u2713 Kein Pool \u2014 TP4 halten")
+            )
+            forward_to_demo(data)
+            return
+
         # H4 Trigger → gepuffert, nach 5 Min gebündelt senden
         if timeframe == "H4" or signal_type == "H4_TRIGGER":
             with h4_buffer_lock:
@@ -7945,6 +7975,7 @@ def start_webhook_server():
         # ist obsolet: Pine v2.4.2 feuert HARSI_EXIT intrabar, der Watchlist-Master-
         # Alarm ("Any alert() function call") fängt ihn automatisch ab und Railway
         # leitet ihn in die Entry-Queue. Kein User-Action nötig.
+        forward_to_demo(data)  # Demo-Bot empfaengt dasselbe Signal
         return  # ok: H2_SIGNAL processed
 
     @app.route("/", methods=["GET"])
