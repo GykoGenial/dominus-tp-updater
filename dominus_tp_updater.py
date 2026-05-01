@@ -4010,7 +4010,7 @@ def cmd_berechnen():
             sym  = pos.get("symbol", "?")
             qty  = float(pos.get("total", 0))
             avg  = float(pos.get("openPriceAvg", 0))
-            lev  = (int(trade_data.get(symbol, {}).get("leverage", 0)) or int(float(pos.get("leverage", 10))))
+            lev  = (int(trade_data.get(sym, {}).get("leverage", 0)) or int(float(pos.get("leverage", 10))))
             drct = pos.get("holdSide", "?").upper()
             pnl  = float(pos.get("unrealizedPL", 0))
 
@@ -6396,7 +6396,7 @@ def cmd_status():
         sym      = pos.get("symbol", "?")
         qty      = float(pos.get("total", 0))
         drct     = pos.get("holdSide", "?").upper()
-        lev      = (int(trade_data.get(symbol, {}).get("leverage", 0)) or int(float(pos.get("leverage", 10))))
+        lev      = (int(trade_data.get(sym, {}).get("leverage", 0)) or int(float(pos.get("leverage", 10))))
         pnl      = float(pos.get("unrealizedPL", 0))
         mark     = get_mark_price(sym)
         # v4.31: Trailing-Level aus IST-SL auf Bitget ableiten (heilt State
@@ -6475,7 +6475,7 @@ def cmd_refresh(parts: list):
     for pos in positions_to_check:
         sym      = pos.get("symbol", "?")
         drct     = pos.get("holdSide", "?").upper()
-        lev      = (int(trade_data.get(symbol, {}).get("leverage", 0)) or int(float(pos.get("leverage", 10))))
+        lev      = (int(trade_data.get(sym, {}).get("leverage", 0)) or int(float(pos.get("leverage", 10))))
         avg      = float(pos.get("openPriceAvg", 0))
         qty      = float(pos.get("total", 0))
         mark     = get_mark_price(sym)
@@ -6614,7 +6614,7 @@ def build_daily_report(date_str: str = None) -> str:
         for pos in open_positions:
             sym  = pos.get("symbol", "?")
             drct = pos.get("holdSide", "?").upper()
-            lev  = (int(trade_data.get(symbol, {}).get("leverage", 0)) or int(float(pos.get("leverage", 10))))
+            lev  = (int(trade_data.get(sym, {}).get("leverage", 0)) or int(float(pos.get("leverage", 10))))
             pnl  = float(pos.get("unrealizedPL", 0))
             # v4.31: IST-SL live abfragen statt Dict blind zu glauben
             _avg = float(pos.get("openPriceAvg", 0) or 0)
