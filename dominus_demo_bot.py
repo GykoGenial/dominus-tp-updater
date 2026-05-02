@@ -2338,18 +2338,67 @@ def _save_demo_trade(symbol: str, td: dict, pnl_data: dict):
     except Exception:
         trades = []
 
+    import datetime as _dt
+    now = _dt.datetime.now()
+    entry_price = float(td.get("entry", 0) or 0)
+    sl_price    = float(td.get("sl", 0) or 0)
+    lev         = int(td.get("leverage", 10) or 10)
+    sl_dist_pct = abs(entry_price - sl_price) / entry_price * 100 if entry_price else 0
+
+    # Score aus trade_data lesen (wurde beim Entry-Queue gespeichert)
+    score_data  = td.get("score_data") or {}
+    score       = int(score_data.get("score", 0))
+    is_premium  = bool(score_data.get("is_premium", False))
+    breakdown   = score_data.get("breakdown", [])
+    score_range = (
+        "A 75-100" if score >= 75 else
+        "B 50-74"  if score >= 50 else
+        "C 25-49"  if score >= 25 else
+        "D 0-24"
+    )
+
+    net_pnl    = float(pnl_data.get("net_pnl", 0) or 0)
+    tp_closes  = pnl_data.get("tp_closes", []) or []
+    num_closes = int(pnl_data.get("num_closes", 0) or 0)
+
+    # TP-Hit Analyse
+    tp1_hit = num_closes >= 2
+    tp2_hit = num_closes >= 3
+    tp3_hit = num_closes >= 4
+    tp4_hit = num_closes >= 4 and net_pnl > 0
+
     trades.append({
-        "symbol":    symbol,
-        "direction": td.get("direction", "?"),
-        "leverage":  td.get("leverage", 10),
-        "entry":     td.get("entry", 0),
-        "sl":        td.get("sl", 0),
-        "open_dt":   td.get("open_dt", ""),
-        "close_dt":  __import__("datetime").datetime.now().isoformat(),
-        "net_pnl":   pnl_data.get("net_pnl", 0),
-        "realized":  pnl_data.get("realized_pnl", 0),
-        "fee":       pnl_data.get("fee", 0),
-        "closes":    pnl_data.get("num_closes", 0),
+        # Identifikation
+        "symbol":      symbol,
+        "direction":   td.get("direction", "?"),
+        "leverage":    lev,
+        "entry":       entry_price,
+        "sl":          sl_price,
+        "sl_dist_pct": round(sl_dist_pct, 3),
+        # Zeitstempel
+        "open_dt":     td.get("open_dt", ""),
+        "close_dt":    now.isoformat(),
+        "weekday":     now.strftime("%A"),  # Monday, Tuesday, ...
+        "hour":        now.hour,
+        # P&L
+        "net_pnl":     round(net_pnl, 4),
+        "realized":    round(float(pnl_data.get("realized_pnl", 0) or 0), 4),
+        "fee":         round(float(pnl_data.get("fee", 0) or 0), 4),
+        "won":         net_pnl > 0,
+        # TP-Analyse
+        "num_closes":  num_closes,
+        "tp1_hit":     tp1_hit,
+        "tp2_hit":     tp2_hit,
+        "tp3_hit":     tp3_hit,
+        "tp4_hit":     tp4_hit,
+        # Score
+        "score":       score,
+        "score_range": score_range,
+        "is_premium":  is_premium,
+        "score_breakdown": breakdown,
+        # DCA
+        "peak_size":   float(td.get("peak_size", 0) or 0),
+        "dca_used":    float(td.get("peak_size", 0) or 0) > float(td.get("init_size", 0) or 0),
     })
 
     try:
@@ -3752,17 +3801,29 @@ def setup_new_trade(pos: dict):
     # v4.12: Sling-SL + DCA Auto-Void für neuen Trade zurücksetzen
     sling_sl.pop(symbol, None)
     dca_void.pop(symbol, None)
-    # Trade-Daten für spätere Auswertung
+    # Trade-Daten für spätere Auswertung inkl. Score
+    _sugg_for_score = build_trade_suggestion(symbol, direction, entry, sl_price, None)
+    _score_data = score_entry({
+        "symbol":             symbol,
+        "direction":          direction,
+        "sugg":               _sugg_for_score,
+        "harsi_warn":         0,
+        "timing_elapsed_min": 0,
+        "xinfo":              {},
+    }) if _sugg_for_score else {}
+
     trade_data[symbol] = {
         "entry":      entry,
         "direction":  direction,
         "leverage":   leverage,
         "sl":         sl_price,
         "peak_size":  size,
+        "init_size":  size,
         "open_ts":    int(time.time() * 1000),
         "open_dt":    __import__("datetime").datetime.now().isoformat(),
         "symbol":     symbol,
         "demo":       DEMO_MODE,
+        "score_data": _score_data,
     }
 
     # ── 6. Telegram-Zusammenfassung ─────────────────────────
@@ -7246,6 +7307,201 @@ def flush_h4_buffer():
     log(f"H4-Zusammenfassung gesendet: {len(longs)} Long, {len(shorts)} Short")
 
 
+def _build_dashboard_html(trades_json: str) -> str:
+    """Rendert das Performance Dashboard als HTML-String."""
+    return f"""<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DOMINUS Demo Performance</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Fraunces:ital,wght@0,300;0,700;1,300&display=swap');
+:root{{
+  --bg:#0a0c0e;--bg2:#111417;--bg3:#181c20;--border:#252a2f;
+  --text:#e8e4dc;--muted:#6b7280;--green:#2ecc71;--red:#e74c3c;
+  --amber:#f39c12;--blue:#3498db;--accent:#c9a84c;
+  --font:'Fraunces',serif;--mono:'DM Mono',monospace;
+}}
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{background:var(--bg);color:var(--text);font-family:var(--font);min-height:100vh}}
+.header{{padding:2.5rem 3rem 2rem;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:flex-end}}
+.logo{{font-size:1.8rem;font-weight:700;color:var(--accent);letter-spacing:-.02em}}
+.logo span{{color:var(--muted);font-weight:300;font-size:1rem;display:block;letter-spacing:.1em;font-family:var(--mono);margin-top:.2rem}}
+.refresh{{font-family:var(--mono);font-size:11px;color:var(--muted);cursor:pointer;border:1px solid var(--border);padding:.4rem .8rem;border-radius:4px;background:transparent;color:var(--muted)}}
+.refresh:hover{{border-color:var(--accent);color:var(--accent)}}
+.main{{padding:2rem 3rem;max-width:1400px}}
+.kpi-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:1rem;margin-bottom:2rem}}
+.kpi{{background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:1.25rem 1.5rem}}
+.kpi-label{{font-family:var(--mono);font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin-bottom:.5rem}}
+.kpi-value{{font-size:2rem;font-weight:700;line-height:1}}
+.kpi-sub{{font-family:var(--mono);font-size:11px;color:var(--muted);margin-top:.3rem}}
+.green{{color:var(--green)}}.red{{color:var(--red)}}.amber{{color:var(--amber)}}.blue{{color:var(--blue)}}
+.section{{margin-bottom:2.5rem}}
+.section-title{{font-family:var(--mono);font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);border-bottom:1px solid var(--border);padding-bottom:.6rem;margin-bottom:1.2rem}}
+.score-grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:1rem}}
+.score-card{{background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:1.2rem}}
+.score-badge{{font-family:var(--mono);font-size:20px;font-weight:500;margin-bottom:.4rem}}
+.score-label{{font-size:.8rem;color:var(--muted);margin-bottom:.6rem}}
+.score-bar{{height:4px;border-radius:2px;background:var(--border);margin-bottom:.6rem;overflow:hidden}}
+.score-fill{{height:100%;border-radius:2px}}
+.score-stats{{font-family:var(--mono);font-size:11px;color:var(--muted)}}
+.table-wrap{{background:var(--bg2);border:1px solid var(--border);border-radius:8px;overflow:hidden}}
+table{{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:12px}}
+th{{padding:.8rem 1rem;text-align:left;border-bottom:1px solid var(--border);color:var(--muted);font-weight:500;font-size:10px;letter-spacing:.08em;text-transform:uppercase}}
+td{{padding:.7rem 1rem;border-bottom:1px solid var(--border)}}
+tr:last-child td{{border-bottom:none}}
+tr:hover td{{background:var(--bg3)}}
+.pill{{display:inline-block;padding:.15rem .5rem;border-radius:3px;font-size:10px;font-weight:500}}
+.pill-green{{background:rgba(46,204,113,.15);color:var(--green)}}
+.pill-red{{background:rgba(231,76,60,.15);color:var(--red)}}
+.pill-amber{{background:rgba(243,156,18,.15);color:var(--amber)}}
+.pill-blue{{background:rgba(52,152,219,.15);color:var(--blue)}}
+.bar-row{{display:grid;grid-template-columns:100px 1fr 60px;gap:.5rem;align-items:center;padding:.4rem 0}}
+.bar-bg{{background:var(--border);border-radius:2px;height:8px;overflow:hidden}}
+.bar-val{{height:100%;border-radius:2px;background:var(--green)}}
+.empty{{padding:3rem;text-align:center;color:var(--muted);font-style:italic}}
+</style>
+</head>
+<body>
+<div class="header">
+  <div>
+    <div class="logo">DOMINUS <span>DEMO PERFORMANCE DASHBOARD</span></div>
+  </div>
+  <button class="refresh" onclick="location.reload()">↻ Aktualisieren</button>
+</div>
+<div class="main">
+  <div id="content"><div class="empty">Lade Daten...</div></div>
+</div>
+<script>
+const RAW = {trades_json};
+
+function fmt(n, d=2) {{ return n == null ? '—' : n.toFixed(d); }}
+function pct(n) {{ return n == null ? '—' : (n*100).toFixed(1)+'%'; }}
+function pill(txt, cls) {{ return `<span class="pill pill-${{cls}}">${{txt}}</span>`; }}
+
+function render(trades) {{
+  if (!trades.length) {{
+    document.getElementById('content').innerHTML = '<div class="empty">Noch keine Demo-Trades gespeichert.<br>Warte auf das erste Signal.</div>';
+    return;
+  }}
+
+  const wins   = trades.filter(t => t.won);
+  const losses = trades.filter(t => !t.won);
+  const wr     = wins.length / trades.length;
+  const totalPnl = trades.reduce((s,t) => s + (t.net_pnl||0), 0);
+  const avgWin   = wins.length   ? wins.reduce((s,t)=>s+(t.net_pnl||0),0)/wins.length : 0;
+  const avgLoss  = losses.length ? losses.reduce((s,t)=>s+(t.net_pnl||0),0)/losses.length : 0;
+  const tp1Rate  = trades.filter(t=>t.tp1_hit).length/trades.length;
+  const tp4Rate  = trades.filter(t=>t.tp4_hit).length/trades.length;
+  const premTrades = trades.filter(t=>t.is_premium);
+  const premWr   = premTrades.length ? premTrades.filter(t=>t.won).length/premTrades.length : null;
+
+  // Score Buckets
+  const buckets = {{'A 75-100':[],'B 50-74':[],'C 25-49':[],'D 0-24':[]}};
+  trades.forEach(t => {{ if (t.score_range && buckets[t.score_range]) buckets[t.score_range].push(t); }});
+
+  // Wochentag Winrate
+  const days = {{}};
+  trades.forEach(t => {{
+    if (!t.weekday) return;
+    if (!days[t.weekday]) days[t.weekday] = {{wins:0,total:0}};
+    days[t.weekday].total++;
+    if (t.won) days[t.weekday].wins++;
+  }});
+
+  let html = '';
+
+  // KPIs
+  html += `<div class="kpi-grid section">
+    <div class="kpi"><div class="kpi-label">Trades Total</div><div class="kpi-value">${{trades.length}}</div></div>
+    <div class="kpi"><div class="kpi-label">Winrate</div><div class="kpi-value ${{wr>=0.55?'green':wr>=0.45?'amber':'red'}}">${{pct(wr)}}</div><div class="kpi-sub">${{wins.length}}W / ${{losses.length}}L</div></div>
+    <div class="kpi"><div class="kpi-label">Net P&L</div><div class="kpi-value ${{totalPnl>=0?'green':'red'}}">${{totalPnl>=0?'+':''}}${{fmt(totalPnl)}} USDT</div></div>
+    <div class="kpi"><div class="kpi-label">Ø Gewinn</div><div class="kpi-value green">+${{fmt(avgWin)}}</div></div>
+    <div class="kpi"><div class="kpi-label">Ø Verlust</div><div class="kpi-value red">${{fmt(avgLoss)}}</div></div>
+    <div class="kpi"><div class="kpi-label">TP1 Hit-Rate</div><div class="kpi-value blue">${{pct(tp1Rate)}}</div></div>
+    <div class="kpi"><div class="kpi-label">TP4 Hit-Rate</div><div class="kpi-value amber">${{pct(tp4Rate)}}</div></div>
+    <div class="kpi"><div class="kpi-label">Premium WR</div><div class="kpi-value ${{premWr!=null?(premWr>=0.6?'green':'amber'):''}}">${{premWr!=null?pct(premWr):'n/a'}}</div><div class="kpi-sub">${{premTrades.length}} Trades</div></div>
+  </div>`;
+
+  // Score-Analyse
+  html += `<div class="section"><div class="section-title">Score-Analyse — Welcher Score-Bereich ist profitabelsten?</div>
+  <div class="score-grid">`;
+  const bucketColors = {{'A 75-100':'#2ecc71','B 50-74':'#3498db','C 25-49':'#f39c12','D 0-24':'#e74c3c'}};
+  Object.entries(buckets).forEach(([range, ts]) => {{
+    if (!ts.length) {{
+      html += `<div class="score-card"><div class="score-badge" style="color:${{bucketColors[range]}}">${{range}}</div><div class="score-stats">Keine Trades</div></div>`;
+      return;
+    }}
+    const bWr  = ts.filter(t=>t.won).length/ts.length;
+    const bPnl = ts.reduce((s,t)=>s+(t.net_pnl||0),0);
+    const bAvg = bPnl/ts.length;
+    html += `<div class="score-card">
+      <div class="score-badge" style="color:${{bucketColors[range]}}">${{range}}</div>
+      <div class="score-label">${{ts.length}} Trades</div>
+      <div class="score-bar"><div class="score-fill" style="width:${{bWr*100}}%;background:${{bucketColors[range]}}"></div></div>
+      <div class="score-stats">
+        WR: ${{pct(bWr)}} &nbsp;|&nbsp; Ø P&L: ${{bAvg>=0?'+':''}}${{fmt(bAvg)}} USDT<br>
+        Net: ${{bPnl>=0?'+':''}}${{fmt(bPnl)}} USDT
+      </div>
+    </div>`;
+  }});
+  html += `</div></div>`;
+
+  // Wochentag Analyse
+  const dayOrder = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'];
+  const dayDE    = {{'Monday':'Mo','Tuesday':'Di','Wednesday':'Mi','Thursday':'Do','Friday':'Fr','Saturday':'Sa','Sunday':'So'}};
+  html += `<div class="section"><div class="section-title">Winrate nach Wochentag</div>`;
+  dayOrder.forEach(d => {{
+    if (!days[d]) return;
+    const dwr = days[d].wins/days[d].total;
+    html += `<div class="bar-row">
+      <span style="font-family:var(--mono);font-size:12px;color:var(--muted)">${{dayDE[d]}} (${{days[d].total}}T)</span>
+      <div class="bar-bg"><div class="bar-val" style="width:${{dwr*100}}%;background:${{dwr>=0.55?'var(--green)':dwr>=0.45?'var(--amber)':'var(--red)'}}"></div></div>
+      <span style="font-family:var(--mono);font-size:12px;color:${{dwr>=0.55?'var(--green)':dwr>=0.45?'var(--amber)':'var(--red)'}}">${{pct(dwr)}}</span>
+    </div>`;
+  }});
+  html += `</div>`;
+
+  // Letzte Trades
+  const recent = [...trades].reverse().slice(0, 30);
+  html += `<div class="section"><div class="section-title">Letzte Trades (max. 30)</div>
+  <div class="table-wrap"><table>
+  <thead><tr>
+    <th>Datum</th><th>Symbol</th><th>Dir</th><th>Score</th><th>Premium</th>
+    <th>Hebel</th><th>SL%</th><th>TP1</th><th>TP4</th><th>Net P&L</th><th>Ergebnis</th>
+  </tr></thead><tbody>`;
+
+  recent.forEach(t => {{
+    const d = t.close_dt ? t.close_dt.substring(0,10) : '—';
+    const scoreRange = t.score_range || '—';
+    const scoreColor = {{'A 75-100':'green','B 50-74':'blue','C 25-49':'amber','D 0-24':'red'}}[scoreRange] || '';
+    html += `<tr>
+      <td style="color:var(--muted)">${{d}}</td>
+      <td style="font-weight:600">${{t.symbol||'—'}}</td>
+      <td>${{t.direction==='long'?pill('LONG','green'):pill('SHORT','red')}}</td>
+      <td>${{pill(scoreRange, scoreColor)}}</td>
+      <td>${{t.is_premium?pill('✓ Premium','amber'):'—'}}</td>
+      <td style="color:var(--muted)">${{t.leverage||'—'}}x</td>
+      <td style="color:var(--muted)">${{fmt(t.sl_dist_pct,2)}}%</td>
+      <td>${{t.tp1_hit?'✓':'—'}}</td>
+      <td>${{t.tp4_hit?'✓':'—'}}</td>
+      <td class="${{(t.net_pnl||0)>=0?'green':'red'}}">${{(t.net_pnl||0)>=0?'+':''}}${{fmt(t.net_pnl)}} USDT</td>
+      <td>${{t.won?pill('Gewinn','green'):pill('Verlust','red')}}</td>
+    </tr>`;
+  }});
+  html += `</tbody></table></div></div>`;
+
+  document.getElementById('content').innerHTML = html;
+}}
+
+render(RAW);
+</script>
+</body>
+</html>"""
+
+
+
 def start_webhook_server():
     """
     Startet einen Flask HTTP-Server in einem separaten Thread.
@@ -8011,6 +8267,21 @@ def start_webhook_server():
     @app.route("/health", methods=["GET"])
     def health():
         return jsonify({"status": "running", "version": "v4.35.1"}), 200
+
+    @app.route("/dashboard", methods=["GET"])
+    def dashboard():
+        """Performance Dashboard — liest demo_trades.json live."""
+        import json as _j, os as _os
+        from flask import Response
+        fname = "demo_trades.json"
+        trades = []
+        if _os.path.exists(fname):
+            try:
+                with open(fname) as f:
+                    trades = _j.load(f)
+            except Exception:
+                trades = []
+        return Response(_build_dashboard_html(_j.dumps(trades)), mimetype="text/html")
 
     port = _env_int("PORT", 8080)
     # WICHTIG: Token NICHT ins Log schreiben — er landet sonst in Railway-Logs.
