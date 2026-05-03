@@ -802,36 +802,6 @@ DCA2_MULTIPLIER = 2.5   # DCA2 = 2.5× Initial
 
 POLL_INTERVAL = 20    # Sekunden zwischen Checks
 
-# ─── v4.36: Finanzmathematische Optimierungen ────────────────────────────────
-# FIX 4: Gebührenkorrektur — Taker-Fee wird in TP-Preise eingerechnet
-# Bitget Standard: Taker 0.06%, Maker 0.02%.
-# Bei 10x Hebel: 2 × 0.06% × 10 = 1.2% Gebührenbelastung auf Kapital.
-# TP1 (10% Netto-Ziel) muss also auf 11.2% Brutto-ROI-Niveau ausgelöst werden.
-TAKER_FEE = _env_float("TAKER_FEE", 0.0006)   # 0.06% — als Railway-Variable überschreibbar
-
-# FIX 5: Funding Rate Warnschwelle
-# Warnung wenn Funding Rate negativer ist als dieser Schwellwert (für Long).
-# -0.05%/8h = ca. -0.15%/Tag = ca. -4.5% ROI auf Kapital bei 10x in 30 Tagen.
-FUNDING_WARN_THRESHOLD = _env_float("FUNDING_WARN_THRESHOLD", -0.0005)
-
-# FIX 6: TP-Ausführungstyp
-# USE_LIMIT_TP=true → Limit-Order mit Buffer statt Market (weniger Slippage).
-# LIMIT_TP_BUFFER → 0.1% unter Trigger (Long) / darüber (Short).
-# Risiko: bei sehr schnellen Moves kann Limit nicht vollständig gefüllt werden.
-_raw_ult = os.environ.get("USE_LIMIT_TP", "0").strip().lower()
-USE_LIMIT_TP   = _raw_ult in ("1", "true", "yes", "on")
-LIMIT_TP_BUFFER = _env_float("LIMIT_TP_BUFFER", 0.001)   # 0.1%
-
-# FIX 11: ClientOid-Prefix — nur eigene Orders werden storniert
-# Manuell auf Bitget gesetzte Orders ohne diesen Prefix bleiben unberührt.
-ORDER_PREFIX = os.environ.get("ORDER_PREFIX", "DOM_")
-
-# FIX 12: Lock für TP-Update-Debounce
-# Verhindert parallele Doppel-Aufrufe wenn zwei DCA-Fills gleichzeitig ankommen.
-import threading as _threading_fix
-_tp_update_lock = _threading_fix.Lock()
-# ─────────────────────────────────────────────────────────────────────────────
-
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("DEMO_TELEGRAM_CHAT_ID",
                    os.environ.get("TELEGRAM_CHAT_ID", ""))
@@ -862,6 +832,27 @@ def _env_float(name: str, default: float) -> float:
     except (ValueError, TypeError):
         print(f"[WARN] {name}='{raw}' ungültig, nutze Default {default}")
         return default
+
+# ─── v4.36: Finanzmathematische Optimierungen ────────────────────────────────
+# Alle _env_float/_env_int Aufrufe hier — nach den Funktionsdefinitionen oben.
+# FIX 4: Taker-Fee in TP-Preise einrechnen (Bitget Standard 0.06%)
+TAKER_FEE = _env_float("TAKER_FEE", 0.0006)
+
+# FIX 5: Funding Rate Warnschwelle (-0.05%/8h = ca. -4.5% ROI/Monat bei 10x)
+FUNDING_WARN_THRESHOLD = _env_float("FUNDING_WARN_THRESHOLD", -0.0005)
+
+# FIX 6: TP als Limit-Order (weniger Slippage, kein 100% Fill garantiert)
+_raw_ult = os.environ.get("USE_LIMIT_TP", "0").strip().lower()
+USE_LIMIT_TP    = _raw_ult in ("1", "true", "yes", "on")
+LIMIT_TP_BUFFER = _env_float("LIMIT_TP_BUFFER", 0.001)   # 0.1%
+
+# FIX 11: ClientOid-Prefix — nur eigene Orders stornieren
+ORDER_PREFIX = os.environ.get("ORDER_PREFIX", "DOM_")
+
+# FIX 12: Debounce-Lock für TP-Update
+import threading as _threading_fix
+_tp_update_lock = _threading_fix.Lock()
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 # Finanzmathematische Parameter
