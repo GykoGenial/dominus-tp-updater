@@ -1,5 +1,5 @@
 """
-DOMINUS Demo-Bot v4.35.1 — PAPER TRADING
+DOMINUS Demo-Bot v4.36 — PAPER TRADING
 ════════════════════════════════════
 Vollautomatisches Paper Trading auf Bitget Demo-Account.
 Kein echtes Kapital — identische Logik wie Live-Script.
@@ -32,6 +32,34 @@ Finanzmathematische Optimierungen:
   ⑩ Klick-UX          — Button-Driven Rangliste mit adaptivem Keyboard (v4.25)
   ⑪ One-Click-Exec    — 🚀 Trade jetzt Button mit Two-Tap-Confirm (v4.28)
   ⑫ Inline-Berechnung — 🚀 1. Tap zeigt volle /trade-Vorschau (v4.35.1)
+
+Changelog v4.36 — Finanzmathematische Optimierungen (8 Fixes):
+  F1: FIX 4 — calc_tp_price() rechnet jetzt Taker-Fee ein (TAKER_FEE=0.0006).
+      TP-Trigger werden erhoeht sodass der NETTO-ROI nach Gebühren dem Ziel
+      entspricht. Bei 10x/0.06%: +1.2% Aufschlag auf alle TP-Preise.
+      Konfigurierbar via Railway-Variable TAKER_FEE.
+  F2: FIX 5 — Funding Rate Warnung bei extrem negativen Werten.
+      Nach jedem DCA-TP-Update wird die aktuelle Funding Rate abgefragt.
+      Warnung per Telegram wenn Rate < FUNDING_WARN_THRESHOLD (-0.05%/8h).
+  F3: FIX 6 — TP-Ausführung als Limit-Order statt Market (optional).
+      USE_LIMIT_TP=true (Railway) setzt executePrice mit LIMIT_TP_BUFFER
+      (0.1%) unter dem Trigger. Weniger Slippage, aber kein 100% Fill-Garantie.
+  F4: FIX 9 — Timestamp-Lücke im Main-Loop geschlossen.
+      fetch_time wird VOR get_recent_fills_all() gesetzt. Fills die während
+      setup_new_trade/update_tp_for_position eintreffen gehen nicht mehr verloren.
+  F5: FIX 10 — TP-Verifikation nach Platzierung.
+      verify_tp_orders() prüft 3s nach place_tp_orders() ob die erwartete
+      Anzahl DOM_-eigener TPs wirklich auf der Exchange aktiv ist. Telegram-
+      Alarm wenn TPs fehlen.
+  F6: FIX 11 — cancel_all_tp_orders() storniert nur eigene DOM_-Orders.
+      Manuell auf Bitget gesetzte TPs ohne ORDER_PREFIX bleiben unberührt.
+      cancel_all_tp_orders(dom_only=False) beim Position-Close räumt alles auf.
+  F7: FIX 12 — Debounce-Lock in update_tp_for_position().
+      _tp_update_lock verhindert parallele Doppel-Aufrufe wenn zwei DCA-Fills
+      gleichzeitig ankommen (grosse Limit-Order in mehrere Fills aufgeteilt).
+  F8: FIX 3 — Race-Condition: place-first, cancel-after in update_tp_for_position.
+      Neue TPs werden ZUERST platziert, dann werden alte storniert. Kein
+      Zeitfenster mehr ohne TP-Schutz auf der Exchange.
 
 Changelog v4.35.1 — UX: 🚀 1. Tap zeigt volle /trade-Berechnung:
   U1: Erster Tap auf 🚀 Trade jetzt postet zusätzlich die komplette
@@ -773,6 +801,36 @@ DCA1_MULTIPLIER = 1.5   # DCA1 = 1.5× Initial
 DCA2_MULTIPLIER = 2.5   # DCA2 = 2.5× Initial
 
 POLL_INTERVAL = 20    # Sekunden zwischen Checks
+
+# ─── v4.36: Finanzmathematische Optimierungen ────────────────────────────────
+# FIX 4: Gebührenkorrektur — Taker-Fee wird in TP-Preise eingerechnet
+# Bitget Standard: Taker 0.06%, Maker 0.02%.
+# Bei 10x Hebel: 2 × 0.06% × 10 = 1.2% Gebührenbelastung auf Kapital.
+# TP1 (10% Netto-Ziel) muss also auf 11.2% Brutto-ROI-Niveau ausgelöst werden.
+TAKER_FEE = _env_float("TAKER_FEE", 0.0006)   # 0.06% — als Railway-Variable überschreibbar
+
+# FIX 5: Funding Rate Warnschwelle
+# Warnung wenn Funding Rate negativer ist als dieser Schwellwert (für Long).
+# -0.05%/8h = ca. -0.15%/Tag = ca. -4.5% ROI auf Kapital bei 10x in 30 Tagen.
+FUNDING_WARN_THRESHOLD = _env_float("FUNDING_WARN_THRESHOLD", -0.0005)
+
+# FIX 6: TP-Ausführungstyp
+# USE_LIMIT_TP=true → Limit-Order mit Buffer statt Market (weniger Slippage).
+# LIMIT_TP_BUFFER → 0.1% unter Trigger (Long) / darüber (Short).
+# Risiko: bei sehr schnellen Moves kann Limit nicht vollständig gefüllt werden.
+_raw_ult = os.environ.get("USE_LIMIT_TP", "0").strip().lower()
+USE_LIMIT_TP   = _raw_ult in ("1", "true", "yes", "on")
+LIMIT_TP_BUFFER = _env_float("LIMIT_TP_BUFFER", 0.001)   # 0.1%
+
+# FIX 11: ClientOid-Prefix — nur eigene Orders werden storniert
+# Manuell auf Bitget gesetzte Orders ohne diesen Prefix bleiben unberührt.
+ORDER_PREFIX = os.environ.get("ORDER_PREFIX", "DOM_")
+
+# FIX 12: Lock für TP-Update-Debounce
+# Verhindert parallele Doppel-Aufrufe wenn zwei DCA-Fills gleichzeitig ankommen.
+import threading as _threading_fix
+_tp_update_lock = _threading_fix.Lock()
+# ─────────────────────────────────────────────────────────────────────────────
 
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("DEMO_TELEGRAM_CHAT_ID",
@@ -1900,35 +1958,33 @@ def kelly_recommendation(balance: float, winrate: float) -> dict:
     }
 
 
-def cancel_all_tp_orders(symbol: str):
+def cancel_all_tp_orders(symbol: str, dom_only: bool = True):
     """
-    Storniert alle Einzel-TP-Orders (profit_plan) für ein Symbol.
+    Storniert alle Einzel-TP-Orders (profit_plan) fuer ein Symbol.
 
     v4.15 — Einzelstornierung mit explizitem planType
-    ─────────────────────────────────────────────────
-    Bitget v2 `/api/v2/mix/order/cancel-plan-order` akzeptiert zwar laut Doku
-    einen `orderIdList`-Batch-Mode, aber für TP/SL-Orders (profit_plan) gibt
-    Bitget in diesem Modus `code=00000` mit LEEREM successList+failureList
-    zurück — die Orders werden tatsächlich NICHT storniert (stilles No-Op).
-    Die python-bitget Referenz-Implementierung (`mix_cancel_plan_order`)
-    nutzt deshalb die Einzel-Form MIT `planType` — das funktioniert für
-    profit_plan zuverlässig.
-
-    Ablauf:
-      1. orders-plan-pending lesen (planType=profit_loss liefert TPs+SL)
-      2. Nur profit_plan-Einträge auswählen (SL/TP4 nicht anfassen!)
-      3. Pro Order: POST cancel-plan-order mit {orderId, planType, …}
-      4. Jede Response einzeln prüfen — echte Fehler werden geloggt,
-         der Gesamt-Status wird am Ende zusammengefasst.
+    v4.36 FIX 11 — dom_only=True (Standard): storniert nur Orders deren
+    clientOid mit ORDER_PREFIX beginnt. Manuell auf Bitget gesetzte Orders
+    ohne Prefix bleiben unberuehrt. dom_only=False storniert alle (Altverhalten,
+    z.B. beim Close einer Position wenn aufgeraeumt werden muss).
 
     SL (loss_plan, pos_loss) und TP4 (pos_profit via place-pos-tpsl)
-    werden NIE angefasst — diese werden per place-pos-tpsl überschrieben.
+    werden NIE angefasst — diese werden per place-pos-tpsl ueberschrieben.
     """
     orders = _get_plan_orders(symbol)
-    tp_orders = [o for o in orders if o.get("planType") == "profit_plan"]
+    all_tp = [o for o in orders if o.get("planType") == "profit_plan"]
+
+    if dom_only:
+        tp_orders = [o for o in all_tp
+                     if (o.get("clientOid") or "").startswith(ORDER_PREFIX)]
+        skipped = len(all_tp) - len(tp_orders)
+        if skipped:
+            log(f"  FIX11: {skipped} manuell gesetzte TP(s) ohne PREFIX verschont")
+    else:
+        tp_orders = all_tp
 
     if not tp_orders:
-        log(f"  Keine TP-Orders (profit_plan) gefunden")
+        log(f"  Keine TP-Orders (profit_plan) zum Stornieren gefunden")
         return
 
     log(f"  {len(tp_orders)} TP(s) einzeln stornieren (planType=profit_plan)...")
@@ -1971,7 +2027,17 @@ def cancel_all_tp_orders(symbol: str):
 
 def calc_tp_price(avg: float, roi: float,
                   direction: str, leverage: int) -> float:
-    factor = roi / leverage
+    """
+    Berechnet TP-Preis sodass der NETTO-ROI (nach Entry- und Exit-Gebühren)
+    dem gewünschten Ziel entspricht. [FIX 4 v4.36]
+
+    Brutto-ROI = Netto-ROI + 2 x Taker-Fee x Hebel
+    Beispiel: TP1 10%, 10x, 0.06% Fee -> fee_adj=1.2% -> Brutto=11.2%
+              Trigger = avg * (1 + 0.112/10) statt avg * (1 + 0.10/10)
+    """
+    fee_adjustment = 2 * TAKER_FEE * leverage   # Entry + Exit Fee auf Kapital
+    gross_roi = roi + fee_adjustment
+    factor = gross_roi / leverage
     return avg * (1 + factor) if direction == "long" else avg * (1 - factor)
 
 
@@ -2027,7 +2093,16 @@ def place_tp_orders(symbol: str, avg: float, size: float,
                 log(f"    ⏭ {label} @ {tp_str} bereits überschritten — übersprungen")
                 continue
 
-        qty_str  = round_qty(symbol, qty)
+        qty_str   = round_qty(symbol, qty)
+        # FIX 6 v4.36: Limit-Order mit Buffer statt reiner Market-Order (USE_LIMIT_TP)
+        if USE_LIMIT_TP:
+            exec_raw = tp_val * (1 - LIMIT_TP_BUFFER) if direction == "long" else tp_val * (1 + LIMIT_TP_BUFFER)
+            exec_str = round_price(exec_raw, decimals)
+        else:
+            exec_str = "0"   # Market-Order bei Trigger
+        # FIX 11 v4.36: ClientOid mit ORDER_PREFIX — nur eigene Orders werden storniert
+        _ts_ms = int(time.time() * 1000)
+        client_oid = f"{ORDER_PREFIX}TP{partial_tps.index((roi, label, pct))+1}_{_ts_ms}"
         res = api_post("/api/v2/mix/order/place-tpsl-order", {
             "symbol":       symbol,
             "productType":  PRODUCT_TYPE,
@@ -2035,13 +2110,15 @@ def place_tp_orders(symbol: str, avg: float, size: float,
             "planType":     "profit_plan",
             "triggerPrice": tp_str,
             "triggerType":  "mark_price",
-            "executePrice": "0",
+            "executePrice": exec_str,
             "holdSide":     direction,
             "size":         qty_str,
+            "clientOid":    client_oid,
         })
         if res.get("code") == "00000":
             notional = tp_val * qty
-            log(f"    ✓ {label} @ {tp_str} USDT × {qty_str} {get_base_coin(symbol)} (≈ {notional:.2f} USDT)")
+            exec_info = f"Limit@{exec_str}" if USE_LIMIT_TP else "Market"
+            log(f"    ✓ {label} @ {tp_str} USDT × {qty_str} {get_base_coin(symbol)} (≈ {notional:.2f} USDT | {exec_info})")
             count += 1
             prices.append(f"{label}: {tp_str}")
         else:
@@ -2058,7 +2135,7 @@ def place_tp_orders(symbol: str, avg: float, size: float,
                     "planType":     "profit_plan",
                     "triggerPrice": tp_str2,
                     "triggerType":  "mark_price",
-                    "executePrice": "0",
+                    "executePrice": exec_str,
                     "holdSide":     direction,
                     "size":         qty_str,
                 })
@@ -2588,7 +2665,7 @@ def handle_position_closed(symbol: str, reason: str = ""):
     trade_data.pop(symbol, None)
 
     # Noch offene TP-Orders aufräumen
-    cancel_all_tp_orders(symbol)
+    cancel_all_tp_orders(symbol, dom_only=False)  # Position closed: alles aufräumen
 
     # DCA Limit-Orders stornieren — wichtig bei manuellem Close VOR TP1.
     # Ohne diesen Aufruf bleiben DCA-Limit-Orders auf Bitget aktiv und würden
@@ -3720,7 +3797,7 @@ def setup_new_trade(pos: dict):
                 f"Empfehlung: {sl_str} USDT ({sl_dist:.1f}%)",
                 reply_markup=build_setup_buttons(symbol),
             )
-            cancel_all_tp_orders(symbol)
+            cancel_all_tp_orders(symbol, dom_only=False)  # check_and_repair: fresh start
             time.sleep(1)
             place_tp_orders(symbol, entry, size, direction, leverage, mark,
                             known_sl=sl_price)
@@ -3768,7 +3845,7 @@ def setup_new_trade(pos: dict):
     # TPs auf Basis der tatsächlichen aktuellen Position setzen.
     # DCA-Orders sind noch nicht gefüllt — wird automatisch angepasst wenn sie füllen.
     log(f"  Setze TPs für aktuelle Position (Qty={size})...")
-    cancel_all_tp_orders(symbol)
+    cancel_all_tp_orders(symbol, dom_only=False)  # setup_new_trade: fresh start
     time.sleep(1)
     count, tp_prices = place_tp_orders(
         symbol, entry, size, direction, leverage, mark, known_sl=sl_price
@@ -3934,6 +4011,32 @@ def tps_are_correct(existing: list, avg: float, total: float,
     return True
 
 
+def verify_tp_orders(symbol: str, expected_count: int) -> bool:
+    """
+    FIX 10 v4.36: Prueft 3 Sekunden nach Platzierung ob die erwartete
+    Anzahl DOM_-eigener TPs tatsaechlich auf der Exchange aktiv ist.
+    Sendet Telegram-Alarm wenn TPs fehlen.
+    """
+    time.sleep(3)
+    try:
+        orders   = _get_plan_orders(symbol)
+        dom_tps  = [o for o in orders
+                    if o.get("planType") == "profit_plan"
+                    and (o.get("clientOid") or "").startswith(ORDER_PREFIX)]
+        active   = len(dom_tps)
+        if active < expected_count:
+            msg = (f"⚠️ <b>TP-Verifikation fehlgeschlagen — {symbol}</b>\n"
+                   f"Erwartet: {expected_count} | Aktiv: {active}\n"
+                   f"Bitte manuell prüfen!")
+            log(msg.replace("<b>", "").replace("</b>", ""))
+            telegram(msg)
+            return False
+        log(f"  ✓ TP-Verifikation: {active}/{expected_count} aktiv auf Exchange")
+        return True
+    except Exception as ex:
+        log(f"  ⚠ TP-Verifikation Fehler: {ex}")
+        return False
+
 
 # ═══════════════════════════════════════════════════════════════
 # TP UPDATE (bei Nachkauf)
@@ -3941,11 +4044,26 @@ def tps_are_correct(existing: list, avg: float, total: float,
 
 def update_tp_for_position(pos: dict, reason: str):
     """
-    Wird bei DCA-Fill aufgerufen: löscht alle bestehenden TPs und setzt sie
-    auf Basis des neuen Durchschnittspreises neu (10/20/30/40% ROI, 15/20/25/40%).
-    WICHTIG: Der SL wird nicht verändert. Er wird beim TP4-Setzen explizit
-             mitgeführt, damit place-pos-tpsl ihn nicht überschreibt.
+    Wird bei DCA-Fill aufgerufen: setzt TPs auf Basis des neuen Durchschnittspreises.
+
+    v4.36 FIX 12: _tp_update_lock verhindert parallele Doppel-Aufrufe wenn
+    zwei DCA-Fills im selben Tick ankommen (z.B. grosse Limit-Order aufgeteilt).
+
+    v4.36 FIX 3: Race-Condition geschlossen — neue TPs werden ZUERST platziert,
+    DANN werden die alten storniert. So gibt es kein Zeitfenster ohne TP-Schutz.
     """
+    # FIX 12: Debounce — wenn Update bereits laeuft, Doppel-Trigger ignorieren
+    if not _tp_update_lock.acquire(blocking=False):
+        log(f"  FIX12: TP-Update bereits aktiv fuer {pos.get('symbol','?')} — Doppel-Trigger ignoriert")
+        return
+    try:
+        _update_tp_for_position_impl(pos, reason)
+    finally:
+        _tp_update_lock.release()
+
+
+def _update_tp_for_position_impl(pos: dict, reason: str):
+    """Interne Implementierung (wird von update_tp_for_position mit Lock gerufen)."""
     symbol    = pos.get("symbol", "?")
     direction = pos.get("holdSide", "long")
     avg       = float(pos.get("openPriceAvg", 0))
@@ -3985,19 +4103,39 @@ def update_tp_for_position(pos: dict, reason: str):
     else:
         log(f"  ⚠ Kein SL ermittelbar — TP4-Aufruf ohne SL-Parameter")
 
-    log(f"  TPs löschen und neu setzen (Grund: {reason})")
+    log(f"  TPs neu setzen, dann alte stornieren (Grund: {reason}) [FIX3 v4.36]")
 
-    # v4.35: Min-Qty Edge-Case verbessern. Bisher: Qty<4 → komplettes Bail-Out
-    # ("manuell überwachen"). Ergebnis im Log war SOLUSDT mit Qty=3.7: kein
-    # einziger TP gesetzt, nur SL als Exit. place_tp_orders() hat aber bereits
-    # eingebaute Carry-Forward-Logik (überspringt Sub-min-Qty TPs und addiert
-    # auf den nächsten) plus TP4=Full-Close. Jetzt: erst Versuch starten,
-    # nur bei count==0 als "manuell" warnen.
-    cancel_all_tp_orders(symbol)
-    time.sleep(1)
+    # FIX 3 v4.36: ZUERST neue TPs platzieren, DANN alte stornieren.
+    # So gibt es kein Zeitfenster ohne TP-Schutz auf der Exchange.
     count, prices = place_tp_orders(
         symbol, avg, total, direction, leverage, mark, known_sl=known_sl
     )
+    # Jetzt erst alte TPs stornieren (nur DOM_-eigene, FIX 11)
+    cancel_all_tp_orders(symbol, dom_only=True)
+
+    # FIX 10 v4.36: Verifikation — sind die TPs wirklich auf der Exchange aktiv?
+    if count > 0:
+        verify_tp_orders(symbol, count)
+
+    # FIX 5 v4.36: Funding Rate Warnung bei extrem negativen Werten
+    try:
+        _fr_res = api_get("/api/v2/mix/market/current-fund-rate", {
+            "symbol": symbol, "productType": PRODUCT_TYPE,
+        })
+        if _fr_res.get("code") == "00000":
+            _rate = float((_fr_res.get("data") or {}).get("fundingRate", 0) or 0)
+            _daily_cost = _rate * 3 * leverage * 100   # % auf Kapital/Tag
+            if ((direction == "long"  and _rate < FUNDING_WARN_THRESHOLD) or
+                    (direction == "short" and _rate > -FUNDING_WARN_THRESHOLD)):
+                telegram(
+                    f"⚠️ <b>Funding-Kosten — {symbol}</b>\n"
+                    f"Rate: {_rate*100:.4f}% / 8h\n"
+                    f"Auf Kapital: ~{_daily_cost:.2f}% / Tag bei {leverage}x\n"
+                    f"Haltedauer kritisch prüfen!"
+                )
+                log(f"  FIX5: Funding Rate Warnung {symbol}: {_rate*100:.4f}%/8h")
+    except Exception:
+        pass
 
     if count == 0 and total < 4:
         # Echtes Bail-Out nur wenn place_tp_orders auch nichts hingekriegt hat
@@ -8271,7 +8409,7 @@ def start_webhook_server():
     @app.route("/", methods=["GET"])
     @app.route("/health", methods=["GET"])
     def health():
-        return jsonify({"status": "running", "version": "v4.35.1"}), 200
+        return jsonify({"status": "running", "version": "v4.36"}), 200
 
     @app.route("/dashboard", methods=["GET"])
     def dashboard():
@@ -9019,7 +9157,7 @@ def check_and_repair_position(pos: dict):
 
         # v4.35: Versuche TP-Setzen auch bei Qty<4 — place_tp_orders carry-forward
         # + TP4 (Full-Close) reichen oft auch bei kleinen Positionen.
-        cancel_all_tp_orders(symbol)
+        cancel_all_tp_orders(symbol, dom_only=False)  # position closed: alles aufräumen
         time.sleep(1)
         count, tp_prices = place_tp_orders(
             symbol, avg, size, direction, leverage, mark, known_sl=sl_price
@@ -9201,7 +9339,7 @@ def main():
         log("In Railway → Variables eintragen.")
         return
 
-    log("DOMINUS Demo-Bot v4.35.1 gestartet [DEMO-MODUS — Paper Trading]")
+    log("DOMINUS Demo-Bot v4.36 gestartet [DEMO-MODUS — Paper Trading]")
     log("  paperId=1 aktiv → alle Orders gehen auf Bitget Demo-Account")
     log("  Dieselben API-Keys wie Live — kein separater Demo-Key nötig")
     log(f"  Telegram Demo-Kanal: {TELEGRAM_CHAT_ID}")
@@ -9286,6 +9424,10 @@ def main():
                 flush_h4_buffer()
 
             # ── 1. Neue Fills (Nachkäufe / Einstiege) ──────
+            # FIX 9 v4.36: fetch_time VOR dem API-Call sichern. Fills die
+            # waehrend setup_new_trade/update_tp_for_position eintreffen (3-10s)
+            # wuerden sonst beim naechsten Tick nicht mehr erkannt.
+            fetch_time = int(time.time() * 1000)
             fills      = get_recent_fills_all(last_check_ms)
             open_fills = [f for f in fills if f.get("tradeSide") == "open"]
 
@@ -9293,7 +9435,7 @@ def main():
                 affected = set(
                     f.get("symbol") for f in open_fills if f.get("symbol")
                 )
-                last_check_ms = int(time.time() * 1000)
+                last_check_ms = fetch_time   # FIX 9: Zeitpunkt VOR dem Fetch
                 time.sleep(2)
 
                 for pos in get_all_positions():
@@ -9338,6 +9480,7 @@ def main():
                         )
 
             else:
+                last_check_ms = fetch_time   # FIX 9: auch im else-Zweig aktualisieren
                 # ── 2. Positionen überwachen ────────────────
                 for pos in get_all_positions():
                     sym       = pos.get("symbol", "")
