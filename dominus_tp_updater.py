@@ -7371,11 +7371,11 @@ def start_webhook_server():
         # Richtung: "direction" ODER "side" (beide Feldnamen akzeptieren)
         # Alarm-Templates senden "side":"long"/"short" — Script liest beide.
         # direction kann String ("long"/"short") oder Int (1/-1 vom Liquidity Filter) sein
-    _dir_raw  = data.get("direction", "")
-    if isinstance(_dir_raw, (int, float)):
-        direction = "long" if int(_dir_raw) == 1 else "short" if int(_dir_raw) == -1 else ""
-    else:
-        direction = str(_dir_raw).lower()
+        _dir_raw  = data.get("direction", "")
+        if isinstance(_dir_raw, (int, float)):
+            direction = "long" if int(_dir_raw) == 1 else "short" if int(_dir_raw) == -1 else ""
+        else:
+            direction = str(_dir_raw).lower()
         if direction not in ("long", "short"):
             direction = data.get("side", "").lower()
         # "auto" → leer (Auto-Direction kommt unten, nur für HARSI_SL)
