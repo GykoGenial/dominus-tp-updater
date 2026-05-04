@@ -7324,6 +7324,270 @@ def flush_h4_buffer():
     log(f"H4-Zusammenfassung gesendet: {len(longs)} Long, {len(shorts)} Short")
 
 
+def _build_dashboard_html(trades_json: str) -> str:
+    """
+    Rendert das DOMINUS Live Performance Dashboard als HTML-String.
+    Liest primär aus entry_queue_log.csv (Score, R-Multiple, Macro, Premium)
+    und ergaenzt mit closed_trades-RAM-Daten.
+    """
+    return f"""<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DOMINUS Performance Dashboard</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Fraunces:ital,wght@0,300;0,700;1,300&display=swap');
+:root{{
+  --bg:#0a0c0e;--bg2:#111417;--bg3:#181c20;--border:#252a2f;
+  --text:#e8e4dc;--muted:#6b7280;--green:#2ecc71;--red:#e74c3c;
+  --amber:#f39c12;--blue:#3498db;--accent:#c9a84c;
+  --font:'Fraunces',serif;--mono:'DM Mono',monospace;
+}}
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{background:var(--bg);color:var(--text);font-family:var(--font);min-height:100vh}}
+.header{{padding:2.5rem 3rem 2rem;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:flex-end;flex-wrap:wrap;gap:1rem}}
+.logo{{font-size:1.8rem;font-weight:700;color:var(--accent);letter-spacing:-.02em}}
+.logo span{{color:var(--muted);font-weight:300;font-size:1rem;display:block;letter-spacing:.1em;font-family:var(--mono);margin-top:.2rem}}
+.refresh{{font-family:var(--mono);font-size:11px;color:var(--muted);cursor:pointer;border:1px solid var(--border);padding:.4rem .8rem;border-radius:4px;background:transparent}}
+.refresh:hover{{border-color:var(--accent);color:var(--accent)}}
+.main{{padding:2rem 3rem;max-width:1400px}}
+.kpi-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:1rem;margin-bottom:2rem}}
+.kpi{{background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:1.25rem 1.5rem}}
+.kpi-label{{font-family:var(--mono);font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin-bottom:.5rem}}
+.kpi-value{{font-size:2rem;font-weight:700;line-height:1}}
+.kpi-sub{{font-family:var(--mono);font-size:11px;color:var(--muted);margin-top:.3rem}}
+.green{{color:var(--green)}}.red{{color:var(--red)}}.amber{{color:var(--amber)}}.blue{{color:var(--blue)}}
+.section{{margin-bottom:2.5rem}}
+.section-title{{font-family:var(--mono);font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);border-bottom:1px solid var(--border);padding-bottom:.6rem;margin-bottom:1.2rem}}
+.score-grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:1rem}}
+.score-card{{background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:1.2rem}}
+.score-badge{{font-family:var(--mono);font-size:20px;font-weight:500;margin-bottom:.4rem}}
+.score-label{{font-size:.8rem;color:var(--muted);margin-bottom:.6rem}}
+.score-bar{{height:4px;border-radius:2px;background:var(--border);margin-bottom:.6rem;overflow:hidden}}
+.score-fill{{height:100%;border-radius:2px}}
+.score-stats{{font-family:var(--mono);font-size:11px;color:var(--muted)}}
+.two-col{{display:grid;grid-template-columns:1fr 1fr;gap:1.5rem}}
+.table-wrap{{background:var(--bg2);border:1px solid var(--border);border-radius:8px;overflow:hidden;overflow-x:auto}}
+table{{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:12px}}
+th{{padding:.8rem 1rem;text-align:left;border-bottom:1px solid var(--border);color:var(--muted);font-weight:500;font-size:10px;letter-spacing:.08em;text-transform:uppercase}}
+td{{padding:.7rem 1rem;border-bottom:1px solid var(--border)}}
+tr:last-child td{{border-bottom:none}}
+tr:hover td{{background:var(--bg3)}}
+.pill{{display:inline-block;padding:.15rem .5rem;border-radius:3px;font-size:10px;font-weight:500}}
+.pill-green{{background:rgba(46,204,113,.15);color:var(--green)}}
+.pill-red{{background:rgba(231,76,60,.15);color:var(--red)}}
+.pill-amber{{background:rgba(243,156,18,.15);color:var(--amber)}}
+.pill-blue{{background:rgba(52,152,219,.15);color:var(--blue)}}
+.bar-row{{display:grid;grid-template-columns:110px 1fr 60px;gap:.5rem;align-items:center;padding:.4rem 0}}
+.bar-bg{{background:var(--border);border-radius:2px;height:8px;overflow:hidden}}
+.bar-val{{height:100%;border-radius:2px;background:var(--green)}}
+.empty{{padding:3rem;text-align:center;color:var(--muted);font-style:italic;font-size:1.1rem}}
+@media(max-width:900px){{.main{{padding:1.2rem}}.header{{padding:1.5rem 1.2rem}}.score-grid{{grid-template-columns:1fr 1fr}}.two-col{{grid-template-columns:1fr}}}}
+@media(max-width:500px){{.score-grid{{grid-template-columns:1fr}}}}
+</style>
+</head>
+<body>
+<div class="header">
+  <div>
+    <div class="logo">DOMINUS <span>LIVE PERFORMANCE DASHBOARD</span></div>
+  </div>
+  <button class="refresh" onclick="location.reload()">&#x21BB; Aktualisieren</button>
+</div>
+<div class="main">
+  <div id="content"><div class="empty">Lade Daten...</div></div>
+</div>
+<script>
+const RAW = {trades_json};
+
+function fmt(n, d=2) {{ return n == null || isNaN(n) ? '&#x2014;' : Number(n).toFixed(d); }}
+function pct(n) {{ return n == null || isNaN(n) ? '&#x2014;' : (n*100).toFixed(1)+'%'; }}
+function pill(txt, cls) {{ return `<span class="pill pill-${{cls}}">${{txt}}</span>`; }}
+function colorClass(v, hi=0.55, lo=0.45) {{ return v >= hi ? 'green' : v >= lo ? 'amber' : 'red'; }}
+
+function render(trades) {{
+  if (!trades || !trades.length) {{
+    document.getElementById('content').innerHTML =
+      '<div class="empty">Noch keine abgeschlossenen Trades.<br>Warte auf das erste Signal.</div>';
+    return;
+  }}
+
+  const closed = trades.filter(t => t.won !== undefined && t.won !== null);
+  if (!closed.length) {{
+    document.getElementById('content').innerHTML =
+      '<div class="empty">Trades vorhanden, aber noch kein abgeschlossener Trade mit Outcome.</div>';
+    return;
+  }}
+
+  const wins   = closed.filter(t => t.won == 1 || t.won === true);
+  const losses = closed.filter(t => !(t.won == 1 || t.won === true));
+  const wr     = wins.length / closed.length;
+
+  const pnls     = closed.map(t => parseFloat(t.pnl_usdt || t.net_pnl || 0));
+  const totalPnl = pnls.reduce((s,v) => s+v, 0);
+  const winPnls  = wins.map(t => parseFloat(t.pnl_usdt || t.net_pnl || 0));
+  const losPnls  = losses.map(t => parseFloat(t.pnl_usdt || t.net_pnl || 0));
+  const avgWin   = winPnls.length ? winPnls.reduce((s,v)=>s+v,0)/winPnls.length : 0;
+  const avgLoss  = losPnls.length ? losPnls.reduce((s,v)=>s+v,0)/losPnls.length : 0;
+
+  const rmults = closed.filter(t => t.r_multiple).map(t => parseFloat(t.r_multiple));
+  const avgR   = rmults.length ? rmults.reduce((s,v)=>s+v,0)/rmults.length : null;
+
+  const premTrades = closed.filter(t => t.is_premium == 1 || t.is_premium === true);
+  const premWr     = premTrades.length ? premTrades.filter(t => t.won==1||t.won===true).length/premTrades.length : null;
+
+  const macroOk   = closed.filter(t => t.macro_ok == 1 || t.macro_ok === true);
+  const macroWr   = macroOk.length ? macroOk.filter(t=>t.won==1||t.won===true).length/macroOk.length : null;
+
+  // Score-Bucket Winrate (aus Queue-Log-Daten)
+  const buckets = {{'A (75-100)':[],'B (50-74)':[],'C (25-49)':[],'D (0-24)':[]}};
+  closed.forEach(t => {{
+    const s = parseInt(t.score || 0);
+    if (s >= 75) buckets['A (75-100)'].push(t);
+    else if (s >= 50) buckets['B (50-74)'].push(t);
+    else if (s >= 25) buckets['C (25-49)'].push(t);
+    else buckets['D (0-24)'].push(t);
+  }});
+
+  // Wochentag-Winrate
+  const dayMap = {{}};
+  closed.forEach(t => {{
+    const dt = t.ts_close || t.ts_queue || '';
+    if (!dt) return;
+    const d = new Date(dt.replace('Z','') + (dt.includes('T') ? 'Z' : ''));
+    const dayName = d.toLocaleDateString('de-DE', {{weekday:'long', timeZone:'UTC'}});
+    if (!dayMap[dayName]) dayMap[dayName] = {{wins:0, total:0}};
+    dayMap[dayName].total++;
+    if (t.won==1||t.won===true) dayMap[dayName].wins++;
+  }});
+
+  // Close-Reason Verteilung
+  const reasons = {{}};
+  closed.forEach(t => {{
+    const r = t.close_reason || 'unbekannt';
+    reasons[r] = (reasons[r]||0)+1;
+  }});
+
+  let html = '';
+
+  // KPIs
+  html += `<div class="kpi-grid section">
+    <div class="kpi"><div class="kpi-label">Trades (geschlossen)</div>
+      <div class="kpi-value">${{closed.length}}</div>
+      <div class="kpi-sub">${{wins.length}} Gewinne / ${{losses.length}} Verluste</div></div>
+    <div class="kpi"><div class="kpi-label">Winrate</div>
+      <div class="kpi-value ${{colorClass(wr)}}">${{pct(wr)}}</div></div>
+    <div class="kpi"><div class="kpi-label">Net P&amp;L gesamt</div>
+      <div class="kpi-value ${{totalPnl>=0?'green':'red'}}">${{totalPnl>=0?'+':''}}${{fmt(totalPnl)}} USDT</div></div>
+    <div class="kpi"><div class="kpi-label">&#xD8; Gewinn</div>
+      <div class="kpi-value green">+${{fmt(avgWin)}}</div></div>
+    <div class="kpi"><div class="kpi-label">&#xD8; Verlust</div>
+      <div class="kpi-value red">${{fmt(avgLoss)}}</div></div>
+    <div class="kpi"><div class="kpi-label">&#xD8; R-Multiple</div>
+      <div class="kpi-value ${{avgR!=null?(avgR>=1.5?'green':avgR>=0?'amber':'red'):''}}">${{avgR!=null?fmt(avgR,2):'&#x2014;'}}</div>
+      <div class="kpi-sub">aus ${{rmults.length}} Trades</div></div>
+    <div class="kpi"><div class="kpi-label">Premium WR</div>
+      <div class="kpi-value ${{premWr!=null?colorClass(premWr,0.60,0.50):''}}">${{premWr!=null?pct(premWr):'n/a'}}</div>
+      <div class="kpi-sub">${{premTrades.length}} Premium-Trades</div></div>
+    <div class="kpi"><div class="kpi-label">Makro-aligned WR</div>
+      <div class="kpi-value ${{macroWr!=null?colorClass(macroWr):''}}">${{macroWr!=null?pct(macroWr):'n/a'}}</div>
+      <div class="kpi-sub">${{macroOk.length}} Trades mit BTC+T2 OK</div></div>
+  </div>`;
+
+  // Score-Analyse
+  html += `<div class="section"><div class="section-title">Score-Analyse &mdash; Welcher Score-Bereich ist am profitabelsten?</div>
+  <div class="score-grid">`;
+  const bColors = {{'A (75-100)':'#2ecc71','B (50-74)':'#3498db','C (25-49)':'#f39c12','D (0-24)':'#e74c3c'}};
+  Object.entries(buckets).forEach(([range, ts]) => {{
+    if (!ts.length) {{
+      html += `<div class="score-card"><div class="score-badge" style="color:${{bColors[range]}}">${{range}}</div><div class="score-stats">Keine Trades</div></div>`;
+      return;
+    }}
+    const bWr  = ts.filter(t=>t.won==1||t.won===true).length/ts.length;
+    const bPnl = ts.reduce((s,t)=>s+parseFloat(t.pnl_usdt||t.net_pnl||0),0);
+    const bR   = ts.filter(t=>t.r_multiple).map(t=>parseFloat(t.r_multiple));
+    const bAvgR = bR.length ? bR.reduce((s,v)=>s+v,0)/bR.length : null;
+    html += `<div class="score-card">
+      <div class="score-badge" style="color:${{bColors[range]}}">${{range}}</div>
+      <div class="score-label">${{ts.length}} Trades</div>
+      <div class="score-bar"><div class="score-fill" style="width:${{bWr*100}}%;background:${{bColors[range]}}"></div></div>
+      <div class="score-stats">
+        WR: ${{pct(bWr)}} &nbsp;|&nbsp; Net: ${{bPnl>=0?'+':''}}${{fmt(bPnl)}} USDT<br>
+        &#xD8; R: ${{bAvgR!=null?fmt(bAvgR,2):'&#x2014;'}}
+      </div></div>`;
+  }});
+  html += `</div></div>`;
+
+  // Wochentag + Close-Reason nebeneinander
+  html += `<div class="two-col section">`;
+
+  // Wochentag
+  const dayOrder = ['Montag','Dienstag','Mittwoch','Donnerstag','Freitag','Samstag','Sonntag'];
+  html += `<div><div class="section-title">Winrate nach Wochentag</div>`;
+  dayOrder.forEach(d => {{
+    if (!dayMap[d]) return;
+    const dwr = dayMap[d].wins/dayMap[d].total;
+    html += `<div class="bar-row">
+      <span style="font-family:var(--mono);font-size:12px;color:var(--muted)">${{d.substring(0,2)}} (${{dayMap[d].total}})</span>
+      <div class="bar-bg"><div class="bar-val" style="width:${{dwr*100}}%;background:${{dwr>=0.55?'var(--green)':dwr>=0.45?'var(--amber)':'var(--red)'}}"></div></div>
+      <span style="font-family:var(--mono);font-size:12px;color:${{dwr>=0.55?'var(--green)':dwr>=0.45?'var(--amber)':'var(--red)'}}">${{pct(dwr)}}</span>
+    </div>`;
+  }});
+  html += `</div>`;
+
+  // Close-Reason
+  html += `<div><div class="section-title">Abschluss-Ursache</div><div class="table-wrap"><table>
+    <thead><tr><th>Ursache</th><th>Anzahl</th><th>Anteil</th></tr></thead><tbody>`;
+  Object.entries(reasons).sort((a,b)=>b[1]-a[1]).forEach(([r,n]) => {{
+    html += `<tr><td>${{r}}</td><td style="color:var(--muted)">${{n}}</td><td style="color:var(--muted)">${{(n/closed.length*100).toFixed(0)}}%</td></tr>`;
+  }});
+  html += `</tbody></table></div></div>`;
+  html += `</div>`;
+
+  // Letzte Trades
+  const recent = [...closed].sort((a,b) => {{
+    const ta = a.ts_close||a.ts_queue||'';
+    const tb = b.ts_close||b.ts_queue||'';
+    return tb.localeCompare(ta);
+  }}).slice(0,40);
+
+  html += `<div class="section"><div class="section-title">Letzte Trades (max. 40)</div>
+  <div class="table-wrap"><table>
+  <thead><tr>
+    <th>Datum</th><th>Symbol</th><th>Dir</th><th>Score</th><th>Premium</th>
+    <th>Hebel</th><th>SL%</th><th>R-Mult</th><th>P&amp;L</th><th>Ursache</th><th>Ergebnis</th>
+  </tr></thead><tbody>`;
+  recent.forEach(t => {{
+    const dt = (t.ts_close||t.ts_queue||'').substring(0,10);
+    const sc = parseInt(t.score||0);
+    const scCls = sc>=75?'green':sc>=50?'blue':sc>=25?'amber':'red';
+    const pnl = parseFloat(t.pnl_usdt||t.net_pnl||0);
+    const rm  = t.r_multiple ? parseFloat(t.r_multiple) : null;
+    html += `<tr>
+      <td style="color:var(--muted)">${{dt||'&#x2014;'}}</td>
+      <td style="font-weight:600">${{t.symbol||'&#x2014;'}}</td>
+      <td>${{(t.direction||'').toLowerCase()==='long'?pill('LONG','green'):pill('SHORT','red')}}</td>
+      <td>${{pill(sc||'&#x2014;', scCls)}}</td>
+      <td>${{(t.is_premium==1||t.is_premium===true)?pill('&#x2605; Prem','amber'):'&#x2014;'}}</td>
+      <td style="color:var(--muted)">${{t.leverage||t.open_leverage||'&#x2014;'}}x</td>
+      <td style="color:var(--muted)">${{t.sl_pct?fmt(t.sl_pct,2)+'%':'&#x2014;'}}</td>
+      <td class="${{rm!=null?(rm>=1.5?'green':rm>=0?'amber':'red'):''}}">${{rm!=null?fmt(rm,2):'&#x2014;'}}</td>
+      <td class="${{pnl>=0?'green':'red'}}">${{pnl>=0?'+':''}}${{fmt(pnl)}} USDT</td>
+      <td style="color:var(--muted);font-size:11px">${{t.close_reason||'&#x2014;'}}</td>
+      <td>${{(t.won==1||t.won===true)?pill('Gewinn','green'):pill('Verlust','red')}}</td>
+    </tr>`;
+  }});
+  html += `</tbody></table></div></div>`;
+
+  document.getElementById('content').innerHTML = html;
+}}
+
+render(RAW);
+</script>
+</body>
+</html>"""
+
+
 def start_webhook_server():
     """
     Startet einen Flask HTTP-Server in einem separaten Thread.
@@ -8113,6 +8377,70 @@ def start_webhook_server():
     @app.route("/health", methods=["GET"])
     def health():
         return jsonify({"status": "running", "version": "v4.36"}), 200
+
+    @app.route("/dashboard", methods=["GET"])
+    def dashboard():
+        """
+        Performance Dashboard — liest aus entry_queue_log.csv (Score, R-Multiple,
+        Macro, Premium, Close-Reason) und reichert mit closed_trades-RAM an.
+
+        Optionaler Passwortschutz: DASHBOARD_SECRET Railway-Variable setzen.
+        Aufruf dann mit ?secret=DEIN_SECRET.
+        """
+        import json as _j, csv as _csv, os as _os
+        from flask import Response, request as _req
+
+        # Optionaler Passwortschutz
+        _ds = os.environ.get("DASHBOARD_SECRET", "")
+        if _ds and _req.args.get("secret", "") != _ds:
+            return Response(
+                "<html><body style='background:#0a0c0e;color:#e74c3c;font-family:monospace;"
+                "display:flex;align-items:center;justify-content:center;height:100vh;"
+                "font-size:1.2rem'>403 &mdash; ?secret= fehlt oder falsch</body></html>",
+                status=403, mimetype="text/html"
+            )
+
+        # Basis: entry_queue_log.csv (vollstaendigste Daten: Score, R-Mult, etc.)
+        trades = []
+        if _os.path.exists(ENTRY_LOG_CSV):
+            try:
+                with open(ENTRY_LOG_CSV, newline="", encoding="utf-8") as f:
+                    reader = _csv.DictReader(f, delimiter=";")
+                    for row in reader:
+                        # Nur abgeschlossene Trades mit Outcome anzeigen
+                        if row.get("won") not in ("0", "1"):
+                            continue
+                        trades.append({
+                            "symbol":       row.get("symbol", ""),
+                            "direction":    row.get("direction", ""),
+                            "score":        row.get("score", ""),
+                            "is_premium":   row.get("is_premium", "0"),
+                            "leverage":     row.get("open_leverage") or row.get("leverage", ""),
+                            "sl_pct":       row.get("sl_pct", ""),
+                            "macro_ok":     row.get("macro_ok", "0"),
+                            "ts_queue":     row.get("ts_queue", ""),
+                            "ts_close":     row.get("ts_close", ""),
+                            "pnl_usdt":     row.get("pnl_usdt", ""),
+                            "r_multiple":   row.get("r_multiple", ""),
+                            "won":          row.get("won", ""),
+                            "close_reason": row.get("close_reason", ""),
+                        })
+            except Exception as ex:
+                log(f"[dashboard] entry_queue_log read error: {ex}")
+
+        # Fallback: closed_trades RAM (fuer Trades ohne Queue-Log-Eintrag)
+        if not trades:
+            for t in closed_trades:
+                trades.append({
+                    "symbol":    t.get("symbol", ""),
+                    "direction": t.get("direction", ""),
+                    "leverage":  t.get("leverage", ""),
+                    "ts_close":  str(t.get("ts", "")),
+                    "net_pnl":   t.get("net_pnl", 0),
+                    "won":       "1" if t.get("won") else "0",
+                })
+
+        return Response(_build_dashboard_html(_j.dumps(trades)), mimetype="text/html")
 
     port = _env_int("PORT", 8080)
     # WICHTIG: Token NICHT ins Log schreiben — er landet sonst in Railway-Logs.
