@@ -4722,10 +4722,50 @@ def flush_entries() -> None:
             log(f"  ENTRY-QUEUE: Slot-Overview gesendet (msg_id={msg_id}) "
                 f"— {len(ranked)} Signale ({n_premium} Premium)")
         else:
-            # Fallback — Callbacks funktionieren nicht, aber User sieht
-            # zumindest die Übersicht als normale Telegram-Message.
             log("  ENTRY-QUEUE: WARNUNG — keine message_id erhalten, "
                 "Callback-Navigation deaktiviert für diesen Slot")
+
+        # ── Vollautomatische Ausführung des Top-Scorers ──────────────
+        # Wenn AUTO_TRADE_ENABLED=true: ranked[0] wird sofort ohne
+        # Button-Tap ausgeführt. TWO_TAP_CONFIRM wird ignoriert.
+        if AUTO_TRADE_ENABLED and ranked:
+            _top = ranked[0]
+            _sugg = _top.get("sugg") or {}
+            _sym  = _top["symbol"]
+            _dir  = _top["direction"]
+            _lev  = int(_sugg.get("leverage") or 10)
+            _sl   = float(_sugg.get("sl") or 0)
+            _px   = float(_top.get("entry") or 0)
+            _sc   = _top["_scored"]["score"]
+
+            if _sl and _px:
+                log(f"  AUTO-EXEC: {_sym} {_dir.upper()} | Score={_sc} | "
+                    f"Entry={_px} SL={_sl} Lev={_lev}x")
+                telegram(
+                    f"🤖 <b>Auto-Execute — Top-Score</b>\n"
+                    f"<b>{_sym} {_dir.upper()}</b>  ·  Score <b>{_sc}/100</b>\n"
+                    f"Entry: <code>{_px}</code>  ·  SL: <code>{_sl}</code>  "
+                    f"·  {_lev}x"
+                )
+                _res = execute_trade_order(_sym, _dir, _lev, _px, _sl)
+                if _res.get("ok"):
+                    telegram(
+                        f"✅ <b>Order platziert — {_sym}</b>\n"
+                        f"Qty: {_res.get('qty')}  ·  Margin: "
+                        f"{_res.get('initial_margin', 0):.2f} USDT"
+                    )
+                else:
+                    telegram(
+                        f"❌ <b>Auto-Execute fehlgeschlagen — {_sym}</b>\n"
+                        f"{_res.get('reason', '?')}"
+                    )
+            else:
+                log(f"  AUTO-EXEC: {_sym} übersprungen — kein SL/Entry im sugg "
+                    f"(sl={_sl}, entry={_px})")
+                telegram(
+                    f"⚠️ <b>Auto-Execute übersprungen — {_sym}</b>\n"
+                    f"Kein SL oder Entry-Preis im Signal. Bitte manuell traden."
+                )
     except Exception as ex:
         log(f"[flush_entries] Fehler: {ex}")
         try:
