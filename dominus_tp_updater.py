@@ -7327,8 +7327,8 @@ def flush_h4_buffer():
 def _build_dashboard_html(trades_json: str) -> str:
     """
     Rendert das DOMINUS Live Performance Dashboard als HTML-String.
-    Liest primär aus entry_queue_log.csv (Score, R-Multiple, Macro, Premium)
-    und ergaenzt mit closed_trades-RAM-Daten.
+    Drei Chart.js-Charts: Equity-Kurve, Score-vs-R Scatter, Win/Loss Streaks.
+    Liest primaer aus entry_queue_log.csv.
     """
     return f"""<!DOCTYPE html>
 <html lang="de">
@@ -7336,6 +7336,7 @@ def _build_dashboard_html(trades_json: str) -> str:
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>DOMINUS Performance Dashboard</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Fraunces:ital,wght@0,300;0,700;1,300&display=swap');
 :root{{
@@ -7349,7 +7350,7 @@ body{{background:var(--bg);color:var(--text);font-family:var(--font);min-height:
 .header{{padding:2.5rem 3rem 2rem;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:flex-end;flex-wrap:wrap;gap:1rem}}
 .logo{{font-size:1.8rem;font-weight:700;color:var(--accent);letter-spacing:-.02em}}
 .logo span{{color:var(--muted);font-weight:300;font-size:1rem;display:block;letter-spacing:.1em;font-family:var(--mono);margin-top:.2rem}}
-.refresh{{font-family:var(--mono);font-size:11px;color:var(--muted);cursor:pointer;border:1px solid var(--border);padding:.4rem .8rem;border-radius:4px;background:transparent}}
+.refresh{{font-family:var(--mono);font-size:11px;cursor:pointer;border:1px solid var(--border);padding:.4rem .8rem;border-radius:4px;background:transparent;color:var(--muted)}}
 .refresh:hover{{border-color:var(--accent);color:var(--accent)}}
 .main{{padding:2rem 3rem;max-width:1400px}}
 .kpi-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:1rem;margin-bottom:2rem}}
@@ -7360,6 +7361,10 @@ body{{background:var(--bg);color:var(--text);font-family:var(--font);min-height:
 .green{{color:var(--green)}}.red{{color:var(--red)}}.amber{{color:var(--amber)}}.blue{{color:var(--blue)}}
 .section{{margin-bottom:2.5rem}}
 .section-title{{font-family:var(--mono);font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);border-bottom:1px solid var(--border);padding-bottom:.6rem;margin-bottom:1.2rem}}
+.chart-grid{{display:grid;grid-template-columns:1fr 1fr;gap:1.5rem;margin-bottom:2.5rem}}
+.chart-wide{{margin-bottom:2.5rem}}
+.chart-box{{background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:1.25rem 1.5rem}}
+.chart-box canvas{{max-height:260px}}
 .score-grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:1rem}}
 .score-card{{background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:1.2rem}}
 .score-badge{{font-family:var(--mono);font-size:20px;font-weight:500;margin-bottom:.4rem}}
@@ -7381,205 +7386,278 @@ tr:hover td{{background:var(--bg3)}}
 .pill-blue{{background:rgba(52,152,219,.15);color:var(--blue)}}
 .bar-row{{display:grid;grid-template-columns:110px 1fr 60px;gap:.5rem;align-items:center;padding:.4rem 0}}
 .bar-bg{{background:var(--border);border-radius:2px;height:8px;overflow:hidden}}
-.bar-val{{height:100%;border-radius:2px;background:var(--green)}}
+.bar-val{{height:100%;border-radius:2px}}
 .empty{{padding:3rem;text-align:center;color:var(--muted);font-style:italic;font-size:1.1rem}}
-@media(max-width:900px){{.main{{padding:1.2rem}}.header{{padding:1.5rem 1.2rem}}.score-grid{{grid-template-columns:1fr 1fr}}.two-col{{grid-template-columns:1fr}}}}
+@media(max-width:900px){{
+  .main{{padding:1.2rem}}.header{{padding:1.5rem 1.2rem}}
+  .chart-grid{{grid-template-columns:1fr}}
+  .score-grid{{grid-template-columns:1fr 1fr}}
+  .two-col{{grid-template-columns:1fr}}
+}}
 @media(max-width:500px){{.score-grid{{grid-template-columns:1fr}}}}
 </style>
 </head>
 <body>
 <div class="header">
-  <div>
-    <div class="logo">DOMINUS <span>LIVE PERFORMANCE DASHBOARD</span></div>
-  </div>
+  <div><div class="logo">DOMINUS <span>LIVE PERFORMANCE DASHBOARD</span></div></div>
   <button class="refresh" onclick="location.reload()">&#x21BB; Aktualisieren</button>
 </div>
-<div class="main">
-  <div id="content"><div class="empty">Lade Daten...</div></div>
-</div>
+<div class="main"><div id="content"><div class="empty">Lade...</div></div></div>
 <script>
 const RAW = {trades_json};
+Chart.defaults.color='#6b7280';
+Chart.defaults.borderColor='#252a2f';
+Chart.defaults.font.family="'DM Mono',monospace";
+Chart.defaults.font.size=11;
+let _charts=[];
+function destroyCharts(){{_charts.forEach(c=>c.destroy());_charts=[];}}
+function fmt(n,d=2){{return n==null||isNaN(n)?'\u2014':Number(n).toFixed(d);}}
+function pct(n){{return n==null||isNaN(n)?'\u2014':(n*100).toFixed(1)+'%';}}
+function pill(txt,cls){{return`<span class="pill pill-${{cls}}">${{txt}}</span>`;}}
+function cc(v,hi=.55,lo=.45){{return v>=hi?'green':v>=lo?'amber':'red';}}
+function isWon(t){{return t.won==1||t.won===true||t.won==='1';}}
 
-function fmt(n, d=2) {{ return n == null || isNaN(n) ? '&#x2014;' : Number(n).toFixed(d); }}
-function pct(n) {{ return n == null || isNaN(n) ? '&#x2014;' : (n*100).toFixed(1)+'%'; }}
-function pill(txt, cls) {{ return `<span class="pill pill-${{cls}}">${{txt}}</span>`; }}
-function colorClass(v, hi=0.55, lo=0.45) {{ return v >= hi ? 'green' : v >= lo ? 'amber' : 'red'; }}
-
-function render(trades) {{
-  if (!trades || !trades.length) {{
-    document.getElementById('content').innerHTML =
-      '<div class="empty">Noch keine abgeschlossenen Trades.<br>Warte auf das erste Signal.</div>';
-    return;
+function render(trades){{
+  destroyCharts();
+  if(!trades||!trades.length){{
+    document.getElementById('content').innerHTML='<div class="empty">Noch keine abgeschlossenen Trades.</div>';return;
   }}
-
-  const closed = trades.filter(t => t.won !== undefined && t.won !== null);
-  if (!closed.length) {{
-    document.getElementById('content').innerHTML =
-      '<div class="empty">Trades vorhanden, aber noch kein abgeschlossener Trade mit Outcome.</div>';
-    return;
+  const closed=trades.filter(t=>t.won!==undefined&&t.won!==null&&t.won!=='');
+  if(!closed.length){{
+    document.getElementById('content').innerHTML='<div class="empty">Kein Outcome in den Daten.</div>';return;
   }}
+  const sorted=[...closed].sort((a,b)=>{{
+    const ta=a.ts_close||a.ts_queue||'';
+    const tb=b.ts_close||b.ts_queue||'';
+    return ta.localeCompare(tb);
+  }});
+  const wins=closed.filter(isWon);
+  const losses=closed.filter(t=>!isWon(t));
+  const wr=wins.length/closed.length;
+  const pnls=closed.map(t=>parseFloat(t.pnl_usdt||t.net_pnl||0));
+  const totalPnl=pnls.reduce((s,v)=>s+v,0);
+  const winPnls=wins.map(t=>parseFloat(t.pnl_usdt||t.net_pnl||0));
+  const losPnls=losses.map(t=>parseFloat(t.pnl_usdt||t.net_pnl||0));
+  const avgWin=winPnls.length?winPnls.reduce((s,v)=>s+v,0)/winPnls.length:0;
+  const avgLoss=losPnls.length?losPnls.reduce((s,v)=>s+v,0)/losPnls.length:0;
+  const rmults=closed.filter(t=>t.r_multiple&&!isNaN(parseFloat(t.r_multiple))).map(t=>parseFloat(t.r_multiple));
+  const avgR=rmults.length?rmults.reduce((s,v)=>s+v,0)/rmults.length:null;
+  const premT=closed.filter(t=>t.is_premium==1||t.is_premium===true||t.is_premium==='1');
+  const premWr=premT.length?premT.filter(isWon).length/premT.length:null;
+  const macroT=closed.filter(t=>t.macro_ok==1||t.macro_ok===true||t.macro_ok==='1');
+  const macroWr=macroT.length?macroT.filter(isWon).length/macroT.length:null;
 
-  const wins   = closed.filter(t => t.won == 1 || t.won === true);
-  const losses = closed.filter(t => !(t.won == 1 || t.won === true));
-  const wr     = wins.length / closed.length;
-
-  const pnls     = closed.map(t => parseFloat(t.pnl_usdt || t.net_pnl || 0));
-  const totalPnl = pnls.reduce((s,v) => s+v, 0);
-  const winPnls  = wins.map(t => parseFloat(t.pnl_usdt || t.net_pnl || 0));
-  const losPnls  = losses.map(t => parseFloat(t.pnl_usdt || t.net_pnl || 0));
-  const avgWin   = winPnls.length ? winPnls.reduce((s,v)=>s+v,0)/winPnls.length : 0;
-  const avgLoss  = losPnls.length ? losPnls.reduce((s,v)=>s+v,0)/losPnls.length : 0;
-
-  const rmults = closed.filter(t => t.r_multiple).map(t => parseFloat(t.r_multiple));
-  const avgR   = rmults.length ? rmults.reduce((s,v)=>s+v,0)/rmults.length : null;
-
-  const premTrades = closed.filter(t => t.is_premium == 1 || t.is_premium === true);
-  const premWr     = premTrades.length ? premTrades.filter(t => t.won==1||t.won===true).length/premTrades.length : null;
-
-  const macroOk   = closed.filter(t => t.macro_ok == 1 || t.macro_ok === true);
-  const macroWr   = macroOk.length ? macroOk.filter(t=>t.won==1||t.won===true).length/macroOk.length : null;
-
-  // Score-Bucket Winrate (aus Queue-Log-Daten)
-  const buckets = {{'A (75-100)':[],'B (50-74)':[],'C (25-49)':[],'D (0-24)':[]}};
-  closed.forEach(t => {{
-    const s = parseInt(t.score || 0);
-    if (s >= 75) buckets['A (75-100)'].push(t);
-    else if (s >= 50) buckets['B (50-74)'].push(t);
-    else if (s >= 25) buckets['C (25-49)'].push(t);
-    else buckets['D (0-24)'].push(t);
+  // Score Buckets
+  const bk={{'A (75-100)':[],'B (50-74)':[],'C (25-49)':[],'D (0-24)':[]}};
+  closed.forEach(t=>{{
+    const s=parseInt(t.score||0);
+    if(s>=75)bk['A (75-100)'].push(t);
+    else if(s>=50)bk['B (50-74)'].push(t);
+    else if(s>=25)bk['C (25-49)'].push(t);
+    else bk['D (0-24)'].push(t);
   }});
 
-  // Wochentag-Winrate
-  const dayMap = {{}};
-  closed.forEach(t => {{
-    const dt = t.ts_close || t.ts_queue || '';
-    if (!dt) return;
-    const d = new Date(dt.replace('Z','') + (dt.includes('T') ? 'Z' : ''));
-    const dayName = d.toLocaleDateString('de-DE', {{weekday:'long', timeZone:'UTC'}});
-    if (!dayMap[dayName]) dayMap[dayName] = {{wins:0, total:0}};
-    dayMap[dayName].total++;
-    if (t.won==1||t.won===true) dayMap[dayName].wins++;
+  // Wochentag
+  const dm={{}};
+  closed.forEach(t=>{{
+    const dt=t.ts_close||t.ts_queue||'';if(!dt)return;
+    try{{
+      const d=new Date(dt.includes('T')?dt:dt+'T00:00:00Z');
+      const n=d.toLocaleDateString('de-DE',{{weekday:'long',timeZone:'UTC'}});
+      if(!dm[n])dm[n]={{wins:0,total:0}};
+      dm[n].total++;if(isWon(t))dm[n].wins++;
+    }}catch(e){{}}
   }});
 
-  // Close-Reason Verteilung
-  const reasons = {{}};
-  closed.forEach(t => {{
-    const r = t.close_reason || 'unbekannt';
-    reasons[r] = (reasons[r]||0)+1;
-  }});
+  // Close reasons
+  const rz={{}};
+  closed.forEach(t=>{{const r=t.close_reason||'unbekannt';rz[r]=(rz[r]||0)+1;}});
 
-  let html = '';
+  let html='';
 
   // KPIs
-  html += `<div class="kpi-grid section">
-    <div class="kpi"><div class="kpi-label">Trades (geschlossen)</div>
-      <div class="kpi-value">${{closed.length}}</div>
-      <div class="kpi-sub">${{wins.length}} Gewinne / ${{losses.length}} Verluste</div></div>
-    <div class="kpi"><div class="kpi-label">Winrate</div>
-      <div class="kpi-value ${{colorClass(wr)}}">${{pct(wr)}}</div></div>
-    <div class="kpi"><div class="kpi-label">Net P&amp;L gesamt</div>
-      <div class="kpi-value ${{totalPnl>=0?'green':'red'}}">${{totalPnl>=0?'+':''}}${{fmt(totalPnl)}} USDT</div></div>
-    <div class="kpi"><div class="kpi-label">&#xD8; Gewinn</div>
-      <div class="kpi-value green">+${{fmt(avgWin)}}</div></div>
-    <div class="kpi"><div class="kpi-label">&#xD8; Verlust</div>
-      <div class="kpi-value red">${{fmt(avgLoss)}}</div></div>
-    <div class="kpi"><div class="kpi-label">&#xD8; R-Multiple</div>
-      <div class="kpi-value ${{avgR!=null?(avgR>=1.5?'green':avgR>=0?'amber':'red'):''}}">${{avgR!=null?fmt(avgR,2):'&#x2014;'}}</div>
-      <div class="kpi-sub">aus ${{rmults.length}} Trades</div></div>
-    <div class="kpi"><div class="kpi-label">Premium WR</div>
-      <div class="kpi-value ${{premWr!=null?colorClass(premWr,0.60,0.50):''}}">${{premWr!=null?pct(premWr):'n/a'}}</div>
-      <div class="kpi-sub">${{premTrades.length}} Premium-Trades</div></div>
-    <div class="kpi"><div class="kpi-label">Makro-aligned WR</div>
-      <div class="kpi-value ${{macroWr!=null?colorClass(macroWr):''}}">${{macroWr!=null?pct(macroWr):'n/a'}}</div>
-      <div class="kpi-sub">${{macroOk.length}} Trades mit BTC+T2 OK</div></div>
+  html+=`<div class="kpi-grid section">
+    <div class="kpi"><div class="kpi-label">Trades</div><div class="kpi-value">${{closed.length}}</div><div class="kpi-sub">${{wins.length}}W / ${{losses.length}}L</div></div>
+    <div class="kpi"><div class="kpi-label">Winrate</div><div class="kpi-value ${{cc(wr)}}">${{pct(wr)}}</div></div>
+    <div class="kpi"><div class="kpi-label">Net P&amp;L</div><div class="kpi-value ${{totalPnl>=0?'green':'red'}}">${{totalPnl>=0?'+':''}}${{fmt(totalPnl)}} USDT</div></div>
+    <div class="kpi"><div class="kpi-label">&Oslash; Gewinn</div><div class="kpi-value green">+${{fmt(avgWin)}}</div></div>
+    <div class="kpi"><div class="kpi-label">&Oslash; Verlust</div><div class="kpi-value red">${{fmt(avgLoss)}}</div></div>
+    <div class="kpi"><div class="kpi-label">&Oslash; R-Mult</div><div class="kpi-value ${{avgR!=null?(avgR>=1.5?'green':avgR>=0?'amber':'red'):''}}">${{avgR!=null?fmt(avgR,2):'\u2014'}}</div><div class="kpi-sub">${{rmults.length}} Trades</div></div>
+    <div class="kpi"><div class="kpi-label">Premium WR</div><div class="kpi-value ${{premWr!=null?cc(premWr,.6,.5):''}}">${{premWr!=null?pct(premWr):'n/a'}}</div><div class="kpi-sub">${{premT.length}} Trades</div></div>
+    <div class="kpi"><div class="kpi-label">Makro WR</div><div class="kpi-value ${{macroWr!=null?cc(macroWr):''}}">${{macroWr!=null?pct(macroWr):'n/a'}}</div><div class="kpi-sub">${{macroT.length}} Trades</div></div>
+  </div>`;
+
+  // Equity-Kurve Daten
+  const eqL=[],eqD=[],eqC=[],ddD=[];
+  let cum=0,peak=0;
+  sorted.forEach((t,i)=>{{
+    const p=parseFloat(t.pnl_usdt||t.net_pnl||0);
+    cum+=p;peak=Math.max(peak,cum);
+    eqL.push((t.ts_close||t.ts_queue||'').substring(0,10)||'#'+(i+1));
+    eqD.push(parseFloat(cum.toFixed(2)));
+    eqC.push(p>=0?'rgba(46,204,113,0.9)':'rgba(231,76,60,0.9)');
+    ddD.push(parseFloat((cum-peak).toFixed(2)));
+  }});
+
+  html+=`<div class="chart-wide">
+    <div class="section-title">Equity-Kurve &mdash; Kumulativer P&amp;L &amp; Drawdown</div>
+    <div class="chart-box"><canvas id="cEq"></canvas></div></div>`;
+
+  // Scatter Daten
+  const scW=closed.filter(t=>t.score&&t.r_multiple&&!isNaN(parseFloat(t.r_multiple))&&isWon(t))
+    .map(t=>{{return{{x:parseInt(t.score),y:parseFloat(parseFloat(t.r_multiple).toFixed(2))}}}});
+  const scL=closed.filter(t=>t.score&&t.r_multiple&&!isNaN(parseFloat(t.r_multiple))&&!isWon(t))
+    .map(t=>{{return{{x:parseInt(t.score),y:parseFloat(parseFloat(t.r_multiple).toFixed(2))}}}});
+
+  // Streak Daten
+  const stk=[];let cur={{type:isWon(sorted[0])?'W':'L',len:0}};
+  sorted.forEach(t=>{{
+    const tp=isWon(t)?'W':'L';
+    if(tp===cur.type)cur.len++;else{{stk.push({{...cur}});cur={{type:tp,len:1}};}}
+  }});stk.push({{...cur}});
+  const stL=stk.map((s,i)=>'#'+(i+1));
+  const stV=stk.map(s=>s.type==='W'?s.len:-s.len);
+  const stC=stk.map(s=>s.type==='W'?'rgba(46,204,113,0.75)':'rgba(231,76,60,0.75)');
+
+  html+=`<div class="chart-grid">
+    <div><div class="section-title">Score vs. R-Multiple &mdash; Korreliert Score mit Outcome?</div>
+      <div class="chart-box"><canvas id="cSc"></canvas></div></div>
+    <div><div class="section-title">Win / Loss Streaks</div>
+      <div class="chart-box"><canvas id="cSt"></canvas></div></div>
   </div>`;
 
   // Score-Analyse
-  html += `<div class="section"><div class="section-title">Score-Analyse &mdash; Welcher Score-Bereich ist am profitabelsten?</div>
-  <div class="score-grid">`;
-  const bColors = {{'A (75-100)':'#2ecc71','B (50-74)':'#3498db','C (25-49)':'#f39c12','D (0-24)':'#e74c3c'}};
-  Object.entries(buckets).forEach(([range, ts]) => {{
-    if (!ts.length) {{
-      html += `<div class="score-card"><div class="score-badge" style="color:${{bColors[range]}}">${{range}}</div><div class="score-stats">Keine Trades</div></div>`;
-      return;
-    }}
-    const bWr  = ts.filter(t=>t.won==1||t.won===true).length/ts.length;
-    const bPnl = ts.reduce((s,t)=>s+parseFloat(t.pnl_usdt||t.net_pnl||0),0);
-    const bR   = ts.filter(t=>t.r_multiple).map(t=>parseFloat(t.r_multiple));
-    const bAvgR = bR.length ? bR.reduce((s,v)=>s+v,0)/bR.length : null;
-    html += `<div class="score-card">
-      <div class="score-badge" style="color:${{bColors[range]}}">${{range}}</div>
+  const bCol={{'A (75-100)':'#2ecc71','B (50-74)':'#3498db','C (25-49)':'#f39c12','D (0-24)':'#e74c3c'}};
+  html+=`<div class="section"><div class="section-title">Score-Analyse</div><div class="score-grid">`;
+  Object.entries(bk).forEach(([range,ts])=>{{
+    if(!ts.length){{html+=`<div class="score-card"><div class="score-badge" style="color:${{bCol[range]}}">${{range}}</div><div class="score-stats">Keine Trades</div></div>`;return;}}
+    const bWr=ts.filter(isWon).length/ts.length;
+    const bPnl=ts.reduce((s,t)=>s+parseFloat(t.pnl_usdt||t.net_pnl||0),0);
+    const bR=ts.filter(t=>t.r_multiple&&!isNaN(parseFloat(t.r_multiple))).map(t=>parseFloat(t.r_multiple));
+    const bAvgR=bR.length?bR.reduce((s,v)=>s+v,0)/bR.length:null;
+    html+=`<div class="score-card">
+      <div class="score-badge" style="color:${{bCol[range]}}">${{range}}</div>
       <div class="score-label">${{ts.length}} Trades</div>
-      <div class="score-bar"><div class="score-fill" style="width:${{bWr*100}}%;background:${{bColors[range]}}"></div></div>
-      <div class="score-stats">
-        WR: ${{pct(bWr)}} &nbsp;|&nbsp; Net: ${{bPnl>=0?'+':''}}${{fmt(bPnl)}} USDT<br>
-        &#xD8; R: ${{bAvgR!=null?fmt(bAvgR,2):'&#x2014;'}}
-      </div></div>`;
+      <div class="score-bar"><div class="score-fill" style="width:${{bWr*100}}%;background:${{bCol[range]}}"></div></div>
+      <div class="score-stats">WR: ${{pct(bWr)}} | Net: ${{bPnl>=0?'+':''}}${{fmt(bPnl)}} USDT<br>&Oslash; R: ${{bAvgR!=null?fmt(bAvgR,2):'\u2014'}}</div></div>`;
   }});
-  html += `</div></div>`;
+  html+=`</div></div>`;
 
-  // Wochentag + Close-Reason nebeneinander
-  html += `<div class="two-col section">`;
-
-  // Wochentag
-  const dayOrder = ['Montag','Dienstag','Mittwoch','Donnerstag','Freitag','Samstag','Sonntag'];
-  html += `<div><div class="section-title">Winrate nach Wochentag</div>`;
-  dayOrder.forEach(d => {{
-    if (!dayMap[d]) return;
-    const dwr = dayMap[d].wins/dayMap[d].total;
-    html += `<div class="bar-row">
-      <span style="font-family:var(--mono);font-size:12px;color:var(--muted)">${{d.substring(0,2)}} (${{dayMap[d].total}})</span>
-      <div class="bar-bg"><div class="bar-val" style="width:${{dwr*100}}%;background:${{dwr>=0.55?'var(--green)':dwr>=0.45?'var(--amber)':'var(--red)'}}"></div></div>
-      <span style="font-family:var(--mono);font-size:12px;color:${{dwr>=0.55?'var(--green)':dwr>=0.45?'var(--amber)':'var(--red)'}}">${{pct(dwr)}}</span>
+  // Wochentag + Close-Reason
+  const dO=['Montag','Dienstag','Mittwoch','Donnerstag','Freitag','Samstag','Sonntag'];
+  html+=`<div class="two-col section"><div><div class="section-title">Winrate nach Wochentag</div>`;
+  dO.forEach(d=>{{
+    if(!dm[d])return;
+    const dwr=dm[d].wins/dm[d].total;
+    html+=`<div class="bar-row">
+      <span style="font-family:var(--mono);font-size:12px;color:var(--muted)">${{d.substring(0,2)}} (${{dm[d].total}})</span>
+      <div class="bar-bg"><div class="bar-val" style="width:${{dwr*100}}%;background:${{dwr>=.55?'var(--green)':dwr>=.45?'var(--amber)':'var(--red)'}}"></div></div>
+      <span style="font-family:var(--mono);font-size:12px;color:${{dwr>=.55?'var(--green)':dwr>=.45?'var(--amber)':'var(--red)'}}">${{pct(dwr)}}</span>
     </div>`;
   }});
-  html += `</div>`;
-
-  // Close-Reason
-  html += `<div><div class="section-title">Abschluss-Ursache</div><div class="table-wrap"><table>
-    <thead><tr><th>Ursache</th><th>Anzahl</th><th>Anteil</th></tr></thead><tbody>`;
-  Object.entries(reasons).sort((a,b)=>b[1]-a[1]).forEach(([r,n]) => {{
-    html += `<tr><td>${{r}}</td><td style="color:var(--muted)">${{n}}</td><td style="color:var(--muted)">${{(n/closed.length*100).toFixed(0)}}%</td></tr>`;
+  html+=`</div><div><div class="section-title">Abschluss-Ursache</div><div class="table-wrap"><table>
+    <thead><tr><th>Ursache</th><th>#</th><th>%</th></tr></thead><tbody>`;
+  Object.entries(rz).sort((a,b)=>b[1]-a[1]).forEach(([r,n])=>{{
+    html+=`<tr><td>${{r}}</td><td style="color:var(--muted)">${{n}}</td><td style="color:var(--muted)">${{(n/closed.length*100).toFixed(0)}}%</td></tr>`;
   }});
-  html += `</tbody></table></div></div>`;
-  html += `</div>`;
+  html+=`</tbody></table></div></div></div>`;
 
-  // Letzte Trades
-  const recent = [...closed].sort((a,b) => {{
-    const ta = a.ts_close||a.ts_queue||'';
-    const tb = b.ts_close||b.ts_queue||'';
-    return tb.localeCompare(ta);
-  }}).slice(0,40);
-
-  html += `<div class="section"><div class="section-title">Letzte Trades (max. 40)</div>
-  <div class="table-wrap"><table>
-  <thead><tr>
-    <th>Datum</th><th>Symbol</th><th>Dir</th><th>Score</th><th>Premium</th>
-    <th>Hebel</th><th>SL%</th><th>R-Mult</th><th>P&amp;L</th><th>Ursache</th><th>Ergebnis</th>
+  // Trades-Tabelle
+  const rec=[...sorted].reverse().slice(0,40);
+  html+=`<div class="section"><div class="section-title">Letzte Trades (max. 40)</div>
+  <div class="table-wrap"><table><thead><tr>
+    <th>Datum</th><th>Symbol</th><th>Dir</th><th>Score</th><th>Prem</th>
+    <th>Hebel</th><th>SL%</th><th>R</th><th>P&amp;L</th><th>Ursache</th><th>Ergebnis</th>
   </tr></thead><tbody>`;
-  recent.forEach(t => {{
-    const dt = (t.ts_close||t.ts_queue||'').substring(0,10);
-    const sc = parseInt(t.score||0);
-    const scCls = sc>=75?'green':sc>=50?'blue':sc>=25?'amber':'red';
-    const pnl = parseFloat(t.pnl_usdt||t.net_pnl||0);
-    const rm  = t.r_multiple ? parseFloat(t.r_multiple) : null;
-    html += `<tr>
-      <td style="color:var(--muted)">${{dt||'&#x2014;'}}</td>
-      <td style="font-weight:600">${{t.symbol||'&#x2014;'}}</td>
+  rec.forEach(t=>{{
+    const dt=(t.ts_close||t.ts_queue||'').substring(0,10);
+    const sc=parseInt(t.score||0);
+    const scC=sc>=75?'green':sc>=50?'blue':sc>=25?'amber':'red';
+    const pnl=parseFloat(t.pnl_usdt||t.net_pnl||0);
+    const rm=t.r_multiple&&!isNaN(parseFloat(t.r_multiple))?parseFloat(t.r_multiple):null;
+    const w=isWon(t);
+    html+=`<tr>
+      <td style="color:var(--muted)">${{dt||'\u2014'}}</td>
+      <td style="font-weight:600">${{t.symbol||'\u2014'}}</td>
       <td>${{(t.direction||'').toLowerCase()==='long'?pill('LONG','green'):pill('SHORT','red')}}</td>
-      <td>${{pill(sc||'&#x2014;', scCls)}}</td>
-      <td>${{(t.is_premium==1||t.is_premium===true)?pill('&#x2605; Prem','amber'):'&#x2014;'}}</td>
-      <td style="color:var(--muted)">${{t.leverage||t.open_leverage||'&#x2014;'}}x</td>
-      <td style="color:var(--muted)">${{t.sl_pct?fmt(t.sl_pct,2)+'%':'&#x2014;'}}</td>
-      <td class="${{rm!=null?(rm>=1.5?'green':rm>=0?'amber':'red'):''}}">${{rm!=null?fmt(rm,2):'&#x2014;'}}</td>
+      <td>${{pill(sc||'\u2014',scC)}}</td>
+      <td>${{(t.is_premium==1||t.is_premium===true||t.is_premium==='1')?pill('\u2605','amber'):'\u2014'}}</td>
+      <td style="color:var(--muted)">${{t.leverage||t.open_leverage||'\u2014'}}x</td>
+      <td style="color:var(--muted)">${{t.sl_pct?fmt(t.sl_pct,2)+'%':'\u2014'}}</td>
+      <td class="${{rm!=null?(rm>=1.5?'green':rm>=0?'amber':'red'):''}}">${{rm!=null?fmt(rm,2):'\u2014'}}</td>
       <td class="${{pnl>=0?'green':'red'}}">${{pnl>=0?'+':''}}${{fmt(pnl)}} USDT</td>
-      <td style="color:var(--muted);font-size:11px">${{t.close_reason||'&#x2014;'}}</td>
-      <td>${{(t.won==1||t.won===true)?pill('Gewinn','green'):pill('Verlust','red')}}</td>
+      <td style="color:var(--muted);font-size:11px">${{t.close_reason||'\u2014'}}</td>
+      <td>${{w?pill('Gewinn','green'):pill('Verlust','red')}}</td>
     </tr>`;
   }});
-  html += `</tbody></table></div></div>`;
+  html+=`</tbody></table></div></div>`;
 
-  document.getElementById('content').innerHTML = html;
+  document.getElementById('content').innerHTML=html;
+
+  // CHART 1 — Equity + Drawdown
+  _charts.push(new Chart(document.getElementById('cEq').getContext('2d'),{{
+    type:'line',
+    data:{{
+      labels:eqL,
+      datasets:[
+        {{label:'Kumulativer P&L (USDT)',data:eqD,borderColor:'#c9a84c',
+          backgroundColor:'rgba(201,168,76,0.08)',borderWidth:2,
+          pointRadius:eqD.length>50?0:3,pointHoverRadius:5,pointBackgroundColor:eqC,
+          fill:true,tension:0.3,yAxisID:'y'}},
+        {{label:'Drawdown',data:ddD,borderColor:'rgba(231,76,60,0.6)',
+          backgroundColor:'rgba(231,76,60,0.07)',borderWidth:1.5,
+          pointRadius:0,fill:true,tension:0.3,yAxisID:'y'}}
+      ]
+    }},
+    options:{{
+      responsive:true,
+      interaction:{{mode:'index',intersect:false}},
+      plugins:{{legend:{{labels:{{boxWidth:12,padding:16}}}},
+        tooltip:{{callbacks:{{label:ctx=>` ${{ctx.dataset.label}}: ${{ctx.parsed.y>=0?'+':''}}${{ctx.parsed.y.toFixed(2)}} USDT`}}}}}},
+      scales:{{
+        x:{{ticks:{{maxTicksLimit:10,maxRotation:0}}}},
+        y:{{grid:{{color:'rgba(255,255,255,0.04)'}}}}
+      }}
+    }}
+  }}));
+
+  // CHART 2 — Score vs R-Multiple Scatter
+  _charts.push(new Chart(document.getElementById('cSc').getContext('2d'),{{
+    type:'scatter',
+    data:{{datasets:[
+      {{label:'Gewinn',data:scW,backgroundColor:'rgba(46,204,113,0.65)',pointRadius:5}},
+      {{label:'Verlust',data:scL,backgroundColor:'rgba(231,76,60,0.65)',pointRadius:5}},
+      {{label:'R=1.5 Min',data:[{{x:0,y:1.5}},{{x:100,y:1.5}}],type:'line',
+        borderColor:'rgba(243,156,18,0.5)',borderDash:[4,4],borderWidth:1.5,
+        pointRadius:0,fill:false}}
+    ]}},
+    options:{{
+      responsive:true,
+      plugins:{{legend:{{labels:{{boxWidth:12,padding:12}}}},
+        tooltip:{{callbacks:{{label:ctx=>` Score ${{ctx.parsed.x}} \u2192 R ${{ctx.parsed.y.toFixed(2)}}`}}}}}},
+      scales:{{
+        x:{{title:{{display:true,text:'Score (0\u2013100)'}},min:0,max:100}},
+        y:{{title:{{display:true,text:'R-Multiple'}},grid:{{color:'rgba(255,255,255,0.04)'}}}}
+      }}
+    }}
+  }}));
+
+  // CHART 3 — Win/Loss Streaks
+  _charts.push(new Chart(document.getElementById('cSt').getContext('2d'),{{
+    type:'bar',
+    data:{{labels:stL,datasets:[{{
+      label:'Streak (+W / -L)',data:stV,backgroundColor:stC,borderRadius:3
+    }}]}},
+    options:{{
+      responsive:true,
+      plugins:{{legend:{{display:false}}}},
+      scales:{{
+        x:{{ticks:{{display:stL.length<=60}},grid:{{display:false}}}},
+        y:{{grid:{{color:'rgba(255,255,255,0.04)'}},
+          ticks:{{callback:v=>v>0?'+'+v+'W':v+'L'}}}}
+      }}
+    }}
+  }}));
 }}
 
 render(RAW);
@@ -7588,26 +7666,15 @@ render(RAW);
 </html>"""
 
 
-def start_webhook_server():
-    """
-    Startet einen Flask HTTP-Server in einem separaten Thread.
-    TradingView sendet Alerts per POST an /webhook?token=SECRET
 
-    Erwartet JSON-Payload:
-    {
-      "symbol":    "ETHUSDT" oder "BITGET:ETHUSDT.P",
-      "direction": "long" oder "short",
-      "entry":     2850.50,        (optional — nimmt aktuellen Kurs wenn leer)
-      "timeframe": "H2"            (optional — für Log)
-    }
-    """
+def start_webhook_server():
+    """Startet Flask-Webhook-Server in separatem Thread."""
     if not FLASK_AVAILABLE:
         log("Flask nicht installiert — Webhook-Server deaktiviert")
         log("requirements.txt: flask hinzufügen")
         return
 
     # ── Token-Redaction im Werkzeug-Access-Log ──────────────────
-    # Werkzeug loggt jedes eingehende POST /webhook?token=XYZ im Access-Log.
     # Das landet in Railway → Token leakt jedes Mal wenn Logs geteilt/exportiert
     # werden. Wir hängen einen Filter an den werkzeug-Logger, der jedes
     # ?token=... durch ?token=*** ersetzt BEVOR die Zeile rausgeht.
