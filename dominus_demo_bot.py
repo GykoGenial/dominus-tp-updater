@@ -7287,7 +7287,7 @@ def poll_telegram_commands():
                 log(f"[handle_callback_query] Fehler: {ex}")
             continue
 
-        msg = update.get("message")
+        msg = update.get("message") or update.get("channel_post")
         if not msg:
             continue
 
