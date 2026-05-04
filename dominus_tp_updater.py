@@ -8238,7 +8238,10 @@ def start_webhook_server():
             # FIX: Nur feuern wenn eine offene Position fuer dieses Symbol existiert.
             # TradingView sendet LIQ_WARNING fuer JEDEN Coin in der Watchlist —
             # der Bot muss hier filtern, sonst kommen 80+ Meldungen pro H2-Kerze.
-            pos = get_position(symbol)
+            _all_pos = get_all_positions()
+            pos = next((p for p in _all_pos
+                        if p.get("symbol", "").upper() == symbol.upper()
+                        and float(p.get("total", 0)) > 0), None)
             if not pos or float(pos.get("total", 0)) == 0:
                 log(f"  LIQ_WARNING: {symbol} ignoriert (keine offene Position)")
                 return
