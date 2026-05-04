@@ -8210,20 +8210,37 @@ def start_webhook_server():
                 save_state()
             return  # ok: HARSI_EXIT handled
 
-        # ── LIQ_WARNING → Telegram + Demo weiterleiten ─────────
+        # ── LIQ_WARNING → nur bei offener Position, gebündelt ───
         if signal_type == "LIQ_WARNING":
             liq_tp   = int(float(data.get("liq_tp",   4) or 4))
             liq_pool = float(data.get("liq_pool", 0) or 0)
             dir_raw  = int(float(data.get("direction", 0) or 0))
             d_txt    = "LONG" if dir_raw == 1 else "SHORT" if dir_raw == -1 else "?"
-            tp_emoji = "🔴" if liq_tp == 1 else "🟠" if liq_tp == 2 else "🟡" if liq_tp == 3 else "🟢"
-            log(f"  LIQ_WARNING: {symbol} {d_txt} Pool bei TP{liq_tp}")
+
+            # FIX: Nur feuern wenn eine offene Position fuer dieses Symbol existiert.
+            # TradingView sendet LIQ_WARNING fuer JEDEN Coin in der Watchlist —
+            # der Bot muss hier filtern, sonst kommen 80+ Meldungen pro H2-Kerze.
+            pos = get_position(symbol)
+            if not pos or float(pos.get("total", 0)) == 0:
+                log(f"  LIQ_WARNING: {symbol} ignoriert (keine offene Position)")
+                return
+
+            # Nur wenn TP-Level relevant (nicht TP4 = kein Pool = OK)
+            if liq_tp >= 4:
+                log(f"  LIQ_WARNING: {symbol} ignoriert (kein Pool bei TPs)")
+                return
+
+            tp_emoji = "🔴" if liq_tp == 1 else "🟠" if liq_tp == 2 else "🟡"
+            avg_px   = float(pos.get("openPriceAvg", entry) or entry)
+            unrealised = float(pos.get("unrealizedPL", 0) or 0)
+
+            log(f"  LIQ_WARNING: {symbol} {d_txt} Pool bei TP{liq_tp} — offene Position!")
             telegram(
                 f"{tp_emoji} <b>Liquidity Warning \u2014 {symbol}</b>\n"
-                f"Richtung: {d_txt} | Kurs: {entry}\n\n"
-                + (f"Pool bei TP{liq_tp}: {liq_pool:.5f} USDT\n"
-                   f"\u26a0\ufe0f TP-Ziel anpassen!" if liq_tp < 4 else
-                   f"\u2713 Kein Pool \u2014 TP4 halten")
+                f"Richtung: {d_txt}  \u00b7  Avg: {avg_px:.5f}\n"
+                f"Pool bei <b>TP{liq_tp}</b>: {liq_pool:.5f} USDT\n"
+                f"uPnL: {unrealised:+.2f} USDT\n\n"
+                f"\u26a0\ufe0f TP{liq_tp}-Ziel anpassen oder fr\u00fchzeitig nehmen!"
             )
             forward_to_demo(data)
             return
