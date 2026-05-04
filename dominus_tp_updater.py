@@ -844,6 +844,13 @@ AUTO_TRADE_ENABLED        = _raw_at in ("1", "true", "yes", "on")
 AUTO_TRADE_CONFIRM_TTL_SEC = _env_int("AUTO_TRADE_CONFIRM_TTL_SEC", 10)
 MAX_AUTO_TRADE_USDT       = _env_float("MAX_AUTO_TRADE_USDT", 0.0)
 
+# Mindest-Score fuer automatische Ausfuehrung (MIN_AUTO_TRADE_SCORE).
+# Trades unterhalb dieser Schwelle werden nicht ausgefuehrt — Telegram zeigt
+# eine Erklaerung mit dem tatsaechlichen Score des Top-Kandidaten.
+# Empfehlung: 45 (DOMINUS-Minimum), 55 (konservativ), 75 (nur Premium).
+# Als Railway-Variable setzbar: MIN_AUTO_TRADE_SCORE=55
+MIN_AUTO_TRADE_SCORE      = int(_env_float("MIN_AUTO_TRADE_SCORE", 45))
+
 # v4.35: Watchlist-Master Drop-Logging — Lärm-Reduktion
 # Pine sendet SLING_SL/HARSI_SL für jedes Watchlist-Symbol. Ohne offene Position
 # wird stumm verworfen — bisher mit Per-Drop-Log-Zeile (240+43 Drops in 24h
@@ -4587,7 +4594,18 @@ def flush_entries() -> None:
             _px   = float(_top.get("entry") or 0)
             _sc   = _top["_scored"]["score"]
 
-            if _sl and _px:
+            # Score-Schwelle pruefen (MIN_AUTO_TRADE_SCORE, Standard 45)
+            if _sc < MIN_AUTO_TRADE_SCORE:
+                log(f"  AUTO-EXEC: {_sym} NICHT ausgefuehrt — "
+                    f"Score {_sc} < Minimum {MIN_AUTO_TRADE_SCORE}")
+                telegram(
+                    f"⏸ <b>Auto-Execute pausiert — Score zu niedrig</b>\n"
+                    f"Top-Kandidat: <b>{_sym} {_dir.upper()}</b>\n"
+                    f"Score: <b>{_sc}/100</b>  ·  Minimum: <b>{MIN_AUTO_TRADE_SCORE}</b>\n\n"
+                    f"Kein Trade gesetzt. Warte auf besseres Setup.\n"
+                    f"<i>Tipp: MIN_AUTO_TRADE_SCORE in Railway anpassen.</i>"
+                )
+            elif _sl and _px:
                 log(f"  AUTO-EXEC: {_sym} {_dir.upper()} | Score={_sc} | "
                     f"Entry={_px} SL={_sl} Lev={_lev}x")
                 telegram(
