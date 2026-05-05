@@ -851,6 +851,15 @@ MAX_AUTO_TRADE_USDT       = _env_float("MAX_AUTO_TRADE_USDT", 0.0)
 # Als Railway-Variable setzbar: MIN_AUTO_TRADE_SCORE=55
 MIN_AUTO_TRADE_SCORE      = int(_env_float("MIN_AUTO_TRADE_SCORE", 45))
 
+# Anzahl Premium-Trades die automatisch ausgefuehrt werden wenn ein
+# Premium-Signal-Burst kommt. 0 = deaktiviert (nur Top-1 normaler Modus).
+# PREMIUM_AUTO_TRADE_COUNT=2 → die 2 besten Premium-Signale werden
+# automatisch getradet. Nicht-Premium Signale werden ignoriert wenn
+# mindestens ein Premium-Signal vorhanden ist.
+# Voraussetzung: Signal muss is_premium=True haben (Impuls im Premium-Bereich)
+# und Score >= MIN_AUTO_TRADE_SCORE erfuellen.
+PREMIUM_AUTO_TRADE_COUNT  = int(_env_float("PREMIUM_AUTO_TRADE_COUNT", 0))
+
 # v4.35: Watchlist-Master Drop-Logging — Lärm-Reduktion
 # Pine sendet SLING_SL/HARSI_SL für jedes Watchlist-Symbol. Ohne offene Position
 # wird stumm verworfen — bisher mit Per-Drop-Log-Zeile (240+43 Drops in 24h
@@ -3215,7 +3224,49 @@ def execute_trade_order(symbol: str, direction: str, leverage: int,
     if direction not in ("long", "short"):
         return {"ok": False, "reason": f"Ungültige Richtung: {direction!r}"}
 
-    # ── 1b. SL-Seite validieren ─────────────────────────────────
+    # ── 1b. DOMINUS Money-Management: Bestehende Trades muessen safe sein ──
+    # Regel (PDF, Kapitel 11): "Sobald ein Trade das Auszahlungsschema
+    # erreicht hat und der Stop Loss auf Entry nachgezogen wurde, kannst du
+    # eine weitere Position eroeffnen. Vorher sollte kein neuer Trade
+    # gestartet werden."
+    #
+    # "Safe" = trailing_sl_level >= 1 (SL auf Entry nach TP1)
+    # Pruefung nur fuer Symbole mit aktiver Position (last_known_size > 0).
+    # Das neue Symbol selbst wird NICHT geprueft (wuerde immer 0 liefern).
+    _unsafe = []
+    for _sym, _lvl in trailing_sl_level.items():
+        if _sym == symbol:
+            continue   # neues Symbol — noch keine Position
+        _size = last_known_size.get(_sym, 0)
+        if _size <= 0:
+            continue   # keine aktive Position
+        _sl_safe = sl_at_entry.get(_sym, False)
+        if not _sl_safe and _lvl < 1:
+            # Position existiert, SL noch NICHT auf Entry nachgezogen
+            _avg = last_known_avg.get(_sym, 0)
+            _unsafe.append((_sym, _lvl, _avg))
+
+    if _unsafe:
+        _lines = "\n".join(
+            f"  • {s}: Level {l} — SL noch auf Original"
+            for s, l, _ in _unsafe
+        )
+        _reason = (
+            f"DOMINUS-Regel verletzt: {len(_unsafe)} Position(en) noch nicht safe "
+            f"(SL nicht auf Entry):\n{_lines}\n\n"
+            f"Erst wenn TP1 erreicht und SL auf Entry → neuer Trade erlaubt."
+        )
+        log(f"  ✗ AUTO-TRADE BLOCKIERT — DOMINUS Money-Management:\n{_lines}")
+        telegram(
+            f"🛑 <b>Neuer Trade blockiert — DOMINUS-Regel</b>\n\n"
+            f"Folgende Positionen haben SL noch nicht auf Entry:\n"
+            + "\n".join(f"  • <b>{s}</b>  ·  Level {l}" for s, l, _ in _unsafe)
+            + f"\n\n<i>Erst nach TP1 und SL-Nachzug auf Entry ist ein neuer "
+              f"Trade erlaubt.</i>"
+        )
+        return {"ok": False, "reason": _reason}
+
+    # ── 1c. SL-Seite validieren ─────────────────────────────────
     if direction == "long" and sl >= entry:
         return {"ok": False,
                 "reason": f"SL {sl} >= Entry {entry} bei LONG — ungültig"}
@@ -4639,56 +4690,285 @@ def flush_entries() -> None:
             log("  ENTRY-QUEUE: WARNUNG — keine message_id erhalten, "
                 "Callback-Navigation deaktiviert für diesen Slot")
 
-        # ── Vollautomatische Ausführung des Top-Scorers ──────────────
-        # Wenn AUTO_TRADE_ENABLED=true: ranked[0] sofort ohne Button-Tap ausfuehren.
+        # ── Vollautomatische Ausführung ──────────────────────────
+        # Zwei Modi (steuerbar via Railway-Variablen):
+        #
+        # Modus A — PREMIUM_AUTO_TRADE_COUNT > 0 (Premium-Modus):
+        #   Nur Premium-Signale werden beruecksichtigt. Wenn Premium-Signale
+        #   vorhanden: die besten N werden automatisch ausgefuehrt.
+        #   Kein Premium → kein Trade (auch nicht Top-Scorer).
+        #
+        # Modus B — Standard (PREMIUM_AUTO_TRADE_COUNT = 0):
+        #   ranked[0] wird ausgefuehrt (bisheriges Verhalten), unabhaengig
+        #   ob Premium oder nicht — Score-Schwelle gilt immer.
         if AUTO_TRADE_ENABLED and ranked:
-            _top  = ranked[0]
-            _sugg = _top.get("sugg") or {}
-            _sym  = _top["symbol"]
-            _dir  = _top["direction"]
-            _lev  = int(_sugg.get("leverage") or 10)
-            _sl   = float(_sugg.get("sl") or 0)
-            _px   = float(_top.get("entry") or 0)
-            _sc   = _top["_scored"]["score"]
 
-            # Score-Schwelle pruefen (MIN_AUTO_TRADE_SCORE, Standard 45)
-            if _sc < MIN_AUTO_TRADE_SCORE:
-                log(f"  AUTO-EXEC: {_sym} NICHT ausgefuehrt — "
-                    f"Score {_sc} < Minimum {MIN_AUTO_TRADE_SCORE}")
-                telegram(
-                    f"⏸ <b>Auto-Execute pausiert — Score zu niedrig</b>\n"
-                    f"Top-Kandidat: <b>{_sym} {_dir.upper()}</b>\n"
-                    f"Score: <b>{_sc}/100</b>  ·  Minimum: <b>{MIN_AUTO_TRADE_SCORE}</b>\n\n"
-                    f"Kein Trade gesetzt. Warte auf besseres Setup.\n"
-                    f"<i>Tipp: MIN_AUTO_TRADE_SCORE in Railway anpassen.</i>"
-                )
-            elif _sl and _px:
-                log(f"  AUTO-EXEC: {_sym} {_dir.upper()} | Score={_sc} | "
-                    f"Entry={_px} SL={_sl} Lev={_lev}x")
-                telegram(
-                    f"🤖 <b>Auto-Execute — Top-Score</b>\n"
-                    f"<b>{_sym} {_dir.upper()}</b>  ·  Score <b>{_sc}/100</b>\n"
-                    f"Entry: <code>{_px}</code>  ·  SL: <code>{_sl}</code>  "
-                    f"·  {_lev}x"
-                )
-                _res = execute_trade_order(_sym, _dir, _lev, _px, _sl)
-                if _res.get("ok"):
+            # Premium-Kandidaten filtern (Score >= Minimum)
+            _premium_candidates = [
+                e for e in ranked
+                if e["_scored"].get("is_premium")
+                and e["_scored"]["score"] >= MIN_AUTO_TRADE_SCORE
+            ]
+
+            if PREMIUM_AUTO_TRADE_COUNT > 0:
+                # ── MODUS A: Nur Premium ─────────────────────────
+                if not _premium_candidates:
+                    # Kein Premium → Fallback auf Standard-Logik (Top-Scorer)
+                    _top_sc  = ranked[0]["_scored"]["score"]
+                    _top_sym = ranked[0]["symbol"]
+                    log(f"  AUTO-EXEC: kein Premium — Fallback auf Top-Scorer "
+                        f"{_top_sym} Score={_top_sc}")
                     telegram(
-                        f"✅ <b>Order platziert — {_sym}</b>\n"
-                        f"Qty: {_res.get('qty')}  ·  Margin: "
-                        f"{_res.get('initial_margin', 0):.2f} USDT"
+                        f"⭐ <b>Kein Premium-Signal — Standard-Fallback</b>\n"
+                        f"Top-Scorer: <b>{_top_sym}</b>  ·  Score {_top_sc}\n"
+                        f"<i>Kein Premium verfuegbar, normale Logik greift.</i>"
                     )
+                    # Standard-Logik: Top-Scorer ausfuehren (identisch Modus B)
+                    _top  = ranked[0]
+                    _sugg = _top.get("sugg") or {}
+                    _sym  = _top["symbol"]
+                    _dir  = _top["direction"]
+                    _lev  = int(_sugg.get("leverage") or 10)
+                    _sl   = float(_sugg.get("sl") or 0)
+                    _px   = float(_top.get("entry") or 0)
+                    _sc   = _top["_scored"]["score"]
+                    if _sc < MIN_AUTO_TRADE_SCORE:
+                        telegram(
+                            f"⏸ <b>Auto-Execute pausiert — Score zu niedrig</b>\n"
+                            f"<b>{_sym} {_dir.upper()}</b>  ·  Score {_sc}  ·  "
+                            f"Minimum {MIN_AUTO_TRADE_SCORE}"
+                        )
+                    elif _sl and _px:
+                        _res = execute_trade_order(_sym, _dir, _lev, _px, _sl)
+                        if _res.get("ok"):
+                            telegram(
+                                f"✅ <b>Order platziert — {_sym}</b>\n"
+                                f"Qty: {_res.get('qty')}  ·  "
+                                f"Margin: {_res.get('initial_margin', 0):.2f} USDT"
+                            )
+                        else:
+                            _reason = _res.get('reason', '?')
+                            telegram(
+                                f"❌ <b>{_sym} fehlgeschlagen</b>\n{_reason}\n"
+                                f"<i>Versuche naechsten Kandidaten...</i>"
+                            )
+                            for _fallback in ranked[1:]:
+                                _fs  = _fallback.get("sugg") or {}
+                                _fsc = _fallback["_scored"]["score"]
+                                if _fsc < MIN_AUTO_TRADE_SCORE:
+                                    break
+                                _fsy = _fallback["symbol"]
+                                _fdi = _fallback["direction"]
+                                _flv = int(_fs.get("leverage") or 10)
+                                _fsl = float(_fs.get("sl") or 0)
+                                _fpx = float(_fallback.get("entry") or 0)
+                                if not _fsl or not _fpx:
+                                    continue
+                                telegram(
+                                    f"🔄 <b>Fallback — {_fsy}</b>\n"
+                                    f"{_fdi.upper()}  ·  Score {_fsc}"
+                                )
+                                _res2 = execute_trade_order(
+                                    _fsy, _fdi, _flv, _fpx, _fsl
+                                )
+                                if _res2.get("ok"):
+                                    telegram(
+                                        f"✅ <b>Fallback — {_fsy}</b>\n"
+                                        f"Qty: {_res2.get('qty')}  ·  Margin: "
+                                        f"{_res2.get('initial_margin',0):.2f} USDT"
+                                    )
+                                    break
+                                else:
+                                    telegram(
+                                        f"❌ <b>Fallback fehlgeschlagen — {_fsy}</b>"
+                                    )
                 else:
+                    # Premium-Signale vorhanden → bis zu N ausfuehren
+                    _to_exec = _premium_candidates[:PREMIUM_AUTO_TRADE_COUNT]
                     telegram(
-                        f"❌ <b>Auto-Execute fehlgeschlagen — {_sym}</b>\n"
-                        f"{_res.get('reason', '?')}"
+                        f"⭐ <b>Premium Auto-Execute — {len(_to_exec)} Trade(s)</b>\n"
+                        + "\n".join(
+                            f"  {i+1}. {e['symbol']} {e['direction'].upper()} "
+                            f"Score {e['_scored']['score']}"
+                            for i, e in enumerate(_to_exec)
+                        )
                     )
+                    for _i, _top in enumerate(_to_exec):
+                        _sugg = _top.get("sugg") or {}
+                        _sym  = _top["symbol"]
+                        _dir  = _top["direction"]
+                        _lev  = int(_sugg.get("leverage") or 10)
+                        _sl   = float(_sugg.get("sl") or 0)
+                        _px   = float(_top.get("entry") or 0)
+                        _sc   = _top["_scored"]["score"]
+
+                        if not _sl or not _px:
+                            log(f"  AUTO-EXEC #{_i+1}: {_sym} — kein SL/Entry, "
+                                f"naechsten versuchen")
+                            continue
+
+                        log(f"  AUTO-EXEC #{_i+1}: {_sym} {_dir.upper()} "
+                            f"Score={_sc} Entry={_px} SL={_sl} Lev={_lev}x [PREMIUM]")
+                        telegram(
+                            f"🤖⭐ <b>Premium Trade #{_i+1} — {_sym}</b>\n"
+                            f"{_dir.upper()}  ·  Score <b>{_sc}/100</b>  ·  {_lev}x\n"
+                            f"Entry: <code>{_px}</code>  ·  SL: <code>{_sl}</code>"
+                        )
+                        _res = execute_trade_order(_sym, _dir, _lev, _px, _sl)
+                        if _res.get("ok"):
+                            telegram(
+                                f"✅ <b>Premium Order #{_i+1} — {_sym}</b>\n"
+                                f"Qty: {_res.get('qty')}  ·  "
+                                f"Margin: {_res.get('initial_margin', 0):.2f} USDT"
+                            )
+                        else:
+                            # Fehler → naechsten Premium-Kandidaten versuchen
+                            _reason = _res.get('reason', '?')
+                            log(f"  AUTO-EXEC #{_i+1}: {_sym} fehlgeschlagen "
+                                f"({_reason}) — versuche Naechsten")
+                            telegram(
+                                f"❌ <b>Premium #{_i+1} fehlgeschlagen — {_sym}</b>\n"
+                                f"{_reason}\n"
+                                f"<i>Versuche naechsten Kandidaten...</i>"
+                            )
+                            # Naechster verfuegbarer Premium-Kandidat der noch
+                            # nicht in _to_exec war
+                            _remaining = [
+                                e for e in _premium_candidates
+                                if e not in _to_exec
+                            ]
+                            if _remaining:
+                                _next = _remaining[0]
+                                _ns   = _next.get("sugg") or {}
+                                _nsy  = _next["symbol"]
+                                _ndi  = _next["direction"]
+                                _nlv  = int(_ns.get("leverage") or 10)
+                                _nsl  = float(_ns.get("sl") or 0)
+                                _npx  = float(_next.get("entry") or 0)
+                                _nsc  = _next["_scored"]["score"]
+                                if _nsl and _npx:
+                                    log(f"  AUTO-EXEC Fallback: {_nsy} "
+                                        f"{_ndi.upper()} Score={_nsc}")
+                                    telegram(
+                                        f"🔄 <b>Fallback — {_nsy}</b>\n"
+                                        f"{_ndi.upper()}  ·  Score {_nsc}  ·  {_nlv}x"
+                                    )
+                                    _res2 = execute_trade_order(
+                                        _nsy, _ndi, _nlv, _npx, _nsl
+                                    )
+                                    if _res2.get("ok"):
+                                        telegram(
+                                            f"✅ <b>Fallback Order — {_nsy}</b>\n"
+                                            f"Qty: {_res2.get('qty')}  ·  "
+                                            f"Margin: "
+                                            f"{_res2.get('initial_margin',0):.2f} USDT"
+                                        )
+                                    else:
+                                        telegram(
+                                            f"❌ <b>Auch Fallback fehlgeschlagen "
+                                            f"— {_nsy}</b>\n"
+                                            f"{_res2.get('reason','?')}"
+                                        )
+                                    _to_exec = list(_to_exec) + [_next]
+                            else:
+                                telegram(
+                                    f"⚠️ Kein weiterer Premium-Kandidat verfuegbar."
+                                )
+                        # Kurze Pause zwischen zwei Trades
+                        if _i < len(_to_exec) - 1:
+                            time.sleep(2)
+
             else:
-                log(f"  AUTO-EXEC: {_sym} uebersprungen — kein SL/Entry (sl={_sl}, entry={_px})")
-                telegram(
-                    f"⚠️ <b>Auto-Execute uebersprungen — {_sym}</b>\n"
-                    f"Kein SL oder Entry-Preis im Signal. Bitte manuell traden."
-                )
+                # ── MODUS B: Standard — Top-Scorer ───────────────
+                _top  = ranked[0]
+                _sugg = _top.get("sugg") or {}
+                _sym  = _top["symbol"]
+                _dir  = _top["direction"]
+                _lev  = int(_sugg.get("leverage") or 10)
+                _sl   = float(_sugg.get("sl") or 0)
+                _px   = float(_top.get("entry") or 0)
+                _sc   = _top["_scored"]["score"]
+
+                if _sc < MIN_AUTO_TRADE_SCORE:
+                    log(f"  AUTO-EXEC: {_sym} NICHT ausgefuehrt — "
+                        f"Score {_sc} < Minimum {MIN_AUTO_TRADE_SCORE}")
+                    telegram(
+                        f"⏸ <b>Auto-Execute pausiert — Score zu niedrig</b>\n"
+                        f"Top-Kandidat: <b>{_sym} {_dir.upper()}</b>\n"
+                        f"Score: <b>{_sc}/100</b>  ·  Minimum: "
+                        f"<b>{MIN_AUTO_TRADE_SCORE}</b>\n\n"
+                        f"Kein Trade. Warte auf besseres Setup."
+                    )
+                elif _sl and _px:
+                    log(f"  AUTO-EXEC: {_sym} {_dir.upper()} | "
+                        f"Score={_sc} | Entry={_px} SL={_sl} Lev={_lev}x")
+                    telegram(
+                        f"🤖 <b>Auto-Execute — Top-Score</b>\n"
+                        f"<b>{_sym} {_dir.upper()}</b>  ·  Score <b>{_sc}/100</b>\n"
+                        f"Entry: <code>{_px}</code>  ·  SL: <code>{_sl}</code>"
+                        f"  ·  {_lev}x"
+                    )
+                    _res = execute_trade_order(_sym, _dir, _lev, _px, _sl)
+                    if _res.get("ok"):
+                        telegram(
+                            f"✅ <b>Order platziert — {_sym}</b>\n"
+                            f"Qty: {_res.get('qty')}  ·  Margin: "
+                            f"{_res.get('initial_margin', 0):.2f} USDT"
+                        )
+                    else:
+                        # Fehler → naechsten Kandidaten aus ranked versuchen
+                        _reason = _res.get('reason', '?')
+                        log(f"  AUTO-EXEC: {_sym} fehlgeschlagen ({_reason}) "
+                            f"— versuche Naechsten")
+                        telegram(
+                            f"❌ <b>{_sym} fehlgeschlagen</b>\n{_reason}\n"
+                            f"<i>Versuche naechsten Kandidaten...</i>"
+                        )
+                        for _fallback in ranked[1:]:
+                            _fs   = _fallback.get("sugg") or {}
+                            _fsc  = _fallback["_scored"]["score"]
+                            if _fsc < MIN_AUTO_TRADE_SCORE:
+                                break
+                            _fsy  = _fallback["symbol"]
+                            _fdi  = _fallback["direction"]
+                            _flv  = int(_fs.get("leverage") or 10)
+                            _fsl  = float(_fs.get("sl") or 0)
+                            _fpx  = float(_fallback.get("entry") or 0)
+                            if not _fsl or not _fpx:
+                                continue
+                            log(f"  AUTO-EXEC Fallback: {_fsy} {_fdi.upper()} "
+                                f"Score={_fsc}")
+                            telegram(
+                                f"🔄 <b>Fallback — {_fsy}</b>\n"
+                                f"{_fdi.upper()}  ·  Score {_fsc}  ·  {_flv}x"
+                            )
+                            _res2 = execute_trade_order(
+                                _fsy, _fdi, _flv, _fpx, _fsl
+                            )
+                            if _res2.get("ok"):
+                                telegram(
+                                    f"✅ <b>Fallback Order — {_fsy}</b>\n"
+                                    f"Qty: {_res2.get('qty')}  ·  Margin: "
+                                    f"{_res2.get('initial_margin', 0):.2f} USDT"
+                                )
+                                break
+                            else:
+                                telegram(
+                                    f"❌ <b>Fallback fehlgeschlagen — {_fsy}</b>\n"
+                                    f"{_res2.get('reason','?')}\n"
+                                    f"<i>Weiter...</i>"
+                                )
+                        else:
+                            telegram(
+                                f"⚠️ Alle Kandidaten fehlgeschlagen. "
+                                f"Bitte manuell pruefen."
+                            )
+                else:
+                    log(f"  AUTO-EXEC: {_sym} skip — kein SL/Entry")
+                    telegram(
+                        f"⚠️ <b>Auto-Execute uebersprungen — {_sym}</b>\n"
+                        f"Kein SL oder Entry. Bitte manuell traden."
+                    )
     except Exception as ex:
         log(f"[flush_entries] Fehler: {ex}")
         try:
