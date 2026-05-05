@@ -882,6 +882,12 @@ BASE_URL = "https://api.bitget.com"
 
 last_known_avg:   dict = {}   # {symbol: avg_price}
 last_known_size:  dict = {}   # {symbol: position_size}
+
+# FIX 3 v4.36: Doppel-Close-Guard — verhindert dass handle_position_closed()
+# fuer dasselbe Symbol innerhalb von 15 Sekunden zweimal ausgefuehrt wird.
+# Tritt auf wenn zwei parallele Threads (Poll + Webhook) gleichzeitig einen
+# Close erkennen.
+_close_cooldown: dict = {}   # {symbol: timestamp_of_last_close}
 sl_at_entry:      dict = {}   # {symbol: bool}
 new_trade_done:   dict = {}   # {symbol: bool} — DCA bereits gesetzt?
 price_decimals_cache: dict = {}  # {symbol: int}  — Preis-Dezimalstellen
@@ -2021,7 +2027,7 @@ def place_tp_orders(symbol: str, avg: float, size: float,
     partial_tps_skipped = 0  # zählt übersprungene Teilschliessungen (Position zu klein)
     carry_qty = 0.0          # übersprungene Qty wird auf nächsten TP aufaddiert
 
-    for roi, label, pct in partial_tps:
+    for _idx, (roi, label, pct) in enumerate(partial_tps):
         tp_raw = calc_tp_price(avg, roi, direction, leverage)
         tp_str = round_price(tp_raw, decimals)
         tp_val = float(tp_str)
@@ -2056,7 +2062,7 @@ def place_tp_orders(symbol: str, avg: float, size: float,
             exec_str = "0"
         # FIX 11 v4.36: ClientOid mit ORDER_PREFIX — nur eigene Orders stornieren
         _ts_ms = int(time.time() * 1000)
-        client_oid = f"{ORDER_PREFIX}TP{partial_tps.index((roi, label, pct))+1}_{_ts_ms}"
+        client_oid = f"{ORDER_PREFIX}TP{_idx+1}_{_ts_ms}"
         res = api_post("/api/v2/mix/order/place-tpsl-order", {
             "symbol":       symbol,
             "productType":  PRODUCT_TYPE,
@@ -2364,6 +2370,17 @@ def handle_position_closed(symbol: str, reason: str = ""):
     Wird aufgerufen wenn eine Position vollständig geschlossen wurde.
     Berechnet P&L, sendet Auswertung per Telegram, bereinigt Status.
     """
+    # FIX 3 v4.36: Doppel-Close-Guard
+    # Wenn handle_position_closed fuer dasselbe Symbol innerhalb von 15s
+    # ein zweites Mal aufgerufen wird, ist es ein Doppel-Trigger (zwei Threads
+    # haben denselben Close erkannt). Den zweiten Aufruf ignorieren.
+    _now = time.time()
+    _last = _close_cooldown.get(symbol, 0)
+    if _now - _last < 15:
+        log(f"  FIX3: Doppel-Close {symbol} ignoriert ({_now-_last:.1f}s seit letztem Close)")
+        return
+    _close_cooldown[symbol] = _now
+
     log(f"Position geschlossen: {symbol} ({reason})")
 
     # Trade-Daten für Auswertung holen
@@ -2700,18 +2717,21 @@ def set_sl_trailing(symbol: str, direction: str, sl_price: float, level: int,
 
     # ── Mark-Price-Guard ─────────────────────────────────────────
     # Bitget lehnt ab wenn SL-Preis auf der falschen Seite des Mark-Price liegt.
-    # Long:  SL muss < Mark-Price (SL über dem Markt → Fehler)
-    # Short: SL muss > Mark-Price (SL unter dem Markt → Fehler)
+    # FIX v4.36: Statt hartem Skip wird ein minimaler Buffer (0.05%) addiert/
+    # subtrahiert, damit der SL immer gesetzt werden kann — auch wenn der
+    # berechnete Trailing-Preis exakt dem Mark-Preis entspricht.
     _mark = get_mark_price(symbol)
     if _mark > 0:
         if direction == "long" and sl_price >= _mark:
-            log(f"  ⚠ Trailing SL Level {level}: sl_price {sl_price:.5f} >= Mark {_mark:.5f} "
-                f"— skip (Bitget würde ablehnen: SL muss < Mark für Long)")
-            return
+            _sl_buffered = _mark * 0.9995   # 0.05% unter Mark
+            log(f"  ⚠ Trailing SL Level {level}: sl_price {sl_price:.8f} >= Mark {_mark:.8f} "
+                f"→ Buffer-Korrektur auf {_sl_buffered:.8f}")
+            sl_price = _sl_buffered
         if direction == "short" and sl_price <= _mark:
-            log(f"  ⚠ Trailing SL Level {level}: sl_price {sl_price:.5f} <= Mark {_mark:.5f} "
-                f"— skip (Bitget würde ablehnen: SL muss > Mark für Short)")
-            return
+            _sl_buffered = _mark * 1.0005   # 0.05% über Mark
+            log(f"  ⚠ Trailing SL Level {level}: sl_price {sl_price:.8f} <= Mark {_mark:.8f} "
+                f"→ Buffer-Korrektur auf {_sl_buffered:.8f}")
+            sl_price = _sl_buffered
 
     decimals     = get_price_decimals(symbol)
     sl_str       = round_price(sl_price, decimals)
