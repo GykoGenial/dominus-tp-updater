@@ -7342,6 +7342,21 @@ def flush_h4_buffer():
     log(f"H4-Zusammenfassung gesendet: {len(longs)} Long, {len(shorts)} Short")
 
 
+def _derive_close_reason(trailing_level: int, won: bool) -> str:
+    """Leitet Close-Reason aus Trailing Level (trades.csv) ab."""
+    if not won:
+        return "SL"
+    if trailing_level >= 4:
+        return "TP4"
+    if trailing_level == 3:
+        return "TP3"
+    if trailing_level == 2:
+        return "TP2"
+    if trailing_level == 1:
+        return "TP1"
+    return "manual"
+
+
 def _build_dashboard_html(trades_json: str) -> str:
     """
     Rendert das DOMINUS Live Performance Dashboard als HTML-String.
@@ -8507,15 +8522,16 @@ def start_webhook_server():
 
         # Basis: entry_queue_log.csv (vollstaendigste Daten: Score, R-Mult, etc.)
         trades = []
+        seen_keys = set()  # Duplikat-Schutz: (symbol, ts_close)
+
         if _os.path.exists(ENTRY_LOG_CSV):
             try:
                 with open(ENTRY_LOG_CSV, newline="", encoding="utf-8") as f:
                     reader = _csv.DictReader(f, delimiter=";")
                     for row in reader:
-                        # Nur abgeschlossene Trades mit Outcome anzeigen
                         if row.get("won") not in ("0", "1"):
                             continue
-                        trades.append({
+                        t = {
                             "symbol":       row.get("symbol", ""),
                             "direction":    row.get("direction", ""),
                             "score":        row.get("score", ""),
@@ -8529,11 +8545,60 @@ def start_webhook_server():
                             "r_multiple":   row.get("r_multiple", ""),
                             "won":          row.get("won", ""),
                             "close_reason": row.get("close_reason", ""),
-                        })
+                        }
+                        trades.append(t)
+                        seen_keys.add((t["symbol"].upper(), t["ts_close"][:10]))
             except Exception as ex:
                 log(f"[dashboard] entry_queue_log read error: {ex}")
 
-        # Fallback: closed_trades RAM (fuer Trades ohne Queue-Log-Eintrag)
+        # Ergaenzung: trades.csv — Trades die nicht im Queue-Log stehen
+        # (z.B. manuell geoeffnete Positionen, Trades vor AUTO_TRADE,
+        #  oder wenn update_entry_log_outcome keinen Queue-Eintrag fand)
+        if _os.path.exists(TRADES_CSV):
+            try:
+                with open(TRADES_CSV, newline="", encoding="utf-8") as f:
+                    reader = _csv.DictReader(f, delimiter=";")
+                    for row in reader:
+                        sym     = row.get("Symbol", "")
+                        won_raw = row.get("Won", "")
+                        if not sym or won_raw not in ("Ja", "Nein", "1", "0"):
+                            continue
+                        # Datum + Zeit → ISO-Timestamp fuer Deduplizierung
+                        datum = row.get("Datum", "")   # "04.05.2026"
+                        zeit  = row.get("Zeit (UTC)", "")  # "14:02"
+                        try:
+                            ts_close = (
+                                f"20{datum[6:8]}-{datum[3:5]}-{datum[0:2]}T{zeit}:00Z"
+                                if "." in datum else datum
+                            )
+                        except Exception:
+                            ts_close = datum
+                        dedup = (sym.upper(), ts_close[:10])
+                        if dedup in seen_keys:
+                            continue  # bereits aus entry_queue_log
+                        seen_keys.add(dedup)
+                        trades.append({
+                            "symbol":       sym,
+                            "direction":    row.get("Richtung", "").lower(),
+                            "score":        "",   # nicht verfuegbar in trades.csv
+                            "is_premium":   "0",
+                            "leverage":     row.get("Hebel", ""),
+                            "sl_pct":       "",
+                            "macro_ok":     "",
+                            "ts_queue":     ts_close,
+                            "ts_close":     ts_close,
+                            "pnl_usdt":     row.get("PnL USDT", ""),
+                            "r_multiple":   "",
+                            "won":          "1" if won_raw in ("Ja", "1") else "0",
+                            "close_reason": _derive_close_reason(
+                                int(row.get("Trailing Level", 0) or 0),
+                                won_raw in ("Ja", "1")
+                            ),
+                        })
+            except Exception as ex:
+                log(f"[dashboard] trades.csv read error: {ex}")
+
+        # Letzter Fallback: closed_trades RAM (nach Redeploy leer)
         if not trades:
             for t in closed_trades:
                 trades.append({
@@ -8541,7 +8606,7 @@ def start_webhook_server():
                     "direction": t.get("direction", ""),
                     "leverage":  t.get("leverage", ""),
                     "ts_close":  str(t.get("ts", "")),
-                    "net_pnl":   t.get("net_pnl", 0),
+                    "pnl_usdt":  t.get("net_pnl", 0),
                     "won":       "1" if t.get("won") else "0",
                 })
 
