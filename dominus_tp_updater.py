@@ -888,6 +888,11 @@ last_known_size:  dict = {}   # {symbol: position_size}
 # Tritt auf wenn zwei parallele Threads (Poll + Webhook) gleichzeitig einen
 # Close erkennen.
 _close_cooldown: dict = {}   # {symbol: timestamp_of_last_close}
+
+# Analog: Setup-Cooldown verhindert dass setup_new_trade() fuer dasselbe
+# Symbol mehrfach aufgerufen wird bevor der erste Aufruf last_known_size
+# und trade_data gesetzt hat (Fills + Poll-Loop koennen sich ueberschneiden).
+_setup_cooldown: dict = {}   # {symbol: timestamp_of_last_setup}
 sl_at_entry:      dict = {}   # {symbol: bool}
 new_trade_done:   dict = {}   # {symbol: bool} — DCA bereits gesetzt?
 price_decimals_cache: dict = {}  # {symbol: int}  — Preis-Dezimalstellen
@@ -3357,6 +3362,21 @@ def execute_trade_order(symbol: str, direction: str, leverage: int,
                 "leverage": leverage, "entry": avg_price}
 
     log(f"  ✓ SL @ {sl_str} gesetzt — Main-Loop übernimmt DCA+TPs")
+
+    # ── trade_data vorbelegen — BEVOR der Fill eintrifft ────────
+    # setup_new_trade() liest trade_data[symbol]["leverage"] um den korrekten
+    # Hebel fuer SL/TP-Berechnungen zu verwenden. Ohne Vorbelegung wuerde es
+    # auf pos.get("leverage") = Bitget-Kontowert (oft 10) zurueckfallen, auch
+    # wenn hier 21x verwendet wurde. Kritisch fuer SL-Abstand-Berechnung.
+    if symbol not in trade_data:
+        trade_data[symbol] = {}
+    trade_data[symbol]["leverage"]  = leverage
+    trade_data[symbol]["direction"] = direction
+    trade_data[symbol]["entry"]     = avg_price
+    trade_data[symbol]["sl"]        = float(sl_str)
+    trade_data[symbol]["open_ts"]   = int(time.time() * 1000)
+    log(f"  trade_data vorbelegt: {symbol} {direction} Lev={leverage}x SL={sl_str}")
+
     return {"ok": True,
             "orderId":        order_id,
             "qty":            qty_str,
@@ -3532,7 +3552,24 @@ def setup_new_trade(pos: dict):
     direction = pos.get("holdSide", "long")
     entry     = float(pos.get("openPriceAvg", 0))
     size      = float(pos.get("total", 0))
-    leverage  = (int(trade_data.get(symbol, {}).get("leverage", 0)) or int(float(pos.get("leverage", 10))))
+
+    # ── Setup-Cooldown-Guard ─────────────────────────────────────
+    # Verhindert Doppel-Setup wenn Fills-Branch und Poll-Loop gleichzeitig
+    # einen neuen Trade erkennen — last_known_size wird erst am Ende gesetzt.
+    _now_s = time.time()
+    _last_s = _setup_cooldown.get(symbol, 0)
+    if _now_s - _last_s < 90:
+        log(f"  Setup-Cooldown: {symbol} bereits in Setup ({_now_s-_last_s:.0f}s) — skip")
+        return
+    _setup_cooldown[symbol] = _now_s
+
+    # ── Leverage — Priorität: trade_data → Auto-Exec → Bitget-Position ──
+    # trade_data[symbol]["leverage"] wird von execute_trade_order() VOR dem
+    # Fill gesetzt. pos.get("leverage") ist der Bitget-Kontowert (kann
+    # abweichen wenn manuell geaendert wurde). Fallback: 10.
+    leverage  = (int(trade_data.get(symbol, {}).get("leverage", 0))
+                 or int(float(pos.get("leverage", 0)))
+                 or 10)
     mark      = get_mark_price(symbol)
 
     # ── v4.32 Phantom-Reopen-Guard ─────────────────────────────────────
