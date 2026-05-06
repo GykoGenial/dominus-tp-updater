@@ -1,5 +1,5 @@
 """
-DOMINUS Trade-Automatisierung v4.36
+DOMINUS Trade-Automatisierung v4.37
 ══════════════════════════════════════════════════════════════
 Vollautomatisches Setup nach DOMINUS-Strategie (Handbuch März 2026)
 Finanzmathematische Optimierungen:
@@ -15,6 +15,11 @@ Finanzmathematische Optimierungen:
   ⑩ Klick-UX          — Button-Driven Rangliste mit adaptivem Keyboard (v4.25)
   ⑪ One-Click-Exec    — 🚀 Trade jetzt Button mit Two-Tap-Confirm (v4.28)
   ⑫ Inline-Berechnung — 🚀 1. Tap zeigt volle /trade-Vorschau (v4.35.1)
+
+Changelog v4.37 — TP Race-Condition Fix:
+  FIX13a: cancel_tp_orders_by_ids() — storniert nur alte TPs anhand gespeicherter IDs,
+          verhindert versehentliches Stornieren neu platzierter TPs (Root Cause: 0/4 aktiv)
+  FIX13b: verify_tp_orders() — 5s Wartezeit statt 3s + 1 automatischer Retry nach 5s
 
 Changelog v4.35.1 — UX: 🚀 1. Tap zeigt volle /trade-Berechnung:
   U1: Erster Tap auf 🚀 Trade jetzt postet zusätzlich die komplette
@@ -2000,6 +2005,50 @@ def cancel_all_tp_orders(symbol: str, dom_only: bool = True):
     log(f"  → {ok}/{len(tp_orders)} TPs storniert, {errs} Fehler")
 
 
+def cancel_tp_orders_by_ids(symbol: str, order_ids: set):
+    """
+    FIX 13: Storniert nur TP-Orders deren orderId oder clientOid in order_ids steht.
+    Verhindert versehentliches Stornieren neu platzierter TPs.
+    """
+    if not order_ids:
+        log(f"  cancel_by_ids: keine alten IDs — nichts zu stornieren")
+        return
+    orders = _get_plan_orders(symbol)
+    to_cancel = [
+        o for o in orders
+        if o.get("planType") == "profit_plan"
+        and (o.get("orderId", "") in order_ids or o.get("clientOid", "") in order_ids)
+    ]
+    if not to_cancel:
+        log(f"  cancel_by_ids: alte IDs nicht mehr auf Exchange — bereits storniert?")
+        return
+    log(f"  cancel_by_ids: {len(to_cancel)} alte TP(s) stornieren...")
+    ok = errs = 0
+    for order in to_cancel:
+        oid  = order.get("orderId") or ""
+        coid = order.get("clientOid") or ""
+        price = order.get("triggerPrice", "?")
+        body = {
+            "symbol": symbol, "productType": PRODUCT_TYPE,
+            "marginCoin": MARGIN_COIN, "planType": "profit_plan",
+        }
+        if oid:
+            body["orderId"] = oid
+        elif coid:
+            body["clientOid"] = coid
+        else:
+            continue
+        res  = api_post("/api/v2/mix/order/cancel-plan-order", body)
+        code = res.get("code")
+        if code == "00000":
+            log(f"    ✓ Alt-TP storniert @ {price}: {oid or coid}")
+            ok += 1
+        else:
+            log(f"    ✗ Alt-TP @ {price}: code={code} msg={res.get('msg','?')}")
+            errs += 1
+    log(f"  cancel_by_ids: {ok}/{len(to_cancel)} storniert, {errs} Fehler")
+
+
 def calc_tp_price(avg: float, roi: float,
                   direction: str, leverage: int) -> float:
     """
@@ -3979,28 +4028,40 @@ def tps_are_correct(existing: list, avg: float, total: float,
 
 def verify_tp_orders(symbol: str, expected_count: int) -> bool:
     """
-    FIX 10 v4.36: Prueft 3s nach Platzierung ob die erwartete Anzahl
-    DOM_-eigener TPs auf der Exchange aktiv ist. Telegram-Alarm wenn TPs fehlen.
+    FIX 10 v4.36: Prueft nach Platzierung ob die erwartete Anzahl
+    DOM_-eigener TPs auf der Exchange aktiv ist.
+    FIX 13: 5s Wartezeit + 1 Retry nach weiteren 5s — gibt Bitget API mehr Zeit.
     """
-    time.sleep(3)
+    for attempt in range(2):
+        time.sleep(5)
+        try:
+            orders  = _get_plan_orders(symbol)
+            dom_tps = [o for o in orders
+                       if o.get("planType") == "profit_plan"
+                       and (o.get("clientOid") or "").startswith(ORDER_PREFIX)]
+            active  = len(dom_tps)
+            if active >= expected_count:
+                log(f"  ✓ TP-Verifikation: {active}/{expected_count} aktiv auf Exchange")
+                return True
+            if attempt == 0:
+                log(f"  TP-Verifikation: {active}/{expected_count} — retry in 5s...")
+        except Exception as ex:
+            log(f"  ⚠ TP-Verifikation Fehler (attempt {attempt+1}): {ex}")
+    # Beide Versuche fehlgeschlagen
     try:
         orders  = _get_plan_orders(symbol)
         dom_tps = [o for o in orders
                    if o.get("planType") == "profit_plan"
                    and (o.get("clientOid") or "").startswith(ORDER_PREFIX)]
         active  = len(dom_tps)
-        if active < expected_count:
-            msg = (f"⚠️ <b>TP-Verifikation fehlgeschlagen — {symbol}</b>\n"
-                   f"Erwartet: {expected_count} | Aktiv: {active}\n"
-                   f"Bitte manuell prüfen!")
-            log(msg.replace("<b>", "").replace("</b>", ""))
-            telegram(msg)
-            return False
-        log(f"  ✓ TP-Verifikation: {active}/{expected_count} aktiv auf Exchange")
-        return True
-    except Exception as ex:
-        log(f"  ⚠ TP-Verifikation Fehler: {ex}")
-        return False
+    except Exception:
+        active = 0
+    msg = (f"⚠️ <b>TP-Verifikation fehlgeschlagen — {symbol}</b>\n"
+           f"Erwartet: {expected_count} | Aktiv: {active}\n"
+           f"Bitte manuell prüfen!")
+    log(msg.replace("<b>", "").replace("</b>", ""))
+    telegram(msg)
+    return False
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -4064,12 +4125,25 @@ def _update_tp_for_position_impl(pos: dict, reason: str):
 
     log(f"  TPs neu setzen, dann alte stornieren (Grund: {reason}) [FIX3 v4.36]")
 
+    # FIX 13: Alte TP-IDs VOR der Platzierung einlesen — verhindert dass
+    # cancel_all_tp_orders() die neu platzierten TPs gleich wieder storniert.
+    _old_orders = _get_plan_orders(symbol)
+    _old_tp_ids = set(
+        o.get("orderId") or o.get("clientOid", "")
+        for o in _old_orders
+        if o.get("planType") == "profit_plan"
+        and (o.get("clientOid") or "").startswith(ORDER_PREFIX)
+    )
+    log(f"  Alte TPs gesichert: {len(_old_tp_ids)} ID(s)")
+
     # FIX 3 v4.36: ZUERST neue TPs platzieren, DANN alte stornieren.
     # Kein Zeitfenster ohne TP-Schutz auf der Exchange.
     count, prices = place_tp_orders(
         symbol, avg, total, direction, leverage, mark, known_sl=known_sl
     )
-    cancel_all_tp_orders(symbol, dom_only=True)
+
+    # FIX 13: Nur die alten IDs stornieren — nicht die frisch platzierten
+    cancel_tp_orders_by_ids(symbol, _old_tp_ids)
 
     # FIX 10 v4.36: Verifikation nach Platzierung
     if count > 0:
