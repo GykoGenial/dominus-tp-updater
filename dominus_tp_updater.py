@@ -865,6 +865,15 @@ MIN_AUTO_TRADE_SCORE      = int(_env_float("MIN_AUTO_TRADE_SCORE", 45))
 # und Score >= MIN_AUTO_TRADE_SCORE erfuellen.
 PREMIUM_AUTO_TRADE_COUNT  = int(_env_float("PREMIUM_AUTO_TRADE_COUNT", 0))
 
+# v4.38: HARSI-Warn-Bundling — harsi_warn=1 Signale werden 60s gesammelt und
+# als eine gebündelte Nachricht gesendet (HARSI_WARN_BUFFER_SEC konfigurierbar).
+# Duplikate (gleicher Symbol+Direction) werden automatisch dedupliziert.
+# Timer wird bei jedem neuen Signal zurückgesetzt (Debounce).
+#
+# v4.37: TP-Race-Condition Fix — cancel_tp_orders_by_ids() statt cancel_all_tp_orders()
+# Alte TP-IDs werden VOR dem Setzen neuer TPs gesammelt, nur diese werden storniert.
+# Verhindert, dass frisch gesetzte TPs sofort wieder storniert werden (0/4-Bug).
+#
 # v4.35: Watchlist-Master Drop-Logging — Lärm-Reduktion
 # Pine sendet SLING_SL/HARSI_SL für jedes Watchlist-Symbol. Ohne offene Position
 # wird stumm verworfen — bisher mit Per-Drop-Log-Zeile (240+43 Drops in 24h
@@ -942,6 +951,12 @@ PHANTOM_ENTRY_TOLERANCE  = 0.001  # 0.1 % — Bitget liefert bei Phantom-Ticks b
 h4_buffer:     list = []
 h4_buffer_lock = __import__("threading").Lock()
 H4_BUFFER_SEC  = _env_int("H4_BUFFER_SEC", 300)  # 5 Min
+
+# HARSI-Warn-Buffer: sammelt harsi_warn=1 Signale, sendet gebündelt
+harsi_warn_buffer:      list = []
+harsi_warn_buffer_lock  = __import__("threading").Lock()
+HARSI_WARN_BUFFER_SEC   = _env_int("HARSI_WARN_BUFFER_SEC", 60)  # 60s Sammelzeit
+_harsi_warn_timer: object = None   # aktiver threading.Timer (oder None)
 
 trailing_sl_level: dict = {}  # {symbol: int} — 0=initial, 1=Entry, 2=TP1-Preis, 3=TP2-Preis
 
@@ -7753,6 +7768,46 @@ def flush_h4_buffer():
     log(f"H4-Zusammenfassung gesendet: {len(longs)} Long, {len(shorts)} Short")
 
 
+def flush_harsi_warn_buffer():
+    """Sendet gesammelte HARSI-Warn-Signale (harsi_warn=1) als gebündelte Telegram-Nachricht."""
+    global harsi_warn_buffer
+    with harsi_warn_buffer_lock:
+        if not harsi_warn_buffer:
+            return
+        items          = list(harsi_warn_buffer)
+        harsi_warn_buffer = []
+
+    now_str = datetime.now().strftime("%H:%M")
+    longs   = [i for i in items if i["direction"] == "long"]
+    shorts  = [i for i in items if i["direction"] == "short"]
+
+    lines = [
+        f"⚠️ <b>HARSI Extremzone — {len(items)} Coin{'s' if len(items)>1 else ''} warten auf Exit</b>",
+        "━" * 12,
+        "",
+    ]
+    if longs:
+        lines.append("🟢 <b>LONG — wartet auf HARSI_EXIT:</b>")
+        for item in longs:
+            expiry = item.get("expiry_str", "—")
+            lines.append(f"  • <b>{item['symbol']}</b>  @ {item['entry']}  |  ⏰ bis {expiry}")
+        lines.append("")
+    if shorts:
+        lines.append("🔴 <b>SHORT — wartet auf HARSI_EXIT:</b>")
+        for item in shorts:
+            expiry = item.get("expiry_str", "—")
+            lines.append(f"  • <b>{item['symbol']}</b>  @ {item['entry']}  |  ⏰ bis {expiry}")
+        lines.append("")
+
+    lines += [
+        "🤖 HARSI_EXIT kommt automatisch via Pine Intrabar-Alert",
+        "📋 /status | /makro",
+    ]
+    telegram("\n".join(lines))
+    log(f"HARSI-Warn-Zusammenfassung gesendet: {len(longs)} Long, {len(shorts)} Short")
+
+
+
 def _derive_close_reason(trailing_level: int, won: bool) -> str:
     """Leitet Close-Reason aus Trailing Level (trades.csv) ab."""
     if not won:
@@ -8832,7 +8887,7 @@ def start_webhook_server():
             btc_t2_txt = "BTC + Total2 gleiche Richtung ✓"
         premium_txt  = "Premium-Setup (dunkelgrün/-rot)"   if premium_val     == 1 else "Kein Premium (höheres Risiko)"
 
-        # Timer-Zeile abhängig von harsi_warn und recovering-Zustand
+        # v4.38: harsi_warn=1 → Signale bündeln statt einzeln senden
         if harsi_warn_val != 0:
             # Ablaufzeitpunkt: H2-Zeitstempel + 30 Min (oder "jetzt + 30 Min" als Fallback)
             # v4.29: timezone-aware Default + Shim für Legacy-Dict-Werte
@@ -8840,22 +8895,35 @@ def start_webhook_server():
                 f"{symbol}_{direction}", datetime.now(timezone.utc)))
             _expiry_utc = _h2_ts + timedelta(minutes=30)
             _expiry_str = _expiry_utc.strftime("%d.%m.%Y %H:%M UTC")
-            # v4.22: HARSI_EXIT kommt automatisch über DOM-ORC v2.4.2 Intrabar-
-            # Alert (Pine alert.freq_once_per_bar) → Watchlist-Master-Alarm.
-            # Kein manuelles Alarm-3-Anlegen mehr nötig. Stattdessen: Timer +
-            # kurzer Hinweis, dass der HARSI_EXIT automatisch eintrudeln wird.
-            _anker  = "sec-alarm3" if direction == "long" else "sec-alarm3b"
-            _anchor_label = "Alarm 3 — Doku" if direction == "long" else "Alarm 3b — Doku"
-            if DOCS_URL:
-                _docs_link = f'\n🔗 <a href="{DOCS_URL}#{_anker}">{_anchor_label}</a>'
-            else:
-                _docs_link = ""
-            timer_line = (
-                f"⏳ <b>HARSI noch in Extremzone — warten auf Intrabar-Exit</b>\n"
-                f"⏰ Fenster läuft ab: <b>{_expiry_str}</b>\n"
-                f"🤖 HARSI_EXIT-Alarm kommt automatisch (Pine v2.4.2 Intrabar)"
-                f"{_docs_link}"
-            )
+
+            # In Buffer aufnehmen und Timer (re-)starten
+            global _harsi_warn_timer
+            with harsi_warn_buffer_lock:
+                # Duplikate vermeiden (gleicher Symbol+Direction ersetzen)
+                harsi_warn_buffer[:] = [
+                    x for x in harsi_warn_buffer
+                    if not (x["symbol"] == symbol and x["direction"] == direction)
+                ]
+                harsi_warn_buffer.append({
+                    "symbol":     symbol,
+                    "direction":  direction,
+                    "entry":      entry,
+                    "expiry_str": _expiry_str,
+                })
+            # Alten Timer canceln, neuen starten (Debounce: HARSI_WARN_BUFFER_SEC)
+            if _harsi_warn_timer is not None:
+                try:
+                    _harsi_warn_timer.cancel()
+                except Exception:
+                    pass
+            import threading as _thr
+            _harsi_warn_timer = _thr.Timer(HARSI_WARN_BUFFER_SEC, flush_harsi_warn_buffer)
+            _harsi_warn_timer.daemon = True
+            _harsi_warn_timer.start()
+            log(f"HARSI-Warn-Buffer +1: {symbol} {direction} — Flush in {HARSI_WARN_BUFFER_SEC}s")
+            forward_to_demo(data)
+            return  # kein Einzel-Telegram für harsi_warn=1
+
         elif _recovering_long and premium_val != 1:
             timer_line = (
                 "🟡 <b>Long-Recovery — nur bei Premium-Long einsteigen!</b>\n"
@@ -8907,7 +8975,7 @@ def start_webhook_server():
     @app.route("/", methods=["GET"])
     @app.route("/health", methods=["GET"])
     def health():
-        return jsonify({"status": "running", "version": "v4.36"}), 200
+        return jsonify({"status": "running", "version": "v4.38"}), 200
 
     @app.route("/dashboard", methods=["GET"])
     def dashboard():
