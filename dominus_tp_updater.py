@@ -1431,6 +1431,33 @@ def telegram_edit_message(
     return False
 
 
+def telegram_file(filepath: str, caption: str = "") -> bool:
+    """v4.38 — Sendet eine Datei als Telegram-Dokument (sendDocument).
+    Gibt True zurück bei Erfolg, False sonst. Silent-Fail bei Netz-Problemen."""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return False
+    if not os.path.isfile(filepath):
+        log(f"[TG-FILE] Datei nicht gefunden: {filepath}")
+        return False
+    try:
+        with open(filepath, "rb") as fh:
+            r = requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument",
+                data={
+                    "chat_id":    TELEGRAM_CHAT_ID,
+                    "caption":    caption[:1024] if caption else "",
+                    "parse_mode": "HTML",
+                },
+                files={"document": fh},
+                timeout=30,
+            )
+        return r.json().get("ok", False)
+    except Exception as e:
+        log(f"[TG-FILE] Fehler beim Senden von {os.path.basename(filepath)}: {e}")
+        return False
+
+
+
 def telegram_answer_callback(
     callback_id: str,
     text: str = "",
@@ -7668,6 +7695,8 @@ def poll_telegram_commands():
             cmd_refresh(parts)
         elif cmd == "/report":
             cmd_report()
+        elif cmd == "/backup":
+            cmd_backup(reply_fn=reply)
         elif cmd == "/trades":
             cmd_trades()
         elif cmd == "/restore_trades" or cmd == "/restoretrades":
@@ -7806,6 +7835,114 @@ def flush_harsi_warn_buffer():
     telegram("\n".join(lines))
     log(f"HARSI-Warn-Zusammenfassung gesendet: {len(longs)} Long, {len(shorts)} Short")
 
+
+# ── Wöchentlicher Report (v4.38) ──────────────────────────────────────────────
+
+weekly_report_sent_week: str = ""   # "YYYY-Www" — verhindert Doppel-Senden
+
+
+def build_weekly_report() -> str:
+    """Erstellt den wöchentlichen Telegram-Report (Montag 08:00).
+    Liest abgeschlossene Trades aus TRADES_CSV und gibt eine Zusammenfassung
+    der laufenden Woche + des aktuellen Monats zurück."""
+    import csv as _csv
+    _now      = datetime.now()
+    _week_str = _now.strftime("KW %V / %Y")
+    _mon_str  = _now.strftime("%B %Y")
+
+    wins_w = losses_w = pnl_w = 0.0
+    wins_m = losses_m = pnl_m = 0.0
+    week_num  = _now.isocalendar()[1]
+    month_num = _now.month
+    year_num  = _now.year
+
+    if TRADES_CSV and os.path.isfile(TRADES_CSV):
+        try:
+            with open(TRADES_CSV, "r", encoding="utf-8", newline="") as f:
+                reader = _csv.DictReader(f, delimiter=";")
+                for row in reader:
+                    try:
+                        ts_str = row.get("ts_close") or row.get("ts_open") or ""
+                        if not ts_str:
+                            continue
+                        ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                        pnl = float(row.get("pnl_usdt") or 0)
+                        won = row.get("won", "")
+
+                        # Woche
+                        if ts.year == year_num and ts.isocalendar()[1] == week_num:
+                            if won == "1":
+                                wins_w += 1; pnl_w += pnl
+                            elif won == "0":
+                                losses_w += 1; pnl_w += pnl
+
+                        # Monat
+                        if ts.year == year_num and ts.month == month_num:
+                            if won == "1":
+                                wins_m += 1; pnl_m += pnl
+                            elif won == "0":
+                                losses_m += 1; pnl_m += pnl
+                    except Exception:
+                        continue
+        except Exception as e:
+            log(f"[WEEKLY] CSV-Lesefehler: {e}")
+
+    total_w = int(wins_w + losses_w)
+    total_m = int(wins_m + losses_m)
+    wr_w = f"{wins_w/total_w*100:.0f}%" if total_w else "—"
+    wr_m = f"{wins_m/total_m*100:.0f}%" if total_m else "—"
+    sign_w = "+" if pnl_w >= 0 else ""
+    sign_m = "+" if pnl_m >= 0 else ""
+
+    lines = [
+        "📊 <b>DOMINUS Wochenbericht</b>",
+        "━" * 12,
+        "",
+        f"📅 <b>{_week_str}</b>",
+        f"  Trades: {total_w}  |  Win-Rate: {wr_w}",
+        f"  PnL:    <b>{sign_w}{pnl_w:.2f} USDT</b>",
+        "",
+        f"🗓 <b>{_mon_str} (laufend)</b>",
+        f"  Trades: {total_m}  |  Win-Rate: {wr_m}",
+        f"  PnL:    <b>{sign_m}{pnl_m:.2f} USDT</b>",
+        "",
+        "📋 /report | /trades | /status",
+    ]
+    return "\n".join(lines)
+
+
+def cmd_backup(reply_fn=None):
+    """v4.38 — /backup: sendet trades.csv + dominus_state.json via Telegram."""
+    _reply = reply_fn or telegram
+    sent = 0
+
+    if TRADES_CSV and os.path.isfile(TRADES_CSV):
+        ok = telegram_file(
+            TRADES_CSV,
+            caption=f"💾 <b>trades.csv</b> — {datetime.now().strftime('%d.%m.%Y %H:%M')}",
+        )
+        if ok:
+            sent += 1
+        else:
+            _reply("❌ trades.csv konnte nicht gesendet werden.")
+    else:
+        _reply(f"⚠️ trades.csv nicht gefunden (<code>{TRADES_CSV}</code>)")
+
+    if STATE_FILE and os.path.isfile(STATE_FILE):
+        ok = telegram_file(
+            STATE_FILE,
+            caption=f"💾 <b>dominus_state.json</b> — {datetime.now().strftime('%d.%m.%Y %H:%M')}",
+        )
+        if ok:
+            sent += 1
+        else:
+            _reply("❌ dominus_state.json konnte nicht gesendet werden.")
+    else:
+        _reply(f"⚠️ dominus_state.json nicht gefunden (<code>{STATE_FILE}</code>)")
+
+    if sent > 0:
+        _reply(f"✅ {sent}/2 Backup-Dateien gesendet.")
+    log(f"[BACKUP] {sent}/2 Dateien via Telegram gesendet.")
 
 
 def _derive_close_reason(trailing_level: int, won: bool) -> str:
@@ -9133,6 +9270,7 @@ def save_state():
             "trailing_sl_level":       trailing_sl_level,
             "closed_trades":           [t for t in closed_trades if t.get("ts", 0) >= time.time() - 90*86400],
             "daily_report_sent_date":  daily_report_sent_date,
+            "weekly_report_sent_week": weekly_report_sent_week,
             "harsi_sl":                harsi_sl,
             # v4.12: Sling-SL (Swing-Pivot-basiert) + DCA Auto-Void State
             "sling_sl":                sling_sl,
@@ -9158,7 +9296,7 @@ def save_state():
 
 def load_state():
     """Lädt den gespeicherten State aus der JSON-Datei beim Start."""
-    global daily_report_sent_date
+    global daily_report_sent_date, weekly_report_sent_week
     if not os.path.exists(STATE_FILE):
         return
     try:
@@ -9171,7 +9309,8 @@ def load_state():
         trade_data.update(s.get("trade_data", {}))
         trailing_sl_level.update(s.get("trailing_sl_level", {}))
         closed_trades.extend(s.get("closed_trades", []))
-        daily_report_sent_date = s.get("daily_report_sent_date", "")
+        daily_report_sent_date  = s.get("daily_report_sent_date",  "")
+        weekly_report_sent_week = s.get("weekly_report_sent_week", "")
         harsi_sl.update(s.get("harsi_sl", {}))
         # v4.12: Sling-SL + DCA Auto-Void State wiederherstellen
         sling_sl.update(s.get("sling_sl", {}))
@@ -10065,7 +10204,7 @@ def main():
             poll_telegram_commands()
 
             # ── 0a. Auto Daily Report um 23:59 ─────────────
-            global daily_report_sent_date
+            global daily_report_sent_date, weekly_report_sent_week
             _now   = datetime.now()
             _today = _now.strftime("%Y-%m-%d")
             if _now.hour == 23 and _now.minute == 59 and daily_report_sent_date != _today:
@@ -10077,6 +10216,19 @@ def main():
                     log("[Auto-Report] ✓ Report gesendet")
                 except Exception as _re:
                     log(f"[Auto-Report] ✗ Fehler: {_re}")
+
+            # ── 0b. Wöchentlicher Report: Montag 08:00 ──────
+            _week = _now.strftime("%Y-W%W")
+            if (_now.weekday() == 0 and _now.hour == 8 and _now.minute == 0
+                    and weekly_report_sent_week != _week):
+                log("[Weekly-Report] Wochenbericht wird gesendet (Mo 08:00)...")
+                try:
+                    telegram(build_weekly_report())
+                    weekly_report_sent_week = _week
+                    save_state()
+                    log("[Weekly-Report] ✓ Report gesendet")
+                except Exception as _we:
+                    log(f"[Weekly-Report] ✗ Fehler: {_we}")
 
             # ── 0b. H4 Puffer flushen wenn Zeitfenster abgelaufen ──
             # Lock für den ganzen Check — verhindert Race mit Webhook-Thread
