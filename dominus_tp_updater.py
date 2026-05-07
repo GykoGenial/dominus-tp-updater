@@ -4068,14 +4068,29 @@ def tps_are_correct(existing: list, avg: float, total: float,
     return True
 
 
-def verify_tp_orders(symbol: str, expected_count: int) -> bool:
+def verify_tp_orders(symbol: str, expected_count: int,
+                     cancelled_count: int = 0) -> bool:
     """
     FIX 10 v4.36: Prueft nach Platzierung ob die erwartete Anzahl
     DOM_-eigener TPs auf der Exchange aktiv ist.
-    FIX 13: 5s Wartezeit + 1 Retry nach weiteren 5s — gibt Bitget API mehr Zeit.
+    FIX 13: 5s Wartezeit + 1 Retry nach weiteren 5s.
+    FIX 14 v4.39: Zwei Korrekturen:
+      (A) expected_count zählt nur profit_plan (TP1/2/3), nicht TP4 (pos_profit).
+          Übergib count-1 wenn TP4 enthalten war, oder nutze profit_plan_count direkt.
+      (B) Nach cancel_by_ids hat Bitget einen Propagation-Delay von 1–5 Min für
+          orders-plan-pending. Wenn alte TPs gecancelt wurden, Verifikation
+          erst nach 90s statt 5+5s durchführen (Blackout abwarten).
     """
+    # Wenn gerade alte TPs storniert wurden: Bitget braucht Zeit bis neue
+    # profit_plan Orders in orders-plan-pending erscheinen. Längere Wartezeit.
+    wait_sec = 90 if cancelled_count > 0 else 5
+    log(f"  TP-Verifikation startet in {wait_sec}s "
+        f"({'nach Cancel-Blackout' if cancelled_count > 0 else 'Standard'})...")
+    time.sleep(wait_sec)
+
     for attempt in range(2):
-        time.sleep(5)
+        if attempt > 0:
+            time.sleep(15)
         try:
             orders  = _get_plan_orders(symbol)
             dom_tps = [o for o in orders
@@ -4083,13 +4098,14 @@ def verify_tp_orders(symbol: str, expected_count: int) -> bool:
                        and (o.get("clientOid") or "").startswith(ORDER_PREFIX)]
             active  = len(dom_tps)
             if active >= expected_count:
-                log(f"  ✓ TP-Verifikation: {active}/{expected_count} aktiv auf Exchange")
+                log(f"  ✓ TP-Verifikation: {active}/{expected_count} profit_plan aktiv")
                 return True
             if attempt == 0:
-                log(f"  TP-Verifikation: {active}/{expected_count} — retry in 5s...")
+                log(f"  TP-Verifikation: {active}/{expected_count} — retry in 15s...")
         except Exception as ex:
             log(f"  ⚠ TP-Verifikation Fehler (attempt {attempt+1}): {ex}")
-    # Beide Versuche fehlgeschlagen
+
+    # Beide Versuche fehlgeschlagen → Telegram-Warnung
     try:
         orders  = _get_plan_orders(symbol)
         dom_tps = [o for o in orders
@@ -4099,8 +4115,8 @@ def verify_tp_orders(symbol: str, expected_count: int) -> bool:
     except Exception:
         active = 0
     msg = (f"⚠️ <b>TP-Verifikation fehlgeschlagen — {symbol}</b>\n"
-           f"Erwartet: {expected_count} | Aktiv: {active}\n"
-           f"Bitte manuell prüfen!")
+           f"Erwartet: {expected_count} profit_plan | Aktiv: {active}\n"
+           f"Bitte manuell prüfen oder /refresh senden!")
     log(msg.replace("<b>", "").replace("</b>", ""))
     telegram(msg)
     return False
@@ -4187,9 +4203,13 @@ def _update_tp_for_position_impl(pos: dict, reason: str):
     # FIX 13: Nur die alten IDs stornieren — nicht die frisch platzierten
     cancel_tp_orders_by_ids(symbol, _old_tp_ids)
 
-    # FIX 10 v4.36: Verifikation nach Platzierung
+    # FIX 14 v4.39: Verifikation mit korrektem expected_count und cancelled_count.
+    # count enthält alle platzierten TPs inkl. TP4 (pos_profit). Die Verifikation
+    # zählt nur profit_plan Orders (TP1/2/3), daher expected = count - 1 (ohne TP4).
+    # cancelled_count steuert die Wartezeit: 0s → 5s, >0 → 90s (Bitget Blackout).
     if count > 0:
-        verify_tp_orders(symbol, count)
+        _pp_expected = max(0, count - 1)  # TP4 (pos_profit) nicht mitzählen
+        verify_tp_orders(symbol, _pp_expected, cancelled_count=len(_old_tp_ids))
 
     # FIX 5 v4.36: Funding Rate Warnung
     try:
