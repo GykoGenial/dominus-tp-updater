@@ -1,5 +1,5 @@
 """
-DOMINUS Demo-Bot v4.41 — PAPER TRADING
+DOMINUS Demo-Bot v4.42 — PAPER TRADING
 ════════════════════════════════════
 Vollautomatisches Paper Trading auf Bitget Demo-Account.
 Kein echtes Kapital — identische Logik wie Live-Script.
@@ -36,6 +36,25 @@ Finanzmathematische Optimierungen:
   ⑩ Klick-UX          — Button-Driven Rangliste mit adaptivem Keyboard (v4.25)
   ⑪ One-Click-Exec    — 🚀 Trade jetzt Button mit Two-Tap-Confirm (v4.28)
   ⑫ Inline-Berechnung — 🚀 1. Tap zeigt volle /trade-Vorschau (v4.35.1)
+
+Changelog v4.42 — DEMO_EXECUTE_ALL + DEMO_FIXED_MARGIN_USDT:
+  E1: DEMO_EXECUTE_ALL (Railway-Variable, default false). Wenn true, werden
+      im flush_entries() ALLE Signale der aktuellen Rangliste als Demo-Trades
+      ausgeführt — nicht nur Top-1. Trades laufen bis Bitget eigene Limits
+      setzt (Max-Open-Positions). 1s Pause zwischen je zwei Trades.
+      Score-Gate (MIN_AUTO_TRADE_SCORE) und DEMO_SYMBOL_UNAVAILABLE greifen
+      weiterhin pro Signal.
+  E2: DEMO_FIXED_MARGIN_USDT (Railway-Variable, default 0 = Kelly wie bisher).
+      Wenn > 0, wird die Kelly/Balance-Sizing-Logik in execute_trade_order()
+      komplett übersprungen und stattdessen dieser feste USDT-Betrag als
+      Margin pro Trade verwendet. Sinn: im Demo-Modus soll die Anzahl der
+      Trades nicht durch das virtuelle Guthaben limitiert werden — Bitget
+      stoppt selbst wenn sein internes Open-Positions-Limit erreicht ist.
+      Empfehlung: 50 USDT (ausreichend für Mindest-Notional bei den meisten
+      Paaren mit 10–20x Hebel).
+  E3: Telegram-Summary nach DEMO_EXECUTE_ALL-Flush: wie viele Trades
+      erfolgreich, wie viele übersprungen (Symbol unavailable / Score) und
+      wie viele fehlgeschlagen.
 
 Changelog v4.41 — Demo-Score-Gate + Demo-Symbol-Fehlerbehandlung:
   S1: MIN_AUTO_TRADE_SCORE mit Default 0 (alle Scores werden getradet).
@@ -1077,6 +1096,16 @@ SLOT_LOWSCORE_CUT  = _env_int("SLOT_LOWSCORE_CUT", 50)
 # DEMO-Default = 0 (alle Score-Bereiche werden getradet — bewusst für Datensammlung).
 # Live-Bot Default = 45. Über Railway-Variable anpassbar: MIN_AUTO_TRADE_SCORE=30
 MIN_AUTO_TRADE_SCORE = _env_int("MIN_AUTO_TRADE_SCORE", 0)
+
+# v4.42: Alle Signale der aktuellen Rangliste als Demo-Trades ausführen (nicht nur Top-1).
+# false = nur Top-1 (Standard-Verhalten), true = alle ranked-Signale
+_raw_dea = os.environ.get("DEMO_EXECUTE_ALL", "0").strip().lower()
+DEMO_EXECUTE_ALL = _raw_dea in ("1", "true", "yes", "on")
+
+# v4.42: Fixer Margin-Betrag pro Trade in USDT — überschreibt Kelly/Balance-Sizing.
+# 0 = Kelly wie bisher. >0 = immer dieser Betrag, unabhängig von Balance/Kelly.
+# Empfehlung für Demo: 50 USDT (reicht für Mindest-Notional bei den meisten Paaren).
+DEMO_FIXED_MARGIN_USDT = _env_float("DEMO_FIXED_MARGIN_USDT", 0.0)
 
 # v4.19: Win-Rate Cache pro Symbol — {symbol: (wr, n_trades, expire_ts)}
 _winrate_cache: dict = {}
@@ -3426,36 +3455,44 @@ def execute_trade_order(symbol: str, direction: str, leverage: int,
         log(f"  ⚠ Hebel {leverage}x > MAX_LEVERAGE {MAX_LEVERAGE}x — gecappt")
         leverage = MAX_LEVERAGE
 
-    # ── 1d. Balance holen ───────────────────────────────────────
-    balance = get_futures_balance()
-    if balance <= 0:
-        return {"ok": False,
-                "reason": f"Balance {balance} — Konto leer oder API-Fehler"}
+    # ── 1d. Balance + Sizing ────────────────────────────────────
+    # v4.42: DEMO_FIXED_MARGIN_USDT > 0 → Kelly/Balance-Sizing überspringen.
+    # Ziel: im Demo-Modus keine Trades durch virtuelle Balance-Limits blockieren.
+    # Bitget stoppt selbst wenn sein Open-Positions-Limit erreicht ist.
+    if DEMO_FIXED_MARGIN_USDT > 0:
+        initial_margin = DEMO_FIXED_MARGIN_USDT
+        log(f"  DEMO_FIXED_MARGIN: {initial_margin:.2f} USDT "
+            f"(Kelly/Balance-Sizing übersprungen)")
+    else:
+        # ── 2. Sizing: Half-Kelly / 5 (Initial in 20/30/50-Schema) ──
+        balance = get_futures_balance()
+        if balance <= 0:
+            return {"ok": False,
+                    "reason": f"Balance {balance} — Konto leer oder API-Fehler"}
 
-    # ── 2. Sizing: Half-Kelly / 5 (Initial in 20/30/50-Schema) ──
-    kelly         = kelly_recommendation(balance, WINRATE)
-    target_total  = kelly.get("half_kelly_usdt", 0) or 0
-    initial_margin = target_total / 5.0
+        kelly         = kelly_recommendation(balance, WINRATE)
+        target_total  = kelly.get("half_kelly_usdt", 0) or 0
+        initial_margin = target_total / 5.0
 
-    # Hard-Cap 1: 10%-Margin-Regel (max_margin / 3 pro Order)
-    max_margin = balance * 0.10
-    cap_10pct  = max_margin / 3.0
-    if initial_margin > cap_10pct:
-        log(f"  Initial-Margin {initial_margin:.2f} USDT > 10%/3-Cap "
-            f"{cap_10pct:.2f} — capped")
-        initial_margin = cap_10pct
+        # Hard-Cap 1: 10%-Margin-Regel (max_margin / 3 pro Order)
+        max_margin = balance * 0.10
+        cap_10pct  = max_margin / 3.0
+        if initial_margin > cap_10pct:
+            log(f"  Initial-Margin {initial_margin:.2f} USDT > 10%/3-Cap "
+                f"{cap_10pct:.2f} — capped")
+            initial_margin = cap_10pct
 
-    # Hard-Cap 2: MAX_AUTO_TRADE_USDT (optional)
-    if MAX_AUTO_TRADE_USDT > 0 and initial_margin > MAX_AUTO_TRADE_USDT:
-        log(f"  Initial-Margin {initial_margin:.2f} > "
-            f"MAX_AUTO_TRADE_USDT {MAX_AUTO_TRADE_USDT:.2f} — capped")
-        initial_margin = MAX_AUTO_TRADE_USDT
+        # Hard-Cap 2: MAX_AUTO_TRADE_USDT (optional)
+        if MAX_AUTO_TRADE_USDT > 0 and initial_margin > MAX_AUTO_TRADE_USDT:
+            log(f"  Initial-Margin {initial_margin:.2f} > "
+                f"MAX_AUTO_TRADE_USDT {MAX_AUTO_TRADE_USDT:.2f} — capped")
+            initial_margin = MAX_AUTO_TRADE_USDT
 
-    if initial_margin < 1.0:
-        return {"ok": False,
-                "reason": f"Initial-Margin {initial_margin:.2f} < 1 USDT — "
-                          f"Half-Kelly liefert zu wenig (Balance {balance:.2f}, "
-                          f"Winrate {WINRATE})"}
+        if initial_margin < 1.0:
+            return {"ok": False,
+                    "reason": f"Initial-Margin {initial_margin:.2f} < 1 USDT — "
+                              f"Half-Kelly liefert zu wenig (Balance {balance:.2f}, "
+                              f"Winrate {WINRATE})"}
 
     # Kontrakt-Grösse (Quantität in Base-Coin)
     contracts_raw = (initial_margin * leverage) / entry
@@ -4864,108 +4901,126 @@ def flush_entries() -> None:
             log("  ENTRY-QUEUE: WARNUNG — keine message_id erhalten, "
                 "Callback-Navigation deaktiviert für diesen Slot")
 
-        # ── Vollautomatische Ausführung des Top-Scorers ──────────────
-        # Wenn AUTO_TRADE_ENABLED=true: ranked[0] wird sofort ohne
-        # Button-Tap ausgeführt. TWO_TAP_CONFIRM wird ignoriert.
+        # ── Vollautomatische Ausführung ───────────────────────────────
+        # AUTO_TRADE_ENABLED=true: Trades werden ohne Button-Tap ausgeführt.
+        # v4.42: DEMO_EXECUTE_ALL=true → alle ranked-Signale, sonst nur Top-1.
         if AUTO_TRADE_ENABLED and ranked:
-            # ── MODUS B: Standard — Top-Scorer (v4.41: Score-Gate) ──────
-            _top  = ranked[0]
-            _sugg = _top.get("sugg") or {}
-            _sym  = _top["symbol"]
-            _dir  = _top["direction"]
-            _lev  = int(_sugg.get("leverage") or 10)
-            _sl   = float(_sugg.get("sl") or 0)
-            _px   = float(_top.get("entry") or 0)
-            _sc   = _top["_scored"]["score"]
 
-            # v4.41: Score-Gate (Demo-Default 0 = alle Scores; via
-            # MIN_AUTO_TRADE_SCORE Railway-Variable anpassbar)
-            if _sc < MIN_AUTO_TRADE_SCORE:
-                log(f"  AUTO-EXEC: {_sym} NICHT ausgeführt — "
-                    f"Score {_sc} < Minimum {MIN_AUTO_TRADE_SCORE}")
-                telegram(
-                    f"⏸ <b>Auto-Execute pausiert — Score zu niedrig</b>\n"
-                    f"Top-Kandidat: <b>{_sym} {_dir.upper()}</b>\n"
-                    f"Score: <b>{_sc}/100</b>  ·  Minimum: "
-                    f"<b>{MIN_AUTO_TRADE_SCORE}</b>\n\n"
-                    f"Kein Trade. Warte auf besseres Setup."
-                )
-            elif _sl and _px:
-                log(f"  AUTO-EXEC: {_sym} {_dir.upper()} | Score={_sc} | "
-                    f"Entry={_px} SL={_sl} Lev={_lev}x")
-                telegram(
-                    f"🤖 <b>Auto-Execute — Top-Score</b>\n"
-                    f"<b>{_sym} {_dir.upper()}</b>  ·  Score <b>{_sc}/100</b>\n"
-                    f"Entry: <code>{_px}</code>  ·  SL: <code>{_sl}</code>  "
-                    f"·  {_lev}x"
-                )
+            def _exec_one(e: dict, label: str) -> str:
+                """Führt einen einzelnen Trade aus. Gibt Status zurück:
+                'ok', 'score_low', 'no_sl_entry', 'demo_unavail', 'error'."""
+                _sugg = e.get("sugg") or {}
+                _sym  = e["symbol"]
+                _dir  = e["direction"]
+                _lev  = int(_sugg.get("leverage") or 10)
+                _sl   = float(_sugg.get("sl") or 0)
+                _px   = float(e.get("entry") or 0)
+                _sc   = e["_scored"]["score"]
+
+                if _sc < MIN_AUTO_TRADE_SCORE:
+                    log(f"  {label}: {_sym} NICHT ausgeführt — "
+                        f"Score {_sc} < Minimum {MIN_AUTO_TRADE_SCORE}")
+                    return "score_low"
+
+                if not _sl or not _px:
+                    log(f"  {label}: {_sym} übersprungen — "
+                        f"kein SL/Entry (sl={_sl}, px={_px})")
+                    return "no_sl_entry"
+
+                log(f"  {label}: {_sym} {_dir.upper()} | "
+                    f"Score={_sc} | Entry={_px} SL={_sl} Lev={_lev}x")
                 _res = execute_trade_order(_sym, _dir, _lev, _px, _sl)
+
                 if _res.get("ok"):
                     telegram(
-                        f"✅ <b>Order platziert — {_sym}</b>\n"
-                        f"Qty: {_res.get('qty')}  ·  Margin: "
-                        f"{_res.get('initial_margin', 0):.2f} USDT"
+                        f"🤖 <b>{label} — {_sym}</b>\n"
+                        f"{_dir.upper()}  ·  Score <b>{_sc}/100</b>  ·  {_lev}x\n"
+                        f"Entry: <code>{_px}</code>  ·  SL: <code>{_sl}</code>\n"
+                        f"Qty: {_res.get('qty')}  ·  "
+                        f"Margin: {_res.get('initial_margin', 0):.2f} USDT"
                     )
+                    return "ok"
                 elif _res.get("reason", "").startswith("DEMO_SYMBOL_UNAVAILABLE"):
-                    # v4.41: Symbol im Demo nicht verfügbar → Fallback-Kandidaten
-                    log(f"  AUTO-EXEC: {_sym} im Demo nicht verfügbar — "
-                        f"versuche nächsten Kandidaten")
+                    log(f"  {label}: {_sym} im Demo nicht verfügbar — übersprungen")
+                    return "demo_unavail"
+                else:
                     telegram(
-                        f"⚠️ <b>Demo-Symbol nicht verfügbar — {_sym}</b>\n"
+                        f"❌ <b>{label} fehlgeschlagen — {_sym}</b>\n"
+                        f"{_res.get('reason', '?')}"
+                    )
+                    return "error"
+
+            if DEMO_EXECUTE_ALL:
+                # ── MODUS DEMO_EXECUTE_ALL: alle Signale ausführen ────────
+                log(f"  DEMO_EXECUTE_ALL: {len(ranked)} Signale werden ausgeführt")
+                _n_ok = _n_skip_score = _n_skip_sym = _n_err = _n_no_sl = 0
+
+                for _i, _entry in enumerate(ranked):
+                    _status = _exec_one(_entry, f"DEMO-ALL #{_i+1}")
+                    if _status == "ok":
+                        _n_ok += 1
+                    elif _status == "score_low":
+                        _n_skip_score += 1
+                    elif _status == "demo_unavail":
+                        _n_skip_sym += 1
+                    elif _status == "no_sl_entry":
+                        _n_no_sl += 1
+                    else:
+                        _n_err += 1
+                    # Kurze Pause zwischen Trades (Rate-Limit-Schutz)
+                    if _i < len(ranked) - 1:
+                        time.sleep(1)
+
+                # Summary-Nachricht
+                _summary_parts = [f"✅ {_n_ok} Trade(s) platziert"]
+                if _n_skip_sym:
+                    _summary_parts.append(f"⚠️ {_n_skip_sym} Demo-Symbol n.v.")
+                if _n_skip_score:
+                    _summary_parts.append(f"⏸ {_n_skip_score} Score < Min")
+                if _n_no_sl:
+                    _summary_parts.append(f"⏭ {_n_no_sl} kein SL/Entry")
+                if _n_err:
+                    _summary_parts.append(f"❌ {_n_err} Fehler")
+                telegram(
+                    f"📊 <b>DEMO_EXECUTE_ALL — {len(ranked)} Signale verarbeitet</b>\n"
+                    + "  ·  ".join(_summary_parts)
+                )
+
+            else:
+                # ── MODUS Standard: nur Top-1 ─────────────────────────────
+                _status = _exec_one(ranked[0], "AUTO-EXEC")
+                if _status == "demo_unavail":
+                    # Symbol nicht im Demo → Fallback auf nächste Kandidaten
+                    telegram(
+                        f"⚠️ <b>Demo-Symbol nicht verfügbar — "
+                        f"{ranked[0]['symbol']}</b>\n"
                         f"Bitget hat dieses Pair im Demo delistet.\n"
                         f"<i>Versuche nächsten Kandidaten...</i>"
                     )
                     for _fallback in ranked[1:]:
-                        _fs   = _fallback.get("sugg") or {}
-                        _fsc  = _fallback["_scored"]["score"]
-                        if _fsc < MIN_AUTO_TRADE_SCORE:
+                        _fb_status = _exec_one(_fallback, "AUTO-EXEC Fallback")
+                        if _fb_status == "ok":
                             break
-                        _fsy  = _fallback["symbol"]
-                        _fdi  = _fallback["direction"]
-                        _flv  = int(_fs.get("leverage") or 10)
-                        _fsl  = float(_fs.get("sl") or 0)
-                        _fpx  = float(_fallback.get("entry") or 0)
-                        if not _fsl or not _fpx:
-                            continue
-                        log(f"  AUTO-EXEC Fallback: {_fsy} {_fdi.upper()} "
-                            f"Score={_fsc}")
-                        telegram(
-                            f"🔄 <b>Fallback — {_fsy}</b>\n"
-                            f"{_fdi.upper()}  ·  Score {_fsc}  ·  {_flv}x"
-                        )
-                        _res2 = execute_trade_order(_fsy, _fdi, _flv, _fpx, _fsl)
-                        if _res2.get("ok"):
-                            telegram(
-                                f"✅ <b>Fallback Order — {_fsy}</b>\n"
-                                f"Qty: {_res2.get('qty')}  ·  Margin: "
-                                f"{_res2.get('initial_margin', 0):.2f} USDT"
-                            )
+                        elif _fb_status in ("score_low", "error"):
                             break
-                        elif _res2.get("reason", "").startswith(
-                                "DEMO_SYMBOL_UNAVAILABLE"):
-                            telegram(
-                                f"⚠️ <b>Demo-Symbol nicht verfügbar — {_fsy}</b>"
-                            )
-                            continue
-                        else:
-                            telegram(
-                                f"❌ <b>Fallback fehlgeschlagen — {_fsy}</b>\n"
-                                f"{_res2.get('reason', '?')}"
-                            )
-                            break
-                else:
-                    # Anderer Fehler → Error-Alarm
+                        # demo_unavail / no_sl_entry → weiter versuchen
+                elif _status == "score_low":
+                    _top = ranked[0]
                     telegram(
-                        f"❌ <b>Auto-Execute fehlgeschlagen — {_sym}</b>\n"
-                        f"{_res.get('reason', '?')}"
+                        f"⏸ <b>Auto-Execute pausiert — Score zu niedrig</b>\n"
+                        f"Top-Kandidat: <b>{_top['symbol']} "
+                        f"{_top['direction'].upper()}</b>\n"
+                        f"Score: <b>{_top['_scored']['score']}/100</b>  ·  "
+                        f"Minimum: <b>{MIN_AUTO_TRADE_SCORE}</b>\n\n"
+                        f"Kein Trade. Warte auf besseres Setup."
                     )
-            else:
-                log(f"  AUTO-EXEC: {_sym} übersprungen — kein SL/Entry im sugg "
-                    f"(sl={_sl}, entry={_px})")
-                telegram(
-                    f"⚠️ <b>Auto-Execute übersprungen — {_sym}</b>\n"
-                    f"Kein SL oder Entry-Preis im Signal. Bitte manuell traden."
-                )
+                elif _status == "no_sl_entry":
+                    telegram(
+                        f"⚠️ <b>Auto-Execute übersprungen — "
+                        f"{ranked[0]['symbol']}</b>\n"
+                        f"Kein SL oder Entry-Preis im Signal. "
+                        f"Bitte manuell traden."
+                    )
     except Exception as ex:
         log(f"[flush_entries] Fehler: {ex}")
         try:
@@ -8775,7 +8830,7 @@ def start_webhook_server():
     @app.route("/", methods=["GET"])
     @app.route("/health", methods=["GET"])
     def health():
-        return jsonify({"status": "running", "version": "v4.41", "mode": "DEMO"}), 200
+        return jsonify({"status": "running", "version": "v4.42", "mode": "DEMO"}), 200
 
     @app.route("/dashboard", methods=["GET"])
     def dashboard():
