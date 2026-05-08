@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-DOMINUS Channel Monitor  v1.7  (2026-05-09)
+DOMINUS Channel Monitor  v1.8  (2026-05-09)
 ════════════════════════════════════════════════════════════════
 Überwacht den Dominus Telegram-Kanal auf neue Coins UND optional
 parallel eine öffentliche TradingView-Watchlist.
@@ -10,6 +10,22 @@ als importierbare .txt-Datei + eine interaktive HTML-Clicklist
 (Delta-Modus: nur Coins, die seit dem letzten master_watchlist.txt
 dazugekommen sind — ein Button je Coin, kopiert BITGET:XYZUSDT.P
 in die Zwischenablage) per Telegram.
+
+Changelog v1.8:
+  • ÄNDERUNG: Jeder Neustart führt immer einen vollständigen Kanal-Scan durch
+    (CHANNEL_HISTORY_LIMIT Nachrichten), unabhängig davon ob MONITOR_REBUILD
+    gesetzt ist. Der Scan vergleicht alle Channel-Coins mit master_watchlist.txt
+    (TV-Baseline) und ergänzt alles was noch fehlt. Existing state (known_coins,
+    watchlist) bleibt erhalten — es werden nur Neuzugänge verarbeitet.
+    Vorteil: nach jedem Redeploy (z.B. GitHub-Push) ist der Stand sofort
+    vollständig und aktuell — keine Lücken durch Downtime.
+  • ÄNDERUNG: Telegram-Bestätigung nach Startup-Scan listet alle neuen Coins
+    explizit auf (Symbol + Exchange-Kürzel), damit sie direkt in TradingView
+    eingefügt werden können. Wenn nichts Neues: kurze "alles aktuell"-Meldung.
+  • ERSETZT v1.7-Catchup-Scan (last_seen_msg_id): der vollständige Startup-Scan
+    macht den ID-basierten Nachholmechanismus obsolet.
+  • MONITOR_REBUILD=1 bleibt erhalten für kompletten State-Reset (TV-Baseline
+    neu aufbauen + all known_coins leeren).
 
 Changelog v1.7:
   • NEU: Startup-Catch-up-Scan bei normalem Restart (kein MONITOR_REBUILD).
@@ -795,6 +811,64 @@ async def bootstrap_state(client, channel, state: dict) -> dict:
     return state
 
 
+# ── Startup-Vollscan (v1.8) ───────────────────────────────────────
+async def startup_full_scan(client, channel, state: dict) -> tuple[list, int]:
+    """
+    Scannt den gesamten DOMINUS-Kanal (CHANNEL_HISTORY_LIMIT Nachrichten)
+    und gleicht mit der aktuellen master_watchlist.txt (TV-Baseline) ab.
+    Neue Coins werden aufgelöst und zum State hinzugefügt.
+
+    Läuft bei JEDEM Neustart — ersetzt den v1.7 Catchup-Scan.
+    Gibt (new_syms, scanned_count) zurück.
+    """
+    log.info(f"[Startup-Scan] Scanne {CHANNEL_HISTORY_LIMIT} Kanal-Nachrichten ...")
+
+    # TV-Baseline laden (master_watchlist.txt) — was bereits in TV ist
+    baseline_coins: set[str] = await asyncio.to_thread(get_tv_baseline_coins)
+    log.info(f"[Startup-Scan] TV-Baseline: {len(baseline_coins)} bekannte Coins")
+
+    # Alle Coins aus Channel-History sammeln
+    channel_raw: list[str] = []
+    scanned = 0
+    coin_msgs = 0
+    max_msg_id = state.get("last_seen_msg_id", 0)
+
+    async for msg in client.iter_messages(channel, limit=CHANNEL_HISTORY_LIMIT):
+        scanned += 1
+        if msg.id > max_msg_id:
+            max_msg_id = msg.id
+        if not msg.text:
+            continue
+        coins = extract_coins(msg.text)
+        if coins:
+            coin_msgs += 1
+            for c in coins:
+                if c not in channel_raw:
+                    channel_raw.append(c)
+
+    log.info(f"[Startup-Scan] {scanned} Nachrichten, {coin_msgs} Coin-Listen, "
+             f"{len(channel_raw)} einzigartige Roh-Coins")
+
+    # Coins verarbeiten: nur was NICHT in TV-Baseline ist
+    # Dazu known_coins vorübergehend auf Baseline setzen, damit process_new_coins
+    # korrekt filtert (baseline = bereits in TV → überspringen)
+    _orig_known = list(state.get("known_coins", []))
+    # Baseline als bekannt markieren ohne State zu zerstören
+    for c in baseline_coins:
+        if c not in state["known_coins"]:
+            state["known_coins"].append(c)
+
+    new_syms, skipped = process_new_coins(channel_raw, state)
+
+    if new_syms or skipped:
+        state["last_seen_msg_id"] = max_msg_id
+        save_state(state)
+
+    log.info(f"[Startup-Scan] Fertig: {len(new_syms)} neue Symbole, "
+             f"{len(skipped)} nicht gefunden")
+    return new_syms, skipped, scanned
+
+
 # ── Hauptprogramm ────────────────────────────────────────────────
 async def main() -> None:
     log.info("════ Dominus Channel Monitor v1.6 ════")
@@ -836,77 +910,62 @@ async def main() -> None:
     else:
         log.info("TV_WATCHLIST_URL nicht gesetzt → kein TV-Abgleich")
 
-    # State laden + ggf. Bootstrap erzwingen
+    # State laden
     state = load_state()
-    need_bootstrap = MONITOR_REBUILD or not state.get("known_coins")
 
-    if need_bootstrap:
-        if MONITOR_REBUILD:
-            log.info("MONITOR_REBUILD=1 → State wird komplett neu aufgebaut")
-            state = {"known_coins": [], "watchlist": [], "skipped": []}
+    # v1.8: MONITOR_REBUILD → State komplett leeren, dann immer Vollscan
+    if MONITOR_REBUILD:
+        log.info("MONITOR_REBUILD=1 → State wird komplett neu aufgebaut")
+        state = {"known_coins": [], "watchlist": [], "skipped": []}
         state = await bootstrap_state(client, channel, state)
     else:
-        log.info(f"State geladen: {len(state['watchlist'])} Symbole bekannt")
+        # v1.8: Jeder Neustart = vollständiger Kanal-Scan gegen master_watchlist.txt
+        log.info(f"State geladen: {len(state.get('watchlist', []))} Symbole bekannt")
+        syms_before = len(state.get("watchlist", []))
 
-        # v1.7: Catch-up-Scan — Nachrichten seit letzter bekannter msg_id prüfen
-        last_id   = state.get("last_seen_msg_id", 0)
-        syms_before = len(state["watchlist"])
-        catchup_new: list[str] = []
-        catchup_raw: list[str] = []
-        new_max_id  = last_id
-        scanned     = 0
+        new_syms, skipped, scanned = await startup_full_scan(client, channel, state)
+        syms_after = len(state.get("watchlist", []))
 
-        log.info(f"[Catchup] Scanne letzte {MONITOR_CATCHUP_LIMIT} Nachrichten "
-                 f"(last_seen_msg_id={last_id})...")
-        async for msg in client.iter_messages(channel, limit=MONITOR_CATCHUP_LIMIT):
-            scanned += 1
-            if msg.id > new_max_id:
-                new_max_id = msg.id
-            if last_id and msg.id <= last_id:
-                break   # alles Ältere bereits bekannt
-            if not msg.text:
-                continue
-            coins = extract_coins(msg.text)
-            if coins:
-                for c in coins:
-                    if c not in catchup_raw:
-                        catchup_raw.append(c)
+        # ── Telegram-Bestätigung mit expliziter Coin-Liste ──────────
+        if new_syms:
+            # Coin-Zeilen aufbauen: je eine Zeile pro neuem Symbol
+            coin_lines = []
+            for sym in sorted(new_syms):
+                # sym = "BITGET:XYZUSDT.P" oder "BYBIT:XYZUSDT"
+                exch_icon = "🟠" if "BITGET" in sym else "🔵"
+                raw_coin  = sym.split(":")[1] if ":" in sym else sym
+                coin_lines.append(f"  {exch_icon} <code>{raw_coin}</code>  →  {sym}")
 
-        if catchup_raw:
-            log.info(f"[Catchup] {len(catchup_raw)} neue Roh-Coins gefunden — verarbeite...")
-            catchup_new, catchup_skipped = process_new_coins(catchup_raw, state)
-            if catchup_new:
-                state["last_seen_msg_id"] = new_max_id
-                save_state(state)
-                log.info(f"[Catchup] {len(catchup_new)} neue Symbole hinzugefügt: "
-                         f"{catchup_new}")
-                await asyncio.to_thread(
-                    send_watchlist_file, state, catchup_new, catchup_skipped
-                )
-                await asyncio.to_thread(
-                    send_clicklist_file, state, "📋 Clicklist (Catch-up)"
-                )
-        else:
-            log.info(f"[Catchup] {scanned} Nachrichten gescannt — keine neuen Coins")
-            if new_max_id > last_id:
-                state["last_seen_msg_id"] = new_max_id
-                save_state(state)
+            # Bei sehr langer Liste: erste 30 zeigen, Rest als Hinweis
+            display_lines = coin_lines[:30]
+            rest = len(coin_lines) - 30
+            suffix = f"\n  <i>…und {rest} weitere</i>" if rest > 0 else ""
 
-        # Startup-Bestätigung mit Catch-up-Ergebnis
-        syms_after = len(state["watchlist"])
-        neu_count  = syms_after - syms_before
-        if neu_count > 0:
             send_text(
-                f"▶️ <b>Dominus-Monitor aktiv</b>\n"
-                f"Watchlist: <b>{syms_after}</b> Symbole\n"
-                f"➕ <b>{neu_count} neue</b> seit letztem Start hinzugefügt\n"
-                f"🔍 {scanned} Nachrichten gescannt (Catch-up)"
+                f"▶️ <b>Dominus-Monitor aktiv — Vollscan abgeschlossen</b>\n"
+                f"📊 Watchlist: <b>{syms_after} Symbole</b> "
+                f"(+{len(new_syms)} neu)\n"
+                f"🔍 {scanned} Nachrichten gescannt\n\n"
+                f"➕ <b>Neue Coins hinzugefügt:</b>\n"
+                + "\n".join(display_lines) + suffix
+                + (f"\n\n⚠️ Nicht auf Bitget/Bybit: "
+                   f"{', '.join(skipped[:10])}"
+                   + (f" …(+{len(skipped)-10})" if len(skipped) > 10 else "")
+                   if skipped else "")
+            )
+            # Clicklist + .txt-Datei als Anhang
+            await asyncio.to_thread(
+                send_watchlist_file, state, new_syms, skipped
+            )
+            await asyncio.to_thread(
+                send_clicklist_file, state, "📋 Clicklist (Startup-Scan)"
             )
         else:
             send_text(
-                f"▶️ <b>Dominus-Monitor aktiv</b>\n"
-                f"Watchlist: <b>{syms_after}</b> Symbole\n"
-                f"✅ Nichts Neues — {scanned} Nachrichten geprüft, alles bekannt"
+                f"▶️ <b>Dominus-Monitor aktiv — Vollscan abgeschlossen</b>\n"
+                f"📊 Watchlist: <b>{syms_after} Symbole</b> — alles aktuell ✅\n"
+                f"🔍 {scanned} Nachrichten gescannt\n"
+                f"<i>Überwache auf neue DOMINUS-Nachrichten...</i>"
             )
 
     # Neue Nachrichten überwachen
