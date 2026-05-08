@@ -1,20 +1,24 @@
 """
-DOMINUS Demo-Bot v4.36 — PAPER TRADING
+DOMINUS Demo-Bot v4.37 — PAPER TRADING
 ════════════════════════════════════
 Vollautomatisches Paper Trading auf Bitget Demo-Account.
 Kein echtes Kapital — identische Logik wie Live-Script.
 
 Unterschied zum Live-Script:
-  - GLEICHE API-Keys wie Live (API_KEY / SECRET_KEY / PASSPHRASE)
-  - paperId="1" Header aktiviert Bitget Demo-Account
-  - Separater Telegram-Kanal (TELEGRAM_CHAT_ID = Demo-Kanal ID)
+  - SEPARATE Demo-API-Keys (DEMO_API_KEY / DEMO_SECRET_KEY / DEMO_PASSPHRASE)
+    → erstellt im Bitget Demo-Konto unter Futures → Klassisches Demo-Trading → API-Keys
+  - KEIN paperId-Header (war wirkungslos für v2 REST-API, führte zu Live-Orders)
+  - Separater Telegram-Kanal (DEMO_TELEGRAM_CHAT_ID)
   - Performance-Tracking in demo_trades.json
 
 Railway Setup:
   1. Neuer Service → Start Command: python dominus_demo_bot.py
-  2. Variables: gleiche API-Keys wie Live
-  3. TELEGRAM_CHAT_ID = Chat-ID des Demo-Telegram-Kanals
-  4. WEBHOOK_SECRET = eigenes Token z.B. dominus-demo-2026
+  2. Variables:
+       DEMO_API_KEY       → API Key aus Bitget Demo-Konto
+       DEMO_SECRET_KEY    → Secret Key aus Bitget Demo-Konto
+       DEMO_PASSPHRASE    → Passphrase aus Bitget Demo-Konto
+       DEMO_TELEGRAM_CHAT_ID → Chat-ID des Demo-Telegram-Kanals
+       WEBHOOK_SECRET     → eigenes Token z.B. dominus-demo-2026
 ════════════════════════════════════
 DOMINUS Trade-Automatisierung v4.35.1 — ursprüngliches Script
 ══════════════════════════════════════════════════════════════
@@ -769,12 +773,13 @@ except ImportError:
 # KONFIGURATION — aus Railway Variables
 # ═══════════════════════════════════════════════════════════════
 
-# Demo-Mode: dieselben Credentials wie Live
-# Der Demo-Modus wird ausschliesslich via paperId="1" Header gesteuert
-API_KEY    = os.environ.get("API_KEY",    "")
-SECRET_KEY = os.environ.get("SECRET_KEY", "")
-PASSPHRASE = os.environ.get("PASSPHRASE", "")
-DEMO_MODE  = True   # aktiviert paperId="1" + separaten Telegram-Kanal + Trade-Logging
+# Demo-Mode: SEPARATE Credentials aus Bitget Demo-Konto
+# Erstellt unter: Futures → Klassisches Demo-Trading → API-Keys
+# WICHTIG: Nicht dieselben Keys wie Live — sonst werden echte Trades ausgeführt!
+API_KEY    = os.environ.get("DEMO_API_KEY",    "")
+SECRET_KEY = os.environ.get("DEMO_SECRET_KEY", "")
+PASSPHRASE = os.environ.get("DEMO_PASSPHRASE", "")
+DEMO_MODE  = True   # separater Telegram-Kanal + Trade-Logging in demo_trades.json
 
 PRODUCT_TYPE = "usdt-futures"
 MARGIN_COIN  = "USDT"
@@ -960,11 +965,18 @@ h4_buffer:     list = []
 h4_buffer_lock = __import__("threading").Lock()
 H4_BUFFER_SEC  = _env_int("H4_BUFFER_SEC", 300)  # 5 Min
 
+# HARSI-Warn-Buffer: sammelt harsi_warn=1 Signale, sendet gebündelt
+harsi_warn_buffer:      list = []
+harsi_warn_buffer_lock  = __import__("threading").Lock()
+HARSI_WARN_BUFFER_SEC   = _env_int("HARSI_WARN_BUFFER_SEC", 60)  # 60s Sammelzeit
+_harsi_warn_timer: object = None   # aktiver threading.Timer (oder None)
+
 trailing_sl_level: dict = {}  # {symbol: int} — 0=initial, 1=Entry, 2=TP1-Preis, 3=TP2-Preis
 
 # Daily P&L Report — Aufzeichnung abgeschlossener Trades
 closed_trades: list = []
-daily_report_sent_date: str = ""   # "2026-04-17" — verhindert Doppelversand pro Tag
+daily_report_sent_date:  str = ""   # "2026-04-17" — verhindert Doppelversand pro Tag
+weekly_report_sent_week: str = ""   # "YYYY-Www"   — verhindert Doppel-Senden
 
 # Harsi-Ausstiegslinie
 harsi_sl: dict = {}
@@ -1422,6 +1434,29 @@ def telegram_edit_message(
     return False
 
 
+def telegram_file(filepath: str, caption: str = "") -> bool:
+    """v4.38 — Sendet eine Datei als Telegram-Dokument (sendDocument)."""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return False
+    if not os.path.isfile(filepath):
+        log(f"[TG-FILE] Datei nicht gefunden: {filepath}")
+        return False
+    try:
+        with open(filepath, "rb") as fh:
+            r = requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument",
+                data={"chat_id": TELEGRAM_CHAT_ID,
+                      "caption": caption[:1024] if caption else "",
+                      "parse_mode": "HTML"},
+                files={"document": fh},
+                timeout=30,
+            )
+        return r.json().get("ok", False)
+    except Exception as e:
+        log(f"[TG-FILE] Fehler beim Senden von {os.path.basename(filepath)}: {e}")
+        return False
+
+
 def telegram_answer_callback(
     callback_id: str,
     text: str = "",
@@ -1494,9 +1529,9 @@ def make_headers(method: str, path: str, body: str = "") -> dict:
         "Content-Type":      "application/json",
         "locale":            "en-US",
     }
-    # Demo-Modus: paperId=1 schaltet Bitget auf Demo-Account um
-    if DEMO_MODE:
-        h["paperId"] = "1"
+    # v4.37: paperId-Header entfernt — war für Bitget v2 REST-API wirkungslos
+    # und hat dazu geführt, dass Orders auf dem Live-Account ausgeführt wurden.
+    # Demo-Routing erfolgt ausschliesslich durch die separaten Demo-API-Keys.
     return h
 
 
@@ -2014,6 +2049,50 @@ def cancel_all_tp_orders(symbol: str, dom_only: bool = True):
             errs += 1
 
     log(f"  → {ok}/{len(tp_orders)} TPs storniert, {errs} Fehler")
+
+
+def cancel_tp_orders_by_ids(symbol: str, order_ids: set):
+    """
+    FIX 13: Storniert nur TP-Orders deren orderId oder clientOid in order_ids steht.
+    Verhindert versehentliches Stornieren neu platzierter TPs.
+    """
+    if not order_ids:
+        log(f"  cancel_by_ids: keine alten IDs — nichts zu stornieren")
+        return
+    orders = _get_plan_orders(symbol)
+    to_cancel = [
+        o for o in orders
+        if o.get("planType") == "profit_plan"
+        and (o.get("orderId", "") in order_ids or o.get("clientOid", "") in order_ids)
+    ]
+    if not to_cancel:
+        log(f"  cancel_by_ids: alte IDs nicht mehr auf Exchange — bereits storniert?")
+        return
+    log(f"  cancel_by_ids: {len(to_cancel)} alte TP(s) stornieren...")
+    ok = errs = 0
+    for order in to_cancel:
+        oid  = order.get("orderId") or ""
+        coid = order.get("clientOid") or ""
+        price = order.get("triggerPrice", "?")
+        body = {
+            "symbol": symbol, "productType": PRODUCT_TYPE,
+            "marginCoin": MARGIN_COIN, "planType": "profit_plan",
+        }
+        if oid:
+            body["orderId"] = oid
+        elif coid:
+            body["clientOid"] = coid
+        else:
+            continue
+        res  = api_post("/api/v2/mix/order/cancel-plan-order", body)
+        code = res.get("code")
+        if code == "00000":
+            log(f"    ✓ Alt-TP storniert @ {price}: {oid or coid}")
+            ok += 1
+        else:
+            log(f"    ✗ Alt-TP @ {price}: code={code} msg={res.get('msg','?')}")
+            errs += 1
+    log(f"  cancel_by_ids: {ok}/{len(to_cancel)} storniert, {errs} Fehler")
 
 
 def calc_tp_price(avg: float, roi: float,
@@ -4002,31 +4081,42 @@ def tps_are_correct(existing: list, avg: float, total: float,
     return True
 
 
-def verify_tp_orders(symbol: str, expected_count: int) -> bool:
+def verify_tp_orders(symbol: str, expected_count: int,
+                     cancelled_count: int = 0) -> bool:
     """
-    FIX 10 v4.36: Prueft 3 Sekunden nach Platzierung ob die erwartete
-    Anzahl DOM_-eigener TPs tatsaechlich auf der Exchange aktiv ist.
-    Sendet Telegram-Alarm wenn TPs fehlen.
+    FIX 14 v4.39:
+      (A) expected_count zählt nur profit_plan (TP1/2/3), nicht TP4 (pos_profit)
+      (B) Nach cancel_by_ids hat Bitget 1-5 Min Propagation-Delay.
+          Bei cancelled_count > 0: 90s warten bevor Verifikation.
     """
-    time.sleep(3)
-    try:
-        orders   = _get_plan_orders(symbol)
-        dom_tps  = [o for o in orders
-                    if o.get("planType") == "profit_plan"
-                    and (o.get("clientOid") or "").startswith(ORDER_PREFIX)]
-        active   = len(dom_tps)
-        if active < expected_count:
-            msg = (f"⚠️ <b>TP-Verifikation fehlgeschlagen — {symbol}</b>\n"
-                   f"Erwartet: {expected_count} | Aktiv: {active}\n"
-                   f"Bitte manuell prüfen!")
-            log(msg.replace("<b>", "").replace("</b>", ""))
-            telegram(msg)
-            return False
-        log(f"  ✓ TP-Verifikation: {active}/{expected_count} aktiv auf Exchange")
-        return True
-    except Exception as ex:
-        log(f"  ⚠ TP-Verifikation Fehler: {ex}")
-        return False
+    wait_sec = 90 if cancelled_count > 0 else 5
+    log(f"  TP-Verifikation startet in {wait_sec}s "
+        f"({'nach Cancel-Blackout' if cancelled_count > 0 else 'Standard'})...")
+    time.sleep(wait_sec)
+
+    for attempt in range(2):
+        if attempt > 0:
+            time.sleep(15)
+        try:
+            orders  = _get_plan_orders(symbol)
+            dom_tps = [o for o in orders
+                       if o.get("planType") == "profit_plan"
+                       and (o.get("clientOid") or "").startswith(ORDER_PREFIX)]
+            active  = len(dom_tps)
+            if active >= expected_count:
+                log(f"  ✓ TP-Verifikation: {active}/{expected_count} profit_plan aktiv")
+                return True
+            if attempt == 0:
+                log(f"  TP-Verifikation: {active}/{expected_count} — retry in 15s...")
+        except Exception as ex:
+            log(f"  ⚠ TP-Verifikation Fehler (attempt {attempt+1}): {ex}")
+
+    msg = (f"⚠️ <b>TP-Verifikation fehlgeschlagen — {symbol}</b>\n"
+           f"Erwartet: {expected_count} profit_plan | Aktiv: {active}\n"
+           f"Bitte manuell prüfen!")
+    log(msg.replace("<b>", "").replace("</b>", ""))
+    telegram(msg)
+    return False
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -4096,17 +4186,28 @@ def _update_tp_for_position_impl(pos: dict, reason: str):
 
     log(f"  TPs neu setzen, dann alte stornieren (Grund: {reason}) [FIX3 v4.36]")
 
+    # FIX 13 v4.39: Alte TP-IDs VOR dem Platzieren neuer TPs sichern.
+    # Danach nur DIESE IDs stornieren — nicht die frisch platzierten.
+    _old_tp_ids = set(
+        (o.get("orderId") or o.get("clientOid") or "")
+        for o in _get_plan_orders(symbol)
+        if o.get("planType") == "profit_plan"
+        and (o.get("clientOid") or "").startswith(ORDER_PREFIX)
+    ) - {""}
+    log(f"  Alte TPs gesichert: {len(_old_tp_ids)} ID(s)")
+
     # FIX 3 v4.36: ZUERST neue TPs platzieren, DANN alte stornieren.
     # So gibt es kein Zeitfenster ohne TP-Schutz auf der Exchange.
     count, prices = place_tp_orders(
         symbol, avg, total, direction, leverage, mark, known_sl=known_sl
     )
-    # Jetzt erst alte TPs stornieren (nur DOM_-eigene, FIX 11)
-    cancel_all_tp_orders(symbol, dom_only=True)
+    # FIX 13: Nur alte IDs stornieren — nicht die frisch platzierten
+    cancel_tp_orders_by_ids(symbol, _old_tp_ids)
 
-    # FIX 10 v4.36: Verifikation — sind die TPs wirklich auf der Exchange aktiv?
+    # FIX 14 v4.39: Verifikation mit Cancel-Blackout-Handling
     if count > 0:
-        verify_tp_orders(symbol, count)
+        _pp_expected = max(0, count - 1)  # TP4 (pos_profit) nicht mitzählen
+        verify_tp_orders(symbol, _pp_expected, cancelled_count=len(_old_tp_ids))
 
     # FIX 5 v4.36: Funding Rate Warnung bei extrem negativen Werten
     try:
@@ -6796,6 +6897,131 @@ def cmd_refresh(parts: list):
     reply("\n".join(lines))
 
 
+def flush_harsi_warn_buffer():
+    """Sendet gesammelte HARSI-Warn-Signale (harsi_warn=1) als gebündelte Telegram-Nachricht."""
+    global harsi_warn_buffer
+    with harsi_warn_buffer_lock:
+        if not harsi_warn_buffer:
+            return
+        items          = list(harsi_warn_buffer)
+        harsi_warn_buffer = []
+
+    now_str = datetime.now().strftime("%H:%M")
+    longs   = [i for i in items if i["direction"] == "long"]
+    shorts  = [i for i in items if i["direction"] == "short"]
+
+    lines = [
+        f"⚠️ <b>HARSI Extremzone — {len(items)} Coin{'s' if len(items)>1 else ''} warten auf Exit</b>",
+        "━" * 12,
+        "",
+    ]
+    if longs:
+        lines.append("🟢 <b>LONG — wartet auf HARSI_EXIT:</b>")
+        for item in longs:
+            expiry = item.get("expiry_str", "—")
+            lines.append(f"  • <b>{item['symbol']}</b>  @ {item['entry']}  |  ⏰ bis {expiry}")
+        lines.append("")
+    if shorts:
+        lines.append("🔴 <b>SHORT — wartet auf HARSI_EXIT:</b>")
+        for item in shorts:
+            expiry = item.get("expiry_str", "—")
+            lines.append(f"  • <b>{item['symbol']}</b>  @ {item['entry']}  |  ⏰ bis {expiry}")
+        lines.append("")
+
+    lines += [
+        "🤖 HARSI_EXIT kommt automatisch via Pine Intrabar-Alert",
+        "📋 /status | /makro",
+    ]
+    telegram("\n".join(lines))
+    log(f"HARSI-Warn-Zusammenfassung gesendet: {len(longs)} Long, {len(shorts)} Short")
+
+
+def build_weekly_report() -> str:
+    """Erstellt den wöchentlichen Telegram-Report (Montag 08:00)."""
+    import csv as _csv
+    _now      = datetime.now()
+    _week_str = _now.strftime("KW %V / %Y")
+    _mon_str  = _now.strftime("%B %Y")
+    wins_w = losses_w = pnl_w = 0.0
+    wins_m = losses_m = pnl_m = 0.0
+    week_num  = _now.isocalendar()[1]
+    month_num = _now.month
+    year_num  = _now.year
+
+    if TRADES_CSV and os.path.isfile(TRADES_CSV):
+        try:
+            with open(TRADES_CSV, "r", encoding="utf-8", newline="") as f:
+                reader = _csv.DictReader(f, delimiter=";")
+                for row in reader:
+                    try:
+                        ts_str = row.get("ts_close") or row.get("ts_open") or ""
+                        if not ts_str:
+                            continue
+                        ts  = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                        pnl = float(row.get("pnl_usdt") or 0)
+                        won = row.get("won", "")
+                        if ts.year == year_num and ts.isocalendar()[1] == week_num:
+                            if won == "1":   wins_w += 1; pnl_w += pnl
+                            elif won == "0": losses_w += 1; pnl_w += pnl
+                        if ts.year == year_num and ts.month == month_num:
+                            if won == "1":   wins_m += 1; pnl_m += pnl
+                            elif won == "0": losses_m += 1; pnl_m += pnl
+                    except Exception:
+                        continue
+        except Exception as e:
+            log(f"[WEEKLY] CSV-Lesefehler: {e}")
+
+    total_w = int(wins_w + losses_w)
+    total_m = int(wins_m + losses_m)
+    wr_w = f"{wins_w/total_w*100:.0f}%" if total_w else "—"
+    wr_m = f"{wins_m/total_m*100:.0f}%" if total_m else "—"
+    sign_w = "+" if pnl_w >= 0 else ""
+    sign_m = "+" if pnl_m >= 0 else ""
+
+    lines = [
+        "📊 <b>DOMINUS Demo Wochenbericht</b>",
+        "━" * 12,
+        "",
+        f"📅 <b>{_week_str}</b>",
+        f"  Trades: {total_w}  |  Win-Rate: {wr_w}",
+        f"  PnL:    <b>{sign_w}{pnl_w:.2f} USDT</b>",
+        "",
+        f"🗓 <b>{_mon_str} (laufend)</b>",
+        f"  Trades: {total_m}  |  Win-Rate: {wr_m}",
+        f"  PnL:    <b>{sign_m}{pnl_m:.2f} USDT</b>",
+        "",
+        "📋 /report | /trades | /status",
+    ]
+    return "\n".join(lines)
+
+
+def cmd_backup(reply_fn=None):
+    """v4.38 — /backup: sendet trades.csv + dominus_state.json via Telegram."""
+    _reply = reply_fn or telegram
+    sent = 0
+    if TRADES_CSV and os.path.isfile(TRADES_CSV):
+        ok = telegram_file(
+            TRADES_CSV,
+            caption=f"💾 <b>demo_trades.csv</b> — {datetime.now().strftime('%d.%m.%Y %H:%M')}",
+        )
+        if ok: sent += 1
+        else: _reply("❌ trades.csv konnte nicht gesendet werden.")
+    else:
+        _reply(f"⚠️ trades.csv nicht gefunden (<code>{TRADES_CSV}</code>)")
+    if STATE_FILE and os.path.isfile(STATE_FILE):
+        ok = telegram_file(
+            STATE_FILE,
+            caption=f"💾 <b>dominus_demo_state.json</b> — {datetime.now().strftime('%d.%m.%Y %H:%M')}",
+        )
+        if ok: sent += 1
+        else: _reply("❌ dominus_state.json konnte nicht gesendet werden.")
+    else:
+        _reply(f"⚠️ dominus_state.json nicht gefunden (<code>{STATE_FILE}</code>)")
+    if sent > 0:
+        _reply(f"✅ {sent}/2 Backup-Dateien gesendet.")
+    log(f"[BACKUP] {sent}/2 Dateien via Telegram gesendet.")
+
+
 def build_daily_report(date_str: str = None) -> str:
     """
     Erstellt einen täglichen P&L-Report als HTML-String für Telegram.
@@ -7378,6 +7604,8 @@ def poll_telegram_commands():
             cmd_report()
         elif cmd == "/trades":
             cmd_trades()
+        elif cmd == "/backup":
+            cmd_backup(reply_fn=reply)
         elif cmd == "/restore_trades" or cmd == "/restoretrades":
             # ohne angehängte Datei — nur Anleitung zeigen
             reply(
@@ -8366,30 +8594,38 @@ def start_webhook_server():
             btc_t2_txt = "BTC + Total2 gleiche Richtung ✓"
         premium_txt  = "Premium-Setup (dunkelgrün/-rot)"   if premium_val     == 1 else "Kein Premium (höheres Risiko)"
 
-        # Timer-Zeile abhängig von harsi_warn und recovering-Zustand
+        # v4.38: harsi_warn=1 → Signale bündeln statt einzeln senden
         if harsi_warn_val != 0:
-            # Ablaufzeitpunkt: H2-Zeitstempel + 30 Min (oder "jetzt + 30 Min" als Fallback)
-            # v4.29: timezone-aware Default + Shim für Legacy-Dict-Werte
             _h2_ts      = _ensure_aware_utc(last_h2_signal_time.get(
                 f"{symbol}_{direction}", datetime.now(timezone.utc)))
             _expiry_utc = _h2_ts + timedelta(minutes=30)
             _expiry_str = _expiry_utc.strftime("%d.%m.%Y %H:%M UTC")
-            # v4.22: HARSI_EXIT kommt automatisch über DOM-ORC v2.4.2 Intrabar-
-            # Alert (Pine alert.freq_once_per_bar) → Watchlist-Master-Alarm.
-            # Kein manuelles Alarm-3-Anlegen mehr nötig. Stattdessen: Timer +
-            # kurzer Hinweis, dass der HARSI_EXIT automatisch eintrudeln wird.
-            _anker  = "sec-alarm3" if direction == "long" else "sec-alarm3b"
-            _anchor_label = "Alarm 3 — Doku" if direction == "long" else "Alarm 3b — Doku"
-            if DOCS_URL:
-                _docs_link = f'\n🔗 <a href="{DOCS_URL}#{_anker}">{_anchor_label}</a>'
-            else:
-                _docs_link = ""
-            timer_line = (
-                f"⏳ <b>HARSI noch in Extremzone — warten auf Intrabar-Exit</b>\n"
-                f"⏰ Fenster läuft ab: <b>{_expiry_str}</b>\n"
-                f"🤖 HARSI_EXIT-Alarm kommt automatisch (Pine v2.4.2 Intrabar)"
-                f"{_docs_link}"
-            )
+
+            global _harsi_warn_timer
+            with harsi_warn_buffer_lock:
+                harsi_warn_buffer[:] = [
+                    x for x in harsi_warn_buffer
+                    if not (x["symbol"] == symbol and x["direction"] == direction)
+                ]
+                harsi_warn_buffer.append({
+                    "symbol":     symbol,
+                    "direction":  direction,
+                    "entry":      entry,
+                    "expiry_str": _expiry_str,
+                })
+            if _harsi_warn_timer is not None:
+                try:
+                    _harsi_warn_timer.cancel()
+                except Exception:
+                    pass
+            import threading as _thr
+            _harsi_warn_timer = _thr.Timer(HARSI_WARN_BUFFER_SEC, flush_harsi_warn_buffer)
+            _harsi_warn_timer.daemon = True
+            _harsi_warn_timer.start()
+            log(f"HARSI-Warn-Buffer +1: {symbol} {direction} — Flush in {HARSI_WARN_BUFFER_SEC}s")
+            return  # kein Einzel-Telegram für harsi_warn=1
+
+        # Timer-Zeile für harsi_warn=0
         elif _recovering_long and premium_val != 1:
             timer_line = (
                 "🟡 <b>Long-Recovery — nur bei Premium-Long einsteigen!</b>\n"
@@ -8440,21 +8676,64 @@ def start_webhook_server():
     @app.route("/", methods=["GET"])
     @app.route("/health", methods=["GET"])
     def health():
-        return jsonify({"status": "running", "version": "v4.36"}), 200
+        return jsonify({"status": "running", "version": "v4.40", "mode": "DEMO"}), 200
 
     @app.route("/dashboard", methods=["GET"])
     def dashboard():
-        """Performance Dashboard — liest demo_trades.json live."""
-        import json as _j, os as _os
-        from flask import Response
-        fname = "demo_trades.json"
+        """
+        DEMO Performance Dashboard — liest aus TRADES_CSV (Railway Volume).
+
+        Optionaler Passwortschutz: DASHBOARD_SECRET Railway-Variable setzen.
+        Aufruf dann mit ?secret=DEIN_SECRET.
+        """
+        import json as _j, csv as _csv, os as _os
+        from flask import Response, request as _req
+
+        # Optionaler Passwortschutz (gleiche Logik wie Live-Bot)
+        _ds = os.environ.get("DASHBOARD_SECRET", "")
+        if _ds and _req.args.get("secret", "") != _ds:
+            return Response(
+                "<html><body style='background:#0a0c0e;color:#e74c3c;font-family:monospace;"
+                "display:flex;align-items:center;justify-content:center;height:100vh;"
+                "font-size:1.2rem'>403 &mdash; ?secret= fehlt oder falsch</body></html>",
+                status=403, mimetype="text/html"
+            )
+
+        # Trades aus TRADES_CSV laden (konsistent mit Weekly Report + /backup)
         trades = []
-        if _os.path.exists(fname):
+        if TRADES_CSV and _os.path.isfile(TRADES_CSV):
             try:
-                with open(fname) as f:
-                    trades = _j.load(f)
-            except Exception:
-                trades = []
+                with open(TRADES_CSV, newline="", encoding="utf-8") as f:
+                    reader = _csv.DictReader(f, delimiter=";")
+                    for row in reader:
+                        if row.get("won") not in ("0", "1"):
+                            continue
+                        try:
+                            trades.append({
+                                "symbol":    row.get("symbol", ""),
+                                "direction": row.get("direction", ""),
+                                "pnl":       float(row.get("pnl_usdt") or 0),
+                                "won":       row.get("won", ""),
+                                "ts_close":  row.get("ts_close") or row.get("ts_open", ""),
+                                "leverage":  row.get("leverage", ""),
+                                "r_mult":    row.get("r_mult", ""),
+                                "close_reason": row.get("close_reason", ""),
+                            })
+                        except Exception:
+                            continue
+            except Exception as _e:
+                log(f"[Dashboard] CSV-Lesefehler: {_e}")
+
+        # Fallback: demo_trades.json (Legacy)
+        if not trades:
+            fname = "demo_trades.json"
+            if _os.path.exists(fname):
+                try:
+                    with open(fname) as f:
+                        trades = _j.load(f)
+                except Exception:
+                    pass
+
         return Response(_build_dashboard_html(_j.dumps(trades)), mimetype="text/html")
 
     port = _env_int("PORT", 8080)
@@ -8499,6 +8778,7 @@ def save_state():
             "trailing_sl_level":       trailing_sl_level,
             "closed_trades":           [t for t in closed_trades if t.get("ts", 0) >= time.time() - 90*86400],
             "daily_report_sent_date":  daily_report_sent_date,
+            "weekly_report_sent_week": weekly_report_sent_week,
             "harsi_sl":                harsi_sl,
             # v4.12: Sling-SL (Swing-Pivot-basiert) + DCA Auto-Void State
             "sling_sl":                sling_sl,
@@ -8524,7 +8804,7 @@ def save_state():
 
 def load_state():
     """Lädt den gespeicherten State aus der JSON-Datei beim Start."""
-    global daily_report_sent_date
+    global daily_report_sent_date, weekly_report_sent_week
     if not os.path.exists(STATE_FILE):
         return
     try:
@@ -8537,7 +8817,8 @@ def load_state():
         trade_data.update(s.get("trade_data", {}))
         trailing_sl_level.update(s.get("trailing_sl_level", {}))
         closed_trades.extend(s.get("closed_trades", []))
-        daily_report_sent_date = s.get("daily_report_sent_date", "")
+        daily_report_sent_date  = s.get("daily_report_sent_date",  "")
+        weekly_report_sent_week = s.get("weekly_report_sent_week", "")
         harsi_sl.update(s.get("harsi_sl", {}))
         # v4.12: Sling-SL + DCA Auto-Void State wiederherstellen
         sling_sl.update(s.get("sling_sl", {}))
@@ -9366,13 +9647,14 @@ def report_position_startup(pos: dict):
 
 def main():
     if not API_KEY or not SECRET_KEY or not PASSPHRASE:
-        log("FEHLER: API_KEY, SECRET_KEY oder PASSPHRASE fehlen!")
-        log("In Railway → Variables eintragen.")
+        log("FEHLER: DEMO_API_KEY, DEMO_SECRET_KEY oder DEMO_PASSPHRASE fehlen!")
+        log("In Railway → Variables eintragen (Demo-Keys aus Bitget Demo-Konto).")
+        log("  → Bitget: Futures → Klassisches Demo-Trading → API-Keys erstellen")
         return
 
-    log("DOMINUS Demo-Bot v4.36 gestartet [DEMO-MODUS — Paper Trading]")
-    log("  paperId=1 aktiv → alle Orders gehen auf Bitget Demo-Account")
-    log("  Dieselben API-Keys wie Live — kein separater Demo-Key nötig")
+    log("DOMINUS Demo-Bot v4.37 gestartet [DEMO-MODUS — Paper Trading]")
+    log("  Bitget Demo-Account Keys aktiv (DEMO_API_KEY / DEMO_SECRET_KEY)")
+    log("  Kein paperId-Header — Demo-Routing via separate API-Credentials")
     log(f"  Telegram Demo-Kanal: {TELEGRAM_CHAT_ID}")
     log("  Demo-Trades werden in demo_trades.json gespeichert")
     log(f"Intervall: {POLL_INTERVAL}s")
@@ -9413,6 +9695,18 @@ def main():
         log(f"  ⚠ {len(_orphans)} verwaiste(s) Ghost-Flag(s) gefunden: "
             f"{', '.join(_orphans)} — wird bereinigt")
         for _o in _orphans:
+            # v4.40: Vor State-Löschung Richtung lesen und Bitget-Orders aufräumen.
+            _orphan_dir = (trade_data.get(_o, {}) or {}).get("direction", "")
+            if _orphan_dir in ("long", "short"):
+                log(f"  [v4.40] Storniere verwaiste Bitget-Orders für {_o} ({_orphan_dir})...")
+                try:
+                    cancel_open_dca_orders(_o, _orphan_dir)
+                except Exception as _ex:
+                    log(f"  ⚠ DCA-Stornierung {_o} fehlgeschlagen: {_ex}")
+                try:
+                    cancel_all_tp_orders(_o, dom_only=True)
+                except Exception as _ex:
+                    log(f"  ⚠ TP-Stornierung {_o} fehlgeschlagen: {_ex}")
             new_trade_done.pop(_o, None)
             last_known_avg.pop(_o, None)
             last_known_size.pop(_o, None)
@@ -9434,7 +9728,7 @@ def main():
             poll_telegram_commands()
 
             # ── 0a. Auto Daily Report um 23:59 ─────────────
-            global daily_report_sent_date
+            global daily_report_sent_date, weekly_report_sent_week
             _now   = datetime.now()
             _today = _now.strftime("%Y-%m-%d")
             if _now.hour == 23 and _now.minute == 59 and daily_report_sent_date != _today:
@@ -9447,7 +9741,20 @@ def main():
                 except Exception as _re:
                     log(f"[Auto-Report] ✗ Fehler: {_re}")
 
-            # ── 0b. H4 Puffer flushen wenn Zeitfenster abgelaufen ──
+            # ── 0b. Wöchentlicher Report: Montag 08:00 ──────
+            _week = _now.strftime("%Y-W%W")
+            if (_now.weekday() == 0 and _now.hour == 8 and _now.minute == 0
+                    and weekly_report_sent_week != _week):
+                log("[Weekly-Report] Wochenbericht wird gesendet (Mo 08:00)...")
+                try:
+                    telegram(build_weekly_report())
+                    weekly_report_sent_week = _week
+                    save_state()
+                    log("[Weekly-Report] ✓ Report gesendet")
+                except Exception as _we:
+                    log(f"[Weekly-Report] ✗ Fehler: {_we}")
+
+            # ── 0c. H4 Puffer flushen wenn Zeitfenster abgelaufen ──
             # Lock für den ganzen Check — verhindert Race mit Webhook-Thread
             with h4_buffer_lock:
                 oldest = min((i["ts"] for i in h4_buffer), default=0)
