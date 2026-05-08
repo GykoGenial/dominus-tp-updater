@@ -865,6 +865,11 @@ MIN_AUTO_TRADE_SCORE      = int(_env_float("MIN_AUTO_TRADE_SCORE", 45))
 # und Score >= MIN_AUTO_TRADE_SCORE erfuellen.
 PREMIUM_AUTO_TRADE_COUNT  = int(_env_float("PREMIUM_AUTO_TRADE_COUNT", 0))
 
+# v4.40: Startup-Orphan-Cleanup: Storniert verwaiste Bitget-DCA-Orders bei Symbolen
+# ohne offene Position. Bisher wurden nur Ghost-Flags im State bereinigt. Wenn der
+# Bot offline war und eine Position via TP/manuell schloss, blieben DCA-Limit-Orders
+# auf Bitget aktiv und konnten bei einem Kursrücklauf füllen → Ghost-Position.
+#
 # v4.38: HARSI-Warn-Bundling — harsi_warn=1 Signale werden 60s gesammelt und
 # als eine gebündelte Nachricht gesendet (HARSI_WARN_BUFFER_SEC konfigurierbar).
 # Duplikate (gleicher Symbol+Direction) werden automatisch dedupliziert.
@@ -9132,7 +9137,7 @@ def start_webhook_server():
     @app.route("/", methods=["GET"])
     @app.route("/health", methods=["GET"])
     def health():
-        return jsonify({"status": "running", "version": "v4.38"}), 200
+        return jsonify({"status": "running", "version": "v4.40"}), 200
 
     @app.route("/dashboard", methods=["GET"])
     def dashboard():
@@ -10203,6 +10208,22 @@ def main():
         log(f"  ⚠ {len(_orphans)} verwaiste(s) Ghost-Flag(s) gefunden: "
             f"{', '.join(_orphans)} — wird bereinigt")
         for _o in _orphans:
+            # v4.40: Vor State-Löschung Richtung lesen und Bitget-Orders aufräumen.
+            # Wenn der Bot offline war als die Position schloss (Railway-Restart etc.),
+            # wurden DCA-Limit-Orders und TP-Plan-Orders auf Bitget NICHT storniert.
+            # Diese "verwaisten" Orders könnten bei einem Kursrücklauf füllen und
+            # eine Ghost-Position erzeugen. Jetzt werden sie beim Startup bereinigt.
+            _orphan_dir = (trade_data.get(_o, {}) or {}).get("direction", "")
+            if _orphan_dir in ("long", "short"):
+                log(f"  [v4.40] Storniere verwaiste Bitget-Orders für {_o} ({_orphan_dir})...")
+                try:
+                    cancel_open_dca_orders(_o, _orphan_dir)
+                except Exception as _ex:
+                    log(f"  ⚠ DCA-Stornierung {_o} fehlgeschlagen: {_ex}")
+                try:
+                    cancel_all_tp_orders(_o, dom_only=True)
+                except Exception as _ex:
+                    log(f"  ⚠ TP-Stornierung {_o} fehlgeschlagen: {_ex}")
             new_trade_done.pop(_o, None)
             last_known_avg.pop(_o, None)
             last_known_size.pop(_o, None)
