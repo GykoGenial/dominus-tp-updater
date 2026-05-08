@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-DOMINUS Channel Monitor  v1.6  (2026-04-23)
+DOMINUS Channel Monitor  v1.7  (2026-05-09)
 ════════════════════════════════════════════════════════════════
 Überwacht den Dominus Telegram-Kanal auf neue Coins UND optional
 parallel eine öffentliche TradingView-Watchlist.
@@ -10,6 +10,21 @@ als importierbare .txt-Datei + eine interaktive HTML-Clicklist
 (Delta-Modus: nur Coins, die seit dem letzten master_watchlist.txt
 dazugekommen sind — ein Button je Coin, kopiert BITGET:XYZUSDT.P
 in die Zwischenablage) per Telegram.
+
+Changelog v1.7:
+  • NEU: Startup-Catch-up-Scan bei normalem Restart (kein MONITOR_REBUILD).
+    Der Monitor merkt sich die ID der zuletzt gesehenen Kanal-Nachricht
+    (state["last_seen_msg_id"]). Beim nächsten Start werden alle Nachrichten
+    seit dieser ID gescannt und neue Coins verarbeitet — so gehen keine
+    Coins verloren, die während eines Redeployments (z.B. durch GitHub-Push)
+    im Kanal eingetroffen sind. Scan-Limit: MONITOR_CATCHUP_LIMIT (default 50).
+  • NEU: Telegram-Bestätigung nach jedem Verarbeitungsschritt:
+    - Startup (kein Bootstrap): "▶️ Monitor aktiv — X Symbole — Y neue seit
+      letztem Start" (statt nur Symbolzahl).
+    - Startup (nach Catch-up-Scan): zeigt gefundene neue Coins + Symbolzahl.
+    - Live-Update (neue Nachricht im Kanal): bestehende send_watchlist_file-
+      Nachricht bleibt; zusätzlich Log-Zeile mit Zeitstempel des Scans.
+    - Kein Update nötig: kurze Bestätigung "Monitor aktiv, nichts Neues".
 
 Changelog v1.6:
   • BUG-FIX: Coins aus dem Kanal mit Quote-Suffix (z.B. "AAVEUSDT",
@@ -122,6 +137,10 @@ CHANNEL_HISTORY_LIMIT = int(os.environ.get("MONITOR_CHANNEL_HISTORY_LIMIT", "200
 # Sauberer Re-Bootstrap: State wipen, TV-Baseline + Full-Channel neu aufbauen.
 # Setze MONITOR_REBUILD=1 in Railway und redeploye — nach dem Rebuild wieder auf 0.
 MONITOR_REBUILD = os.environ.get("MONITOR_REBUILD", "0").strip().lower() in ("1", "true", "yes", "on")
+
+# v1.7: Anzahl Kanal-Nachrichten die beim normalen Restart rückwärts gescannt
+# werden, um während der Downtime eingegangene Coins zu erfassen.
+MONITOR_CATCHUP_LIMIT = int(os.environ.get("MONITOR_CATCHUP_LIMIT", "50"))
 
 SYMBOL_CACHE_TTL = 6 * 3600   # Exchange-Listen alle 6h neu laden
 
@@ -728,8 +747,11 @@ async def bootstrap_state(client, channel, state: dict) -> dict:
     channel_raw: list[str] = []
     msg_count = 0
     coin_msg_count = 0
+    max_msg_id = 0
     async for msg in client.iter_messages(channel, limit=CHANNEL_HISTORY_LIMIT):
         msg_count += 1
+        if msg.id > max_msg_id:
+            max_msg_id = msg.id
         if not msg.text:
             continue
         coins = extract_coins(msg.text)
@@ -740,6 +762,9 @@ async def bootstrap_state(client, channel, state: dict) -> dict:
                     channel_raw.append(c)
     log.info(f"[Bootstrap] {msg_count} Nachrichten gelesen, "
              f"{coin_msg_count} Coin-Listen, {len(channel_raw)} Roh-Coins extrahiert")
+    # v1.7: höchste gesehene msg_id für Catch-up-Scan beim nächsten Restart merken
+    if max_msg_id:
+        state["last_seen_msg_id"] = max_msg_id
 
     # 3) Channel-Coins verarbeiten (filter gegen Baseline passiert implizit via known_coins)
     new_syms, skipped = process_new_coins(channel_raw, state)
@@ -822,10 +847,67 @@ async def main() -> None:
         state = await bootstrap_state(client, channel, state)
     else:
         log.info(f"State geladen: {len(state['watchlist'])} Symbole bekannt")
-        send_text(
-            f"▶️ <b>Dominus-Monitor neugestartet</b>\n"
-            f"Watchlist: {len(state['watchlist'])} Symbole — überwache auf Neuzugänge."
-        )
+
+        # v1.7: Catch-up-Scan — Nachrichten seit letzter bekannter msg_id prüfen
+        last_id   = state.get("last_seen_msg_id", 0)
+        syms_before = len(state["watchlist"])
+        catchup_new: list[str] = []
+        catchup_raw: list[str] = []
+        new_max_id  = last_id
+        scanned     = 0
+
+        log.info(f"[Catchup] Scanne letzte {MONITOR_CATCHUP_LIMIT} Nachrichten "
+                 f"(last_seen_msg_id={last_id})...")
+        async for msg in client.iter_messages(channel, limit=MONITOR_CATCHUP_LIMIT):
+            scanned += 1
+            if msg.id > new_max_id:
+                new_max_id = msg.id
+            if last_id and msg.id <= last_id:
+                break   # alles Ältere bereits bekannt
+            if not msg.text:
+                continue
+            coins = extract_coins(msg.text)
+            if coins:
+                for c in coins:
+                    if c not in catchup_raw:
+                        catchup_raw.append(c)
+
+        if catchup_raw:
+            log.info(f"[Catchup] {len(catchup_raw)} neue Roh-Coins gefunden — verarbeite...")
+            catchup_new, catchup_skipped = process_new_coins(catchup_raw, state)
+            if catchup_new:
+                state["last_seen_msg_id"] = new_max_id
+                save_state(state)
+                log.info(f"[Catchup] {len(catchup_new)} neue Symbole hinzugefügt: "
+                         f"{catchup_new}")
+                await asyncio.to_thread(
+                    send_watchlist_file, state, catchup_new, catchup_skipped
+                )
+                await asyncio.to_thread(
+                    send_clicklist_file, state, "📋 Clicklist (Catch-up)"
+                )
+        else:
+            log.info(f"[Catchup] {scanned} Nachrichten gescannt — keine neuen Coins")
+            if new_max_id > last_id:
+                state["last_seen_msg_id"] = new_max_id
+                save_state(state)
+
+        # Startup-Bestätigung mit Catch-up-Ergebnis
+        syms_after = len(state["watchlist"])
+        neu_count  = syms_after - syms_before
+        if neu_count > 0:
+            send_text(
+                f"▶️ <b>Dominus-Monitor aktiv</b>\n"
+                f"Watchlist: <b>{syms_after}</b> Symbole\n"
+                f"➕ <b>{neu_count} neue</b> seit letztem Start hinzugefügt\n"
+                f"🔍 {scanned} Nachrichten gescannt (Catch-up)"
+            )
+        else:
+            send_text(
+                f"▶️ <b>Dominus-Monitor aktiv</b>\n"
+                f"Watchlist: <b>{syms_after}</b> Symbole\n"
+                f"✅ Nichts Neues — {scanned} Nachrichten geprüft, alles bekannt"
+            )
 
     # Neue Nachrichten überwachen
     @client.on(events.NewMessage(chats=channel))
@@ -864,16 +946,34 @@ async def main() -> None:
             st = load_state()
             new_syms, skipped = process_new_coins(raw_coins, st)
             if new_syms:
+                # v1.7: msg_id für Catch-up-Scan merken
+                st["last_seen_msg_id"] = event.message.id
                 save_state(st)
 
         if new_syms:
+            log.info(f"[Live] {len(new_syms)} neue Symbole hinzugefügt: {new_syms} "
+                     f"(msg_id={event.message.id})")
             await asyncio.to_thread(send_watchlist_file, st, new_syms, skipped)
             # v1.4: aktualisierte Clicklist hinterher
             await asyncio.to_thread(send_clicklist_file, st, "📋 Bitget Clicklist (aktualisiert)")
         elif skipped:
             log.info(f"Keine neuen Symbole, aber {len(skipped)} nicht gefunden: {skipped}")
+            send_text(
+                f"ℹ️ <b>Kanal-Nachricht verarbeitet</b>\n"
+                f"Coins erkannt: {', '.join(raw_coins[:10])}"
+                + (f" …(+{len(raw_coins)-10})" if len(raw_coins) > 10 else "") + "\n"
+                f"⚠️ Nicht auf Bitget/Bybit: {', '.join(skipped[:10])}\n"
+                f"Watchlist unverändert: {len(st['watchlist'])} Symbole"
+            )
         else:
             log.info("Alle Coins bereits bekannt — kein Update")
+            send_text(
+                f"ℹ️ <b>Kanal-Nachricht verarbeitet</b>\n"
+                f"Coins: {', '.join(raw_coins[:10])}"
+                + (f" …(+{len(raw_coins)-10})" if len(raw_coins) > 10 else "") + "\n"
+                f"✅ Alle bereits bekannt — Watchlist unverändert "
+                f"({len(st['watchlist'])} Symbole)"
+            )
 
     log.info("Monitoring aktiv — warte auf neue Nachrichten...")
     await client.run_until_disconnected()
