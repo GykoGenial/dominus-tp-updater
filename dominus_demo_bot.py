@@ -1,5 +1,5 @@
 """
-DOMINUS Demo-Bot v4.37 — PAPER TRADING
+DOMINUS Demo-Bot v4.41 — PAPER TRADING
 ════════════════════════════════════
 Vollautomatisches Paper Trading auf Bitget Demo-Account.
 Kein echtes Kapital — identische Logik wie Live-Script.
@@ -36,6 +36,24 @@ Finanzmathematische Optimierungen:
   ⑩ Klick-UX          — Button-Driven Rangliste mit adaptivem Keyboard (v4.25)
   ⑪ One-Click-Exec    — 🚀 Trade jetzt Button mit Two-Tap-Confirm (v4.28)
   ⑫ Inline-Berechnung — 🚀 1. Tap zeigt volle /trade-Vorschau (v4.35.1)
+
+Changelog v4.41 — Demo-Score-Gate + Demo-Symbol-Fehlerbehandlung:
+  S1: MIN_AUTO_TRADE_SCORE mit Default 0 (alle Scores werden getradet).
+      Im Live-Bot ist der Threshold 45 — im Demo bewusst auf 0 gesetzt,
+      damit alle Score-Bereiche (0–100) Daten sammeln und die optimale
+      Grenze empirisch bestimmt werden kann. Konfigurierbar via Railway-
+      Variable MIN_AUTO_TRADE_SCORE (z.B. =30 oder =45 zum Testen).
+  S2: Score-Gate in flush_entries() eingebaut (identisch Live-Bot v4.40):
+      Score < MIN_AUTO_TRADE_SCORE → Telegram-Info + kein Trade.
+      Fallback-Logik bei fehlgeschlagener Order prüft ebenfalls Score.
+  S3: Demo-Symbol-Fehlerbehandlung in execute_trade_order():
+      Wenn Bitget eine Market-Order mit Code 40404 / 40007 / "not exist" /
+      "symbol" ablehnt, wird der Trade als DEMO_SYMBOL_UNAVAILABLE markiert
+      und silent übersprungen (Telegram-Hinweis statt Error-Alarm).
+      Hintergrund: Bitget hat einige Futures-Paare im Demo-Bereich delistet;
+      bei diesen schlägt jede Order fehl. Ohne dieses Handling würde
+      execute_trade_order() einen Fehler-Alarm schicken und Fallback-Kandidaten
+      wären fälschlicherweise ausgeschlossen (Score-Gate bricht Fallback-Loop).
 
 Changelog v4.36 — Finanzmathematische Optimierungen (8 Fixes):
   F1: FIX 4 — calc_tp_price() rechnet jetzt Taker-Fee ein (TAKER_FEE=0.0006).
@@ -1054,6 +1072,11 @@ _SLOT_TTL_SEC      = 2 * 3600  # 2h — danach Callbacks mit "Slot abgelaufen"-T
 SLOT_TOP_N         = _env_int("SLOT_TOP_N", 10)
 # Score-Schwelle unter der Signale in den Low-Score-Block wandern.
 SLOT_LOWSCORE_CUT  = _env_int("SLOT_LOWSCORE_CUT", 50)
+
+# v4.41: Mindest-Score für automatische Ausführung.
+# DEMO-Default = 0 (alle Score-Bereiche werden getradet — bewusst für Datensammlung).
+# Live-Bot Default = 45. Über Railway-Variable anpassbar: MIN_AUTO_TRADE_SCORE=30
+MIN_AUTO_TRADE_SCORE = _env_int("MIN_AUTO_TRADE_SCORE", 0)
 
 # v4.19: Win-Rate Cache pro Symbol — {symbol: (wr, n_trades, expire_ts)}
 _winrate_cache: dict = {}
@@ -3466,7 +3489,22 @@ def execute_trade_order(symbol: str, direction: str, leverage: int,
         "force":       "gtc",
     })
     if ord_res.get("code") != "00000":
-        err = ord_res.get("msg", str(ord_res))
+        err  = ord_res.get("msg", str(ord_res))
+        code = str(ord_res.get("code", ""))
+        # v4.41: Demo-Symbol nicht verfügbar erkennen (Bitget delistet manche
+        # Futures-Pairs aus dem Demo-Bereich). Statt generischem Error-Alarm
+        # gibt execute_trade_order() DEMO_SYMBOL_UNAVAILABLE zurück — flush_entries
+        # überspringt dann still und versucht den nächsten Kandidaten.
+        _demo_unavail = (
+            code in ("40404", "40007", "40012")
+            or "not exist" in err.lower()
+            or "symbol" in err.lower() and "not" in err.lower()
+            or "invalid symbol" in err.lower()
+        )
+        if _demo_unavail:
+            log(f"  ✗ Demo-Symbol nicht verfügbar: {symbol} — {err} (code={code})")
+            return {"ok": False,
+                    "reason": f"DEMO_SYMBOL_UNAVAILABLE: {symbol} — {err}"}
         log(f"  ✗ Market-Order Fehler: {err}")
         return {"ok": False, "reason": f"Market-Order rejected: {err}"}
 
@@ -4830,7 +4868,8 @@ def flush_entries() -> None:
         # Wenn AUTO_TRADE_ENABLED=true: ranked[0] wird sofort ohne
         # Button-Tap ausgeführt. TWO_TAP_CONFIRM wird ignoriert.
         if AUTO_TRADE_ENABLED and ranked:
-            _top = ranked[0]
+            # ── MODUS B: Standard — Top-Scorer (v4.41: Score-Gate) ──────
+            _top  = ranked[0]
             _sugg = _top.get("sugg") or {}
             _sym  = _top["symbol"]
             _dir  = _top["direction"]
@@ -4839,7 +4878,19 @@ def flush_entries() -> None:
             _px   = float(_top.get("entry") or 0)
             _sc   = _top["_scored"]["score"]
 
-            if _sl and _px:
+            # v4.41: Score-Gate (Demo-Default 0 = alle Scores; via
+            # MIN_AUTO_TRADE_SCORE Railway-Variable anpassbar)
+            if _sc < MIN_AUTO_TRADE_SCORE:
+                log(f"  AUTO-EXEC: {_sym} NICHT ausgeführt — "
+                    f"Score {_sc} < Minimum {MIN_AUTO_TRADE_SCORE}")
+                telegram(
+                    f"⏸ <b>Auto-Execute pausiert — Score zu niedrig</b>\n"
+                    f"Top-Kandidat: <b>{_sym} {_dir.upper()}</b>\n"
+                    f"Score: <b>{_sc}/100</b>  ·  Minimum: "
+                    f"<b>{MIN_AUTO_TRADE_SCORE}</b>\n\n"
+                    f"Kein Trade. Warte auf besseres Setup."
+                )
+            elif _sl and _px:
                 log(f"  AUTO-EXEC: {_sym} {_dir.upper()} | Score={_sc} | "
                     f"Entry={_px} SL={_sl} Lev={_lev}x")
                 telegram(
@@ -4855,7 +4906,55 @@ def flush_entries() -> None:
                         f"Qty: {_res.get('qty')}  ·  Margin: "
                         f"{_res.get('initial_margin', 0):.2f} USDT"
                     )
+                elif _res.get("reason", "").startswith("DEMO_SYMBOL_UNAVAILABLE"):
+                    # v4.41: Symbol im Demo nicht verfügbar → Fallback-Kandidaten
+                    log(f"  AUTO-EXEC: {_sym} im Demo nicht verfügbar — "
+                        f"versuche nächsten Kandidaten")
+                    telegram(
+                        f"⚠️ <b>Demo-Symbol nicht verfügbar — {_sym}</b>\n"
+                        f"Bitget hat dieses Pair im Demo delistet.\n"
+                        f"<i>Versuche nächsten Kandidaten...</i>"
+                    )
+                    for _fallback in ranked[1:]:
+                        _fs   = _fallback.get("sugg") or {}
+                        _fsc  = _fallback["_scored"]["score"]
+                        if _fsc < MIN_AUTO_TRADE_SCORE:
+                            break
+                        _fsy  = _fallback["symbol"]
+                        _fdi  = _fallback["direction"]
+                        _flv  = int(_fs.get("leverage") or 10)
+                        _fsl  = float(_fs.get("sl") or 0)
+                        _fpx  = float(_fallback.get("entry") or 0)
+                        if not _fsl or not _fpx:
+                            continue
+                        log(f"  AUTO-EXEC Fallback: {_fsy} {_fdi.upper()} "
+                            f"Score={_fsc}")
+                        telegram(
+                            f"🔄 <b>Fallback — {_fsy}</b>\n"
+                            f"{_fdi.upper()}  ·  Score {_fsc}  ·  {_flv}x"
+                        )
+                        _res2 = execute_trade_order(_fsy, _fdi, _flv, _fpx, _fsl)
+                        if _res2.get("ok"):
+                            telegram(
+                                f"✅ <b>Fallback Order — {_fsy}</b>\n"
+                                f"Qty: {_res2.get('qty')}  ·  Margin: "
+                                f"{_res2.get('initial_margin', 0):.2f} USDT"
+                            )
+                            break
+                        elif _res2.get("reason", "").startswith(
+                                "DEMO_SYMBOL_UNAVAILABLE"):
+                            telegram(
+                                f"⚠️ <b>Demo-Symbol nicht verfügbar — {_fsy}</b>"
+                            )
+                            continue
+                        else:
+                            telegram(
+                                f"❌ <b>Fallback fehlgeschlagen — {_fsy}</b>\n"
+                                f"{_res2.get('reason', '?')}"
+                            )
+                            break
                 else:
+                    # Anderer Fehler → Error-Alarm
                     telegram(
                         f"❌ <b>Auto-Execute fehlgeschlagen — {_sym}</b>\n"
                         f"{_res.get('reason', '?')}"
@@ -8676,7 +8775,7 @@ def start_webhook_server():
     @app.route("/", methods=["GET"])
     @app.route("/health", methods=["GET"])
     def health():
-        return jsonify({"status": "running", "version": "v4.40", "mode": "DEMO"}), 200
+        return jsonify({"status": "running", "version": "v4.41", "mode": "DEMO"}), 200
 
     @app.route("/dashboard", methods=["GET"])
     def dashboard():
