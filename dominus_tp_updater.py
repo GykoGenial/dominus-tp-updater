@@ -1,5 +1,5 @@
 """
-DOMINUS Trade-Automatisierung v4.44
+DOMINUS Trade-Automatisierung v4.45
 ══════════════════════════════════════════════════════════════
 Vollautomatisches Setup nach DOMINUS-Strategie (Handbuch März 2026)
 Finanzmathematische Optimierungen:
@@ -15,6 +15,17 @@ Finanzmathematische Optimierungen:
   ⑩ Klick-UX          — Button-Driven Rangliste mit adaptivem Keyboard (v4.25)
   ⑪ One-Click-Exec    — 🚀 Trade jetzt Button mit Two-Tap-Confirm (v4.28)
   ⑫ Inline-Berechnung — 🚀 1. Tap zeigt volle /trade-Vorschau (v4.35.1)
+
+Changelog v4.45 — /show + /coins Coin-Statistik-Befehle:
+  S1: cmd_show(SYMBOL) — /show TRXUSDT zeigt letzten Trade (Datum, Richtung, Hebel,
+      Entry, Close, PnL, ROI%, Dauer) + Gesamt-Statistik (n Trades, Win-Rate mit
+      Balken, Ø PnL/Trade, Ø ROI, Gesamt-PnL, Bester/Schlechtester Trade) + Trend
+      der letzten 5 Trades (✅/❌ Icons). Liest aus trades.csv (Railway Volume).
+  S2: cmd_coins([n]) — /coins zeigt Ranking aller je gehandelten Coins nach
+      Gesamt-PnL, aufgeteilt in Top-N und Flop-N (Default N=5). Optional: /coins 10
+      für Top-10/Flop-10. Enthält pro Coin: Rank, Symbol, Gesamt-PnL, Win/Loss,
+      Win-Rate-Minimalbalken. Quick-Link zu /show SYMBOL am Ende.
+  S3: /show und /coins in cmd_hilfe() und Dispatcher (polling_loop) registriert.
 
 Changelog v4.44 — BTC/Total2 Alignment Hard-Filter (Dominus Handbuch Kap. 10):
   A1: BTC_T2_ALIGNMENT_FILTER (Railway-Variable, Default aktiv) — blockiert H2_SIGNAL-
@@ -6939,6 +6950,10 @@ def cmd_hilfe():
         "/makro — BTC &amp; Total2 Impuls-Richtung + Trade-Erlaubnis\n"
         "/report — Tages- &amp; Monats-P&amp;L Report\n"
         "/queue_stats [tage] — Entry-Queue Auswertung (E[R], Kelly, Score-Buckets)\n"
+        "/show SYMBOL — Letzter Trade + Statistik für einen Coin\n"
+        "   Beispiel: <code>/show TRXUSDT</code>\n"
+        "/coins [n] — Ranking aller Coins nach Gesamt-PnL (Top+Flop)\n"
+        "   Beispiel: <code>/coins</code>  oder  <code>/coins 10</code>\n"
         "\n"
         "⚙️ <b>Aktionen:</b>\n"
         "/trade SYMBOL LONG|SHORT HEBEL ENTRY SL\n"
@@ -7526,6 +7541,211 @@ def cmd_report():
         reply(f"❌ Report Fehler: {e}")
 
 
+def cmd_show(parts: list):
+    """v4.45 — /show SYMBOL: letzter Trade + vollständige Coin-Statistik aus trades.csv."""
+    if len(parts) < 2:
+        reply(
+            "❌ <b>Verwendung:</b> <code>/show SYMBOL</code>\n"
+            "Beispiel: <code>/show TRXUSDT</code>"
+        )
+        return
+
+    symbol = parts[1].strip().upper()
+
+    # ── CSV lesen ──────────────────────────────────────────────
+    rows: list = []
+    try:
+        if TRADES_CSV and os.path.isfile(TRADES_CSV):
+            with open(TRADES_CSV, "r", encoding="utf-8") as f:
+                reader = csv.reader(f, delimiter=";")
+                next(reader, None)                       # Header überspringen
+                for row in reader:
+                    if len(row) >= 12 and row[2].strip().upper() == symbol:
+                        rows.append(row)
+    except Exception as e:
+        reply(f"❌ CSV-Lesefehler: {e}")
+        return
+
+    if not rows:
+        reply(
+            f"❌ Keine Trades gefunden für <b>{symbol}</b>\n"
+            f"Tipp: Symbol genau wie in Bitget angeben, z.B. <code>TRXUSDT</code>"
+        )
+        return
+
+    # ── Statistiken berechnen ──────────────────────────────────
+    total  = len(rows)
+    wins   = sum(1 for r in rows if r[11].strip().lower() in ("ja", "yes", "true", "1"))
+    losses = total - wins
+    wr     = wins / total if total > 0 else 0.0
+
+    pnls: list = []
+    rois: list = []
+    for r in rows:
+        try:
+            pnls.append(float(r[7].replace(",", ".")))
+        except Exception:
+            pass
+        try:
+            rois.append(float(r[8].replace(",", ".")))
+        except Exception:
+            pass
+
+    total_pnl = sum(pnls)
+    avg_pnl   = total_pnl / len(pnls) if pnls else 0.0
+    avg_roi   = sum(rois) / len(rois) if rois else 0.0
+    best_pnl  = max(pnls) if pnls else 0.0
+    worst_pnl = min(pnls) if pnls else 0.0
+
+    # ── Letzter Trade ──────────────────────────────────────────
+    last = rows[-1]
+    # Columns: 0=Datum, 1=Zeit, 2=Symbol, 3=Richtung, 4=Hebel,
+    #          5=Entry, 6=Close, 7=PnL USDT, 8=ROI%, 9=Dauer,
+    #          10=Trailing Level, 11=Won
+    last_datum    = last[0]
+    last_zeit     = last[1]
+    last_richtung = last[3].upper()
+    last_hebel    = last[4]
+    last_entry    = last[5]
+    last_close    = last[6]
+    last_pnl      = last[7]
+    last_roi      = last[8]
+    last_dauer    = last[9] if len(last) > 9 else "—"
+    last_won      = last[11].strip().lower() in ("ja", "yes", "true", "1")
+    last_icon     = "✅" if last_won else "❌"
+    dir_icon      = "🟢" if last_richtung == "LONG" else "🔴"
+
+    # ── Win-Rate-Balken ────────────────────────────────────────
+    filled  = round(wr * 10)
+    bar     = "█" * filled + "░" * (10 - filled)
+
+    # ── Trend letzte 5 Trades ──────────────────────────────────
+    recent      = rows[-5:]
+    trend_parts = []
+    for r in recent:
+        w = r[11].strip().lower() in ("ja", "yes", "true", "1")
+        trend_parts.append("✅" if w else "❌")
+    trend_str = " ".join(trend_parts)
+
+    # ── Nachricht zusammenbauen ────────────────────────────────
+    pnl_sign  = "+" if total_pnl >= 0 else ""
+    apnl_sign = "+" if avg_pnl >= 0 else ""
+    aroi_sign = "+" if avg_roi >= 0 else ""
+
+    msg = (
+        f"📊 <b>{symbol} — Trade-Übersicht</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"\n"
+        f"🕐 <b>Letzter Trade</b> — {last_datum}  {last_zeit} UTC\n"
+        f"{dir_icon} {last_richtung} · {last_hebel}x · {last_icon}\n"
+        f"  Entry:  <code>{last_entry}</code>\n"
+        f"  Close:  <code>{last_close}</code>\n"
+        f"  PnL:    <b>{last_pnl} USDT</b>  ({last_roi}%)\n"
+        f"  Dauer:  {last_dauer}\n"
+        f"\n"
+        f"📈 <b>Gesamt — {total} Trades</b>\n"
+        f"  Wins / Losses:  {wins} ✅ / {losses} ❌\n"
+        f"  Win-Rate:  {wr*100:.1f}%  {bar}\n"
+        f"  Ø PnL/Trade:  <b>{apnl_sign}{avg_pnl:.2f} USDT</b>\n"
+        f"  Ø ROI/Trade:  {aroi_sign}{avg_roi:.1f}%\n"
+        f"  Gesamt PnL:   <b>{pnl_sign}{total_pnl:.2f} USDT</b>\n"
+        f"  Bester Trade:  +{best_pnl:.2f} USDT\n"
+        f"  Schlechtester: {worst_pnl:.2f} USDT\n"
+        f"\n"
+        f"🔥 <b>Trend (letzte {len(recent)}):</b>  {trend_str}"
+    )
+    reply(msg)
+
+
+def cmd_coins(parts: list = None):
+    """v4.45 — /coins [n]: Ranking aller gehandelten Coins nach Gesamt-PnL.
+    Zeigt Top-5 und Flop-5 (oder alle wenn ≤10). Optionales Argument: Anzahl."""
+    # ── CSV lesen, alle Symbole sammeln ────────────────────────
+    sym_data: dict = {}   # symbol → {"total": float, "wins": int, "total": int, "pnls": []}
+    try:
+        if not TRADES_CSV or not os.path.isfile(TRADES_CSV):
+            reply(f"❌ trades.csv nicht gefunden: <code>{TRADES_CSV}</code>")
+            return
+        with open(TRADES_CSV, "r", encoding="utf-8") as f:
+            reader = csv.reader(f, delimiter=";")
+            next(reader, None)
+            for row in reader:
+                if len(row) < 12:
+                    continue
+                sym = row[2].strip().upper()
+                if not sym:
+                    continue
+                won = row[11].strip().lower() in ("ja", "yes", "true", "1")
+                try:
+                    pnl = float(row[7].replace(",", "."))
+                except Exception:
+                    pnl = 0.0
+                if sym not in sym_data:
+                    sym_data[sym] = {"wins": 0, "n": 0, "pnl": 0.0, "pnls": []}
+                sym_data[sym]["n"]    += 1
+                sym_data[sym]["pnl"]  += pnl
+                sym_data[sym]["pnls"].append(pnl)
+                if won:
+                    sym_data[sym]["wins"] += 1
+    except Exception as e:
+        reply(f"❌ CSV-Lesefehler: {e}")
+        return
+
+    if not sym_data:
+        reply("❌ Keine Trade-Daten gefunden.")
+        return
+
+    # ── Sortieren nach Gesamt-PnL ──────────────────────────────
+    ranked = sorted(sym_data.items(), key=lambda x: x[1]["pnl"], reverse=True)
+    total_syms = len(ranked)
+
+    # Anzahl via Argument (default: top5 + flop5, max 10)
+    n_show = 5
+    if parts and len(parts) >= 2:
+        try:
+            n_show = max(1, min(int(parts[1]), 20))
+        except ValueError:
+            pass
+
+    # ── Header ────────────────────────────────────────────────
+    lines = [
+        f"🏆 <b>Coin-Ranking — {total_syms} Coins ({sym_data and sum(v['n'] for v in sym_data.values())} Trades)</b>",
+        f"━━━━━━━━━━━━━━━━━━━━",
+    ]
+
+    def _coin_line(rank: int, sym: str, d: dict) -> str:
+        wr  = d["wins"] / d["n"] if d["n"] > 0 else 0.0
+        pnl = d["pnl"]
+        sign = "+" if pnl >= 0 else ""
+        medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(rank, f"  {rank}.")
+        bar_filled = round(wr * 5)  # 5er-Balken für kompakte Darstellung
+        mini_bar = "█" * bar_filled + "░" * (5 - bar_filled)
+        return (
+            f"{medal} <b>{sym}</b>  {sign}{pnl:.2f} USDT\n"
+            f"    {d['wins']}✅/{d['n']-d['wins']}❌  ({wr*100:.0f}%) {mini_bar}"
+        )
+
+    if total_syms <= n_show * 2:
+        # Alle anzeigen
+        lines.append("")
+        for i, (sym, d) in enumerate(ranked, 1):
+            lines.append(_coin_line(i, sym, d))
+    else:
+        # Top N
+        lines.append(f"\n🚀 <b>Top {n_show}</b>")
+        for i, (sym, d) in enumerate(ranked[:n_show], 1):
+            lines.append(_coin_line(i, sym, d))
+
+        # Flop N
+        lines.append(f"\n💀 <b>Flop {n_show}</b>")
+        flop_start = total_syms - n_show
+        for i, (sym, d) in enumerate(ranked[flop_start:], flop_start + 1):
+            lines.append(_coin_line(i, sym, d))
+
+    lines.append(f"\n📊 /show SYMBOL — Details zu einem Coin")
+    reply("\n".join(lines))
+
+
 def cmd_trades():
     """v4.34 — /trades: schickt die aktuelle trades.csv als Telegram-Dokument
     zurück. Caption enthält Zeilenzahl, Dateigrösse und Mtime, damit man
@@ -7774,6 +7994,10 @@ def poll_telegram_commands():
             cmd_refresh(parts)
         elif cmd == "/report":
             cmd_report()
+        elif cmd == "/show":
+            cmd_show(parts)
+        elif cmd == "/coins":
+            cmd_coins(parts)
         elif cmd == "/backup":
             cmd_backup(reply_fn=reply)
         elif cmd == "/trades":
@@ -9210,7 +9434,7 @@ def start_webhook_server():
     @app.route("/", methods=["GET"])
     @app.route("/health", methods=["GET"])
     def health():
-        return jsonify({"status": "running", "version": "v4.44"}), 200
+        return jsonify({"status": "running", "version": "v4.45"}), 200
 
     @app.route("/dashboard", methods=["GET"])
     def dashboard():
