@@ -7614,8 +7614,16 @@ def cmd_report():
 
 def cmd_pos(parts: list):
     """v4.46 — /pos SYMBOL: Live-Detailansicht einer offenen Position.
-    Zeigt Entry, SL, alle DCAs (Preise + Status), alle TPs (1-4),
-    aktuellen Mark, unrealisierten PnL, Laufzeit + Event-History.
+    Zeigt Entry, SL (mit Typ), alle DCAs (korrekt sortiert), alle TPs (1-4
+    mit ROI%), aktuellen Mark, unrealisierten PnL, Laufzeit + Event-History.
+
+    FIX v4.46b:
+      - SL-Detection: Prüft zuerst pos-Felder (stopLossPrice etc.) dann
+        _get_pos_sl_price() — findet Sling/HARSI SL korrekt (place-pos-tpsl)
+      - ROI%: roi_e × 100 (TP1_ROI=0.10 → 10%)
+      - TP-Sort: SHORT absteigend (höchster Preis zuerst = zuerst getroffen)
+      - DCA-Sort: SHORT aufsteigend (niedrigster Preis zuerst = zuerst getroffen)
+      - SL-Typ: zeigt Quelle (Sling / HARSI / Entry / Manuell)
     """
     if len(parts) < 2:
         reply(
@@ -7652,7 +7660,7 @@ def cmd_pos(parts: list):
     base_coin = get_base_coin(symbol)
     open_ts   = td.get("open_ts", 0)
 
-    # Laufzeit
+    # ── Laufzeit ───────────────────────────────────────────────
     if open_ts:
         secs = int(time.time() - open_ts / 1000)
         h, m = divmod(secs // 60, 60)
@@ -7666,39 +7674,80 @@ def cmd_pos(parts: list):
     else:
         duration_str = "—"
 
-    # ROI auf Margin
+    # ── ROI auf Margin ─────────────────────────────────────────
     roi_pct = 0.0
     if avg > 0 and mark > 0:
         roi_pct = (mark - avg) / avg * leverage * 100
         if direction == "short":
             roi_pct = -roi_pct
 
-    # ── SL-Status ─────────────────────────────────────────────
-    sl = get_sl_price(symbol, direction)
-    sl_secured = sl_at_entry.get(symbol, False)
-    trl_lvl    = infer_trailing_level(symbol, direction, avg, leverage)
+    # ── SL-Detection (FIX: Reihenfolge wie in check_and_repair_position) ──
+    # 1) Direkt aus den Positionsdaten (place-pos-tpsl Typ — Sling/HARSI)
+    sl = 0.0
+    for _f in ("stopLossPrice", "stopLoss", "stopLossTriggerPrice", "slPrice", "sl"):
+        _v = float(pos.get(_f, 0) or 0)
+        if _v > 0:
+            sl = _v
+            break
+    # 2) Fallback: _get_pos_sl_price() (liest Einzelposition + plan-orders)
+    if sl == 0:
+        sl = _get_pos_sl_price(symbol, direction)
+
+    # SL-Typ aus In-Memory-State ableiten
+    sl_secured  = sl_at_entry.get(symbol, False)
+    trl_lvl     = infer_trailing_level(symbol, direction, avg, leverage)
+    _sling_px   = sling_sl.get(symbol, 0)
+    _harsi_px   = harsi_sl.get(symbol, 0)
+
     if sl_secured or trl_lvl >= 1:
-        sl_tag = "🔒 SL = Entry (gesichert)"
+        sl_type = "🔒 Entry (gesichert)"
+    elif _sling_px and abs(_sling_px - sl) / max(sl, 0.00001) < 0.001:
+        sl_type = "🏹 Sling-Trail"
+    elif _harsi_px and abs(_harsi_px - sl) / max(sl, 0.00001) < 0.001:
+        sl_type = "📉 HARSI-Trail"
     elif sl > 0:
-        sl_dist_pct = abs(avg - sl) / avg * 100 if avg > 0 else 0
-        sl_tag = f"🛡 SL = {sl:.{decimals}f}  (−{sl_dist_pct:.2f}% vom Entry)"
+        sl_type = "🛡 Manuell / Original"
     else:
-        sl_tag = "⚠️ Kein SL gesetzt!"
+        sl_type = "⚠️ Kein SL gesetzt!"
+
+    if sl > 0:
+        sl_dist_entry = abs(avg - sl) / avg * 100 if avg > 0 else 0
+        sl_dist_mark  = abs(mark - sl) / mark * 100 if mark > 0 else 0
+        sl_liq_pct    = sl_dist_entry * leverage  # Liquidierungsverlust auf Margin
+        sl_line = (
+            f"  {sl_type}\n"
+            f"  Preis: <code>{sl:.{decimals}f}</code>\n"
+            f"  Abstand Entry: {sl_dist_entry:.2f}%  |  Mark: {sl_dist_mark:.2f}%\n"
+            f"  Max. Verlust bei Stop: −{sl_liq_pct:.0f}% Margin"
+        )
+    else:
+        sl_line = f"  {sl_type}"
 
     # ── DCAs von Bitget ───────────────────────────────────────
+    # LONG: DCAs unterhalb Entry → absteigend sortieren (nächste zuerst)
+    # SHORT: DCAs oberhalb Entry → aufsteigend sortieren (nächste zuerst)
     dca_orders = get_existing_dca_orders(symbol, direction)
     dca_orders.sort(key=lambda o: float(o.get("price", 0)),
-                    reverse=(direction == "short"))
+                    reverse=(direction == "long"))
 
     if dca_orders:
         dca_lines = []
         for i, o in enumerate(dca_orders, 1):
-            px  = float(o.get("price", 0))
-            qty_o = float(o.get("size", 0))
-            dist_pct = abs(avg - px) / avg * 100 if avg > 0 else 0
+            px     = float(o.get("price", 0))
+            qty_o  = float(o.get("size", 0))
+            notional = px * qty_o
+            dist_entry = abs(avg  - px) / avg  * 100 if avg  > 0 else 0
+            dist_mark  = abs(mark - px) / mark * 100 if mark > 0 else 0
+            # Für LONG: DCA unterhalb Mark → prüfe ob schon im Geld
+            filled_icon = ""
+            if direction == "long" and mark <= px:
+                filled_icon = " ✅ im Geld"
+            elif direction == "short" and mark >= px:
+                filled_icon = " ✅ im Geld"
             dca_lines.append(
                 f"  DCA{i}: <code>{px:.{decimals}f}</code>  ×{qty_o:.{qty_dec}f} {base_coin}"
-                f"  ({dist_pct:.1f}% vom Entry)"
+                f"  (≈ {notional:.1f} USDT)\n"
+                f"    Entry +{dist_entry:.1f}%  |  Mark +{dist_mark:.1f}%{filled_icon}"
             )
         dca_block = "\n".join(dca_lines)
     else:
@@ -7710,17 +7759,29 @@ def cmd_pos(parts: list):
     if tp4_price > 0:
         tps.append({"price": tp4_price, "qty": 0, "orderId": "pos_tpsl"})
 
+    # FIX: explizit re-sortieren — SHORT: absteigend (höchster=nächster zuerst)
+    #      LONG: aufsteigend (niedrigster=nächster zuerst)
+    tps.sort(key=lambda x: x["price"], reverse=(direction == "short"))
+
     if tps:
         tp_lines = []
         expected_rois = [TP1_ROI, TP2_ROI, TP3_ROI, TP4_ROI]
         for i, tp in enumerate(tps, 1):
-            px     = tp["price"]
-            roi_e  = expected_rois[i - 1] if i <= len(expected_rois) else 0
-            hit    = (mark >= px if direction == "long" else mark <= px)
+            px    = tp["price"]
+            qty_t = tp.get("qty", 0)
+            # FIX: roi_e * 100 (TP1_ROI = 0.10 → 10%)
+            roi_e = expected_rois[i - 1] * 100 if i <= len(expected_rois) else 0
+            # TP als "ausgelöst" wenn Mark bereits auf der Gewinnseite des TP liegt
+            hit   = (mark >= px if direction == "long" else mark <= px)
             status = "✅ ausgelöst" if hit else "⏳ ausstehend"
-            label  = f"TP{i}" if tp.get("orderId") != "pos_tpsl" else f"TP{i} (TP-SL)"
+            dist_pct = abs(mark - px) / mark * 100 if mark > 0 else 0
+            is_tp4 = tp.get("orderId") == "pos_tpsl"
+            label  = f"TP4 (TP-SL)" if is_tp4 else f"TP{i}"
+            qty_str = f"  ×{qty_t:.{qty_dec}f} {base_coin}" if qty_t > 0 else ""
             tp_lines.append(
-                f"  {label}: <code>{px:.{decimals}f}</code>  +{roi_e:.0f}% ROI  [{status}]"
+                f"  {label}: <code>{px:.{decimals}f}</code>"
+                f"  +{roi_e:.0f}% ROI{qty_str}  [{status}]\n"
+                f"    Mark-Abstand: {dist_pct:.2f}%"
             )
         tp_block = "\n".join(tp_lines)
     else:
@@ -7736,60 +7797,71 @@ def cmd_pos(parts: list):
                 for row in reader:
                     if len(row) >= 4 and row[1].strip().upper() == symbol:
                         events.append(row)
-            events = events[-10:]   # max. letzte 10 Events
+            events = events[-12:]   # max. letzte 12 Events
     except Exception:
         pass
 
+    ev_labels = {
+        "TRADE_OPEN":  "🟢 Trade geöffnet",
+        "SL_ENTRY":    "🔒 SL → Entry",
+        "SL_HARSI":    "📉 HARSI-SL nachgezogen",
+        "SL_SLING":    "🏹 Sling-SL nachgezogen",
+        "DCA_PLACED":  "📥 DCA platziert",
+        "TRADE_CLOSE": "⛳ Trade geschlossen",
+    }
     if events:
         ev_lines = []
         for row in events:
-            ts    = row[0] if len(row) > 0 else "?"
-            ev    = row[3] if len(row) > 3 else "?"
-            info  = row[9] if len(row) > 9 else ""
-            new_sl = row[5] if len(row) > 5 else ""
+            ts     = row[0] if len(row) > 0 else "?"
+            ev     = row[3] if len(row) > 3 else "?"
             old_sl = row[4] if len(row) > 4 else ""
-
-            ev_labels = {
-                "TRADE_OPEN":  "🟢 Trade geöffnet",
-                "SL_ENTRY":    "🔒 SL → Entry",
-                "SL_HARSI":    "📉 HARSI-SL nachgezogen",
-                "SL_SLING":    "🏹 Sling-SL nachgezogen",
-                "DCA_PLACED":  "📥 DCA platziert",
-                "TRADE_CLOSE": "⛔ Trade geschlossen",
-            }
-            label = ev_labels.get(ev, f"• {ev}")
-            detail = info if info else (f"{old_sl} → {new_sl}" if old_sl and new_sl else new_sl)
-            ev_lines.append(f"  {ts}  {label}\n    {detail}")
+            new_sl = row[5] if len(row) > 5 else ""
+            info   = row[9] if len(row) > 9 else ""
+            label  = ev_labels.get(ev, f"• {ev}")
+            if ev in ("SL_ENTRY", "SL_HARSI", "SL_SLING") and old_sl and new_sl:
+                detail = f"{old_sl} → {new_sl}"
+            elif info:
+                detail = info
+            elif new_sl:
+                detail = new_sl
+            else:
+                detail = ""
+            ev_lines.append(f"  {ts}  {label}" + (f"\n    {detail}" if detail else ""))
         history_block = "\n".join(ev_lines)
     else:
-        history_block = "  (noch keine Events aufgezeichnet)"
+        history_block = (
+            "  (Events ab v4.46 aufgezeichnet — nächstes SL-Move\n"
+            "   oder neuer Trade erscheint hier automatisch)"
+        )
 
     # ── Nachricht zusammenbauen ────────────────────────────────
-    roi_sign = "+" if roi_pct >= 0 else ""
+    roi_sign  = "+" if roi_pct >= 0 else ""
     upnl_sign = "+" if upnl >= 0 else ""
-    pos_usdt = qty * mark if mark > 0 else qty * avg
+    pos_usdt  = qty * mark if mark > 0 else qty * avg
+    margin_usdt = pos_usdt / leverage if leverage > 0 else 0
 
     msg = (
         f"{dir_icon} <b>{symbol} {direction.upper()} {leverage}x</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"\n"
         f"📍 <b>Position</b>\n"
-        f"  Qty:    <code>{qty:.{qty_dec}f} {base_coin}</code>  (≈ {pos_usdt:.2f} USDT)\n"
-        f"  Entry:  <code>{avg:.{decimals}f}</code>\n"
-        f"  Mark:   <code>{mark:.{decimals}f}</code>  {roi_sign}{roi_pct:.1f}% ROI\n"
-        f"  PnL:    <b>{upnl_sign}{upnl:.2f} USDT</b>\n"
-        f"  Dauer:  {duration_str}\n"
+        f"  Qty:     <code>{qty:.{qty_dec}f} {base_coin}</code>"
+        f"  ≈ {pos_usdt:.2f} USDT  ({margin_usdt:.2f} USDT Margin)\n"
+        f"  Entry:   <code>{avg:.{decimals}f}</code>\n"
+        f"  Mark:    <code>{mark:.{decimals}f}</code>  {roi_sign}{roi_pct:.1f}% ROI\n"
+        f"  PnL:     <b>{upnl_sign}{upnl:.2f} USDT</b>\n"
+        f"  Dauer:   {duration_str}\n"
         f"\n"
         f"🛡 <b>Stop-Loss</b>\n"
-        f"  {sl_tag}\n"
+        f"{sl_line}\n"
         f"\n"
-        f"📥 <b>DCAs</b>\n"
+        f"📥 <b>DCAs</b>  (sortiert nach Auslösereihenfolge)\n"
         f"{dca_block}\n"
         f"\n"
-        f"🎯 <b>Take-Profits</b>\n"
+        f"🎯 <b>Take-Profits</b>  (sortiert nach Auslösereihenfolge)\n"
         f"{tp_block}\n"
         f"\n"
-        f"📜 <b>Events</b>\n"
+        f"📜 <b>Event-History</b>\n"
         f"{history_block}"
     )
     reply(msg)
