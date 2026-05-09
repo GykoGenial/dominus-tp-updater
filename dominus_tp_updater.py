@@ -1,5 +1,5 @@
 """
-DOMINUS Trade-Automatisierung v4.37
+DOMINUS Trade-Automatisierung v4.44
 ══════════════════════════════════════════════════════════════
 Vollautomatisches Setup nach DOMINUS-Strategie (Handbuch März 2026)
 Finanzmathematische Optimierungen:
@@ -15,6 +15,27 @@ Finanzmathematische Optimierungen:
   ⑩ Klick-UX          — Button-Driven Rangliste mit adaptivem Keyboard (v4.25)
   ⑪ One-Click-Exec    — 🚀 Trade jetzt Button mit Two-Tap-Confirm (v4.28)
   ⑫ Inline-Berechnung — 🚀 1. Tap zeigt volle /trade-Vorschau (v4.35.1)
+
+Changelog v4.44 — BTC/Total2 Alignment Hard-Filter (Dominus Handbuch Kap. 10):
+  A1: BTC_T2_ALIGNMENT_FILTER (Railway-Variable, Default aktiv) — blockiert H2_SIGNAL-
+      Trades wenn btc_t2_warn=1 im Webhook-Payload (DOM-ORC meldet Impuls-Mismatch).
+      Dominus Handbuch Kap. 10: „Die Farbe des DOMINUS Impuls muss bei Coin, Bitcoin
+      und Total2 übereinstimmen. Ist das nicht der Fall, eröffnest du keine Position."
+      Bei Block: Telegram-Warnung mit Symbol, Richtung und Erklärung. Deaktivierbar
+      mit BTC_T2_ALIGNMENT_FILTER=0 in Railway (z.B. für Demo-Sammlung aller Daten).
+  A2: Gleiche Änderung in dominus_demo_bot.py (sync, Default 0 = Filter aus im Demo).
+
+Changelog v4.43 — HTF Liquidity-Buffer für Sling-SL (Jochen Zoom 2026-04-29):
+  L1: SLING_LIQ_BUFFER_PCT (Railway-Variable, Default 0.3%) — verschiebt den
+      Sling-SL leicht über den Pivot hinaus, damit kurze Liquidity-Grabs (Wicks)
+      den Stop nicht triggern. Hintergrund: Sling-Pivots (Sling-Low / Sling-High)
+      sind HTF-Liquiditätszonen, an denen Institutionen Stops auslösen, bevor
+      der Kurs dreht. Ein Buffer von 0.3% gibt dem Trade etwas mehr Spielraum.
+      Long:  SL = pivot × (1 − SLING_LIQ_BUFFER_PCT / 100)
+      Short: SL = pivot × (1 + SLING_LIQ_BUFFER_PCT / 100)
+      Gilt für set_sl_sling() (Stelle 1) und build_trade_suggestion() (Stelle 2).
+      ATR-Fallback bleibt unverändert aktiv wenn Pivot zu nah am Entry liegt.
+  L2: Gleiche Änderung in dominus_demo_bot.py (sync).
 
 Changelog v4.37 — TP Race-Condition Fix:
   FIX13a: cancel_tp_orders_by_ids() — storniert nur alte TPs anhand gespeicherter IDs,
@@ -826,6 +847,18 @@ MAX_LEVERAGE     = _env_int("MAX_LEVERAGE", 25)
 SLING_ATR_MULT  = _env_float("SLING_ATR_MULT",  0.5)
 SLING_PCT_FLOOR = _env_float("SLING_PCT_FLOOR", 0.8)  # % vom Preis
 
+# v4.43: Liquidity-Buffer für Sling-SL (HTF Liquidity — Jochen Zoom 2026-04-29).
+# Swing-Pivots sind gleichzeitig Liquiditätszonen. Grosse Marktteilnehmer fahren
+# den Preis kurz durch den Pivot (Liquidity Grab) bevor sie in die Gegenrichtung
+# drehen. Ohne Buffer wird der Stop exakt an der Liquiditätszone platziert und
+# durch einen Liquidity Grab ausgelöst.
+# Buffer verschiebt den SL leicht über den Pivot hinaus:
+#   Long:  SL = pivot × (1 - SLING_LIQ_BUFFER_PCT/100)  → knapp unter Sling-Low
+#   Short: SL = pivot × (1 + SLING_LIQ_BUFFER_PCT/100)  → knapp über Sling-High
+# Default 0.3% — bewusst klein damit der SL nicht zu weit vom Pivot liegt.
+# Via Railway-Variable anpassbar: SLING_LIQ_BUFFER_PCT=0.5
+SLING_LIQ_BUFFER_PCT = _env_float("SLING_LIQ_BUFFER_PCT", 0.3)
+
 # v4.19: Entry-Queue — mehrere HARSI_EXIT-Signale als Rangliste sammeln
 # ENTRY_QUEUE_ENABLED ("1"/"0"/"true"/"false") — default aktiv.
 # ENTRY_QUEUE_WINDOW_SEC — Sammelfenster in Sekunden (default 90).
@@ -834,6 +867,16 @@ if not _raw_eq:
     _raw_eq = "1"
 ENTRY_QUEUE_ENABLED    = _raw_eq not in ("0", "false", "no", "off")
 ENTRY_QUEUE_WINDOW_SEC = _env_int("ENTRY_QUEUE_WINDOW_SEC", 90)
+
+# v4.44: BTC/Total2 Alignment Hard-Filter (Dominus Handbuch Kap. 10 — Stand 28.03.2026)
+# "Die Farbe des DOMINUS Impuls muss bei Coin, Bitcoin und Total2 übereinstimmen.
+#  Ist das nicht der Fall, eröffnest du keine Position."
+# Wenn btc_t2_warn=1 im H2_SIGNAL Webhook (von DOM-ORC geliefert) → Trade blockiert.
+# Default: aktiv (1). Deaktivierbar mit Railway-Variable BTC_T2_ALIGNMENT_FILTER=0
+_raw_btc_filter = os.environ.get("BTC_T2_ALIGNMENT_FILTER", "1").strip().lower()
+if not _raw_btc_filter:
+    _raw_btc_filter = "1"
+BTC_T2_ALIGNMENT_FILTER = _raw_btc_filter not in ("0", "false", "no", "off")
 
 # v4.28: Stufe B — One-Click-Execution (🚀 Trade jetzt-Button)
 # AUTO_TRADE_ENABLED ("1"/"0"/"true"/"false") — default AUS aus Safety-Gründen.
@@ -3075,20 +3118,29 @@ def set_sl_sling(symbol: str, direction: str, pivot_price: float,
     atr_buf = atr_val * SLING_ATR_MULT if atr_val > 0 else 0.0
     min_buf = max(pct_buf, atr_buf)
 
-    # Pivot zu nah am Markt? → Puffer aufschlagen
+    # v4.43: Liquidity-Buffer — SL leicht über den Pivot hinaus verschieben
+    # damit Liquidity Grabs (kurzes Durchstechen des Pivots) den Stop nicht auslösen
+    liq_buf = pivot_price * (SLING_LIQ_BUFFER_PCT / 100.0)
     if direction == "long":
-        # SL unter dem Pivot — aber Puffer zum Markt mindestens min_buf
-        candidate = pivot_price
+        # Long: SL knapp UNTER dem Sling-Low
+        candidate = pivot_price - liq_buf
         if mark - candidate < min_buf:
             candidate = mark - min_buf
             log(f"  Sling-SL (LONG): Pivot {pivot_price:.5f} zu nah an Mark {mark:.5f} "
                 f"— ATR-Fallback aktiv: SL → {candidate:.5f} (Puffer {min_buf:.5f})")
+        else:
+            log(f"  Sling-SL (LONG): Pivot {pivot_price:.5f} "
+                f"— Liq-Buffer -{SLING_LIQ_BUFFER_PCT}%: SL → {candidate:.5f}")
     else:
-        candidate = pivot_price
+        # Short: SL knapp ÜBER dem Sling-High
+        candidate = pivot_price + liq_buf
         if candidate - mark < min_buf:
             candidate = mark + min_buf
             log(f"  Sling-SL (SHORT): Pivot {pivot_price:.5f} zu nah an Mark {mark:.5f} "
                 f"— ATR-Fallback aktiv: SL → {candidate:.5f} (Puffer {min_buf:.5f})")
+        else:
+            log(f"  Sling-SL (SHORT): Pivot {pivot_price:.5f} "
+                f"— Liq-Buffer +{SLING_LIQ_BUFFER_PCT}%: SL → {candidate:.5f}")
 
     sl_str = round_price(candidate, decimals)
     new_sl = float(sl_str)
@@ -4447,12 +4499,14 @@ def build_trade_suggestion(symbol: str, direction: str, entry: float,
     atr_buf = atr * SLING_ATR_MULT if atr > 0 else 0.0
     min_buf = max(pct_buf, atr_buf)
 
+    # v4.43: Liq-Buffer auf Sling-Pivot anwenden (HTF Liquidity — Jochen Zoom 2026-04-29)
+    liq_buf = pivot * (SLING_LIQ_BUFFER_PCT / 100.0) if pivot > 0 else 0.0
     if direction == "long":
-        sl_candidate = pivot if pivot > 0 else entry - min_buf
+        sl_candidate = (pivot - liq_buf) if pivot > 0 else entry - min_buf
         if entry - sl_candidate < min_buf:
             sl_candidate = entry - min_buf
     else:
-        sl_candidate = pivot if pivot > 0 else entry + min_buf
+        sl_candidate = (pivot + liq_buf) if pivot > 0 else entry + min_buf
         if sl_candidate - entry < min_buf:
             sl_candidate = entry + min_buf
 
@@ -8951,6 +9005,25 @@ def start_webhook_server():
         premium_val     = int(float(data.get("premium",     0) or 0))
 
         # ─────────────────────────────────────────────────────────────
+        # v4.44: BTC/Total2 Alignment Hard-Filter (Dominus Handbuch Kap. 10)
+        # btc_t2_warn=1 → BTC oder Total2 Impuls stimmt NICHT mit Trade-Richtung überein
+        # → kein Trade, Telegram-Warnung, sofort return.
+        # ─────────────────────────────────────────────────────────────
+        if BTC_T2_ALIGNMENT_FILTER and btc_t2_warn_val == 1:
+            _dir_icon = "🟢" if direction == "long" else "🔴"
+            _opp_icon = "🔴" if direction == "long" else "🟢"
+            log(f"  ⛔ BTC/T2-Alignment-Filter: {symbol} {direction} geblockt (btc_t2_warn=1)")
+            telegram(
+                f"⛔ <b>BTC/T2 Alignment — kein Trade</b>\n"
+                f"{_dir_icon} <b>{symbol} {direction.upper()}</b>\n\n"
+                f"BTC oder Total2 Impuls zeigt {_opp_icon} — stimmt <b>nicht</b> mit "
+                f"der Trade-Richtung überein.\n\n"
+                f"📖 <i>Dominus Kap. 10: „Keine Übereinstimmung = Kein Trade.“</i>\n"
+                f"Warte bis BTC + Total2 Impuls ebenfalls {_dir_icon} zeigen."
+            )
+            return
+
+        # ─────────────────────────────────────────────────────────────
         # v4.22: H2_SIGNAL mit harsi_warn=0 → in Entry-Queue (Option 1)
         # ─────────────────────────────────────────────────────────────
         # Bei harsi_warn=0 ist HARSI bereits außerhalb der Extremzone —
@@ -9137,7 +9210,7 @@ def start_webhook_server():
     @app.route("/", methods=["GET"])
     @app.route("/health", methods=["GET"])
     def health():
-        return jsonify({"status": "running", "version": "v4.40"}), 200
+        return jsonify({"status": "running", "version": "v4.44"}), 200
 
     @app.route("/dashboard", methods=["GET"])
     def dashboard():
