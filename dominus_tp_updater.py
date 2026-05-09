@@ -1415,6 +1415,28 @@ def csv_log_trade(trade: dict):
     threading.Thread(target=_write, daemon=True).start()
 
 
+def _met_timestamp() -> str:
+    """Gibt aktuelle Zeit in Europe/Zurich (MEZ/MESZ) zurück — für Event-Log."""
+    try:
+        from zoneinfo import ZoneInfo
+        _tz = ZoneInfo("Europe/Zurich")
+        return datetime.now(_tz).strftime("%d.%m.%Y %H:%M MESZ" if datetime.now(_tz).dst().seconds > 0 else "%d.%m.%Y %H:%M MEZ")
+    except Exception:
+        pass
+    try:
+        import pytz as _pytz
+        _tz = _pytz.timezone("Europe/Zurich")
+        _now = datetime.now(_tz)
+        suffix = "MESZ" if _now.dst().seconds > 0 else "MEZ"
+        return _now.strftime(f"%d.%m.%Y %H:%M {suffix}")
+    except Exception:
+        pass
+    # Fallback: UTC+1 (CET, ohne automatische Sommerzeit)
+    _now_utc = datetime.now(timezone.utc)
+    _offset = 2 if 3 <= _now_utc.month <= 10 else 1   # grobe Schätzung MESZ/MEZ
+    return (_now_utc + timedelta(hours=_offset)).strftime("%d.%m.%Y %H:%M MET")
+
+
 _POS_EVENTS_HEADER = [
     "Zeitstempel", "Symbol", "Richtung", "Event", "Alter_SL", "Neuer_SL",
     "DCA_Preis", "TP_Level", "TP_Preis", "Info",
@@ -1436,7 +1458,7 @@ def _log_pos_event(symbol: str, direction: str, event: str, **kwargs):
                 if not file_exists:
                     writer.writerow(_POS_EVENTS_HEADER)
                 writer.writerow([
-                    datetime.now(timezone.utc).strftime("%d.%m.%Y %H:%M:%S"),
+                    _met_timestamp(),
                     symbol,
                     direction.upper() if direction else "",
                     event,
@@ -7809,24 +7831,54 @@ def cmd_pos(parts: list):
         "DCA_PLACED":  "📥 DCA platziert",
         "TRADE_CLOSE": "⛳ Trade geschlossen",
     }
-    if events:
-        ev_lines = []
-        for row in events:
-            ts     = row[0] if len(row) > 0 else "?"
-            ev     = row[3] if len(row) > 3 else "?"
-            old_sl = row[4] if len(row) > 4 else ""
-            new_sl = row[5] if len(row) > 5 else ""
-            info   = row[9] if len(row) > 9 else ""
-            label  = ev_labels.get(ev, f"• {ev}")
-            if ev in ("SL_ENTRY", "SL_HARSI", "SL_SLING") and old_sl and new_sl:
-                detail = f"{old_sl} → {new_sl}"
-            elif info:
-                detail = info
-            elif new_sl:
-                detail = new_sl
-            else:
-                detail = ""
-            ev_lines.append(f"  {ts}  {label}" + (f"\n    {detail}" if detail else ""))
+
+    # ── Synthetischen TRADE_OPEN-Header immer voranstellen ────
+    # Falls der Trade vor v4.46 eröffnet wurde (kein CSV-Eintrag),
+    # wird die Eröffnungszeit aus trade_data["open_ts"] rekonstruiert.
+    has_open_event = any(
+        len(r) > 3 and r[3].strip() == "TRADE_OPEN" for r in events
+    )
+    synthetic_open_line = ""
+    if not has_open_event and open_ts:
+        try:
+            from zoneinfo import ZoneInfo as _ZI
+            _tz = _ZI("Europe/Zurich")
+            _open_dt = datetime.fromtimestamp(open_ts / 1000, tz=_ZI("UTC")).astimezone(_tz)
+            _suffix  = "MESZ" if _open_dt.dst() and _open_dt.dst().seconds > 0 else "MEZ"
+            _open_str = _open_dt.strftime(f"%d.%m.%Y %H:%M {_suffix}")
+        except Exception:
+            _offset = 2 if 3 <= datetime.now(timezone.utc).month <= 10 else 1
+            _open_dt = datetime.fromtimestamp(open_ts / 1000, tz=timezone.utc)
+            _open_str = (_open_dt + timedelta(hours=_offset)).strftime("%d.%m.%Y %H:%M MET")
+        _entry_str = f"{avg:.{decimals}f}" if avg > 0 else "—"
+        _sl_str    = f"{td.get('sl', 0):.{decimals}f}" if td.get("sl", 0) > 0 else "—"
+        synthetic_open_line = (
+            f"  {_open_str}  🟢 Trade geöffnet\n"
+            f"    Entry {_entry_str} · {leverage}x · SL {_sl_str}"
+        )
+
+    ev_lines = []
+    if synthetic_open_line:
+        ev_lines.append(synthetic_open_line)
+
+    for row in events:
+        ts     = row[0] if len(row) > 0 else "?"
+        ev     = row[3] if len(row) > 3 else "?"
+        old_sl = row[4] if len(row) > 4 else ""
+        new_sl = row[5] if len(row) > 5 else ""
+        info   = row[9] if len(row) > 9 else ""
+        label  = ev_labels.get(ev, f"• {ev}")
+        if ev in ("SL_ENTRY", "SL_HARSI", "SL_SLING") and old_sl and new_sl:
+            detail = f"{old_sl} → {new_sl}"
+        elif info:
+            detail = info
+        elif new_sl:
+            detail = new_sl
+        else:
+            detail = ""
+        ev_lines.append(f"  {ts}  {label}" + (f"\n    {detail}" if detail else ""))
+
+    if ev_lines:
         history_block = "\n".join(ev_lines)
     else:
         history_block = (
