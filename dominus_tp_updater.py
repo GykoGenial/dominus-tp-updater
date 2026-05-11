@@ -1409,6 +1409,14 @@ def csv_log_trade(trade: dict):
                     dt.strftime("%Y"),                   # Jahr
                 ])
             log(f"[CSV] Trade geloggt: {trade.get('symbol')} {pnl:+.2f} USDT → {TRADES_CSV}")
+            # v4.46 — TRADE_CLOSE Event in position_events.csv
+            _sym = trade.get("symbol", "")
+            _dir = trade.get("direction", "")
+            if _sym and _dir:
+                _won_str = "✅ Gewinn" if trade.get("won") else "❌ Verlust"
+                _log_pos_event(_sym, _dir, "TRADE_CLOSE",
+                               info=f"Close={close_px} PnL={pnl:+.2f} USDT "
+                                    f"ROI={roi_pct:+.1f}% {_won_str}")
         except Exception as e:
             log(f"[CSV] Log-Fehler: {e}")
 
