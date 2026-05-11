@@ -1,5 +1,5 @@
 """
-DOMINUS Demo-Bot v4.44 — PAPER TRADING
+DOMINUS Demo-Bot v4.46 — PAPER TRADING
 ════════════════════════════════════
 Vollautomatisches Paper Trading auf Bitget Demo-Account.
 Kein echtes Kapital — identische Logik wie Live-Script.
@@ -852,8 +852,9 @@ WEBHOOK_URL      = os.environ.get("WEBHOOK_URL", "")  # optional: vollständige 
 DOCS_URL           = os.environ.get("DOCS_URL", "https://GykoGenial.github.io/dominus-tp-updater/Dominus_Alarm_Templates.html")
 GOOGLE_CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS", "")  # Service Account JSON als String
 GOOGLE_SHEET_ID    = os.environ.get("GOOGLE_SHEET_ID",    "")  # Spreadsheet ID aus URL
-TRADES_CSV         = os.environ.get("TRADES_CSV", "/app/data/trades.csv")  # Persistentes Trade-Archiv auf Railway Volume
-ENTRY_LOG_CSV      = os.environ.get("ENTRY_LOG_CSV", "/app/data/entry_queue_log.csv")  # Queue-Entscheidungen + Outcomes (v4.20)
+TRADES_CSV          = os.environ.get("TRADES_CSV", "/app/data/trades.csv")  # Persistentes Trade-Archiv auf Railway Volume
+ENTRY_LOG_CSV       = os.environ.get("ENTRY_LOG_CSV", "/app/data/entry_queue_log.csv")  # Queue-Entscheidungen + Outcomes (v4.20)
+POSITION_EVENTS_CSV = os.environ.get("POSITION_EVENTS_CSV", "/app/data/position_events.csv")  # v4.46: SL/DCA/TP Event-History
 
 
 # v4.13: Robuste Env-Parser — Railway-Variablen können "" statt fehlend sein,
@@ -1413,8 +1414,76 @@ def csv_log_trade(trade: dict):
                     dt.strftime("%Y"),                   # Jahr
                 ])
             log(f"[CSV] Trade geloggt: {trade.get('symbol')} {pnl:+.2f} USDT → {TRADES_CSV}")
+            # v4.46 — TRADE_CLOSE Event in position_events.csv
+            _sym = trade.get("symbol", "")
+            _dir = trade.get("direction", "")
+            if _sym and _dir:
+                _won_str = "✅ Gewinn" if trade.get("won") else "❌ Verlust"
+                _log_pos_event(_sym, _dir, "TRADE_CLOSE",
+                               info=f"Close={close_px} PnL={pnl:+.2f} USDT "
+                                    f"ROI={roi_pct:+.1f}% {_won_str} [DEMO]")
         except Exception as e:
             log(f"[CSV] Log-Fehler: {e}")
+
+    threading.Thread(target=_write, daemon=True).start()
+
+
+def _met_timestamp() -> str:
+    """Gibt aktuelle Zeit in Europe/Zurich (MEZ/MESZ) zurück — für Event-Log."""
+    try:
+        from zoneinfo import ZoneInfo
+        _tz = ZoneInfo("Europe/Zurich")
+        _now = datetime.now(_tz)
+        suffix = "MESZ" if _now.dst() and _now.dst().seconds > 0 else "MEZ"
+        return _now.strftime(f"%d.%m.%Y %H:%M {suffix}")
+    except Exception:
+        pass
+    try:
+        import pytz as _pytz
+        _tz = _pytz.timezone("Europe/Zurich")
+        _now = datetime.now(_tz)
+        suffix = "MESZ" if _now.dst().seconds > 0 else "MEZ"
+        return _now.strftime(f"%d.%m.%Y %H:%M {suffix}")
+    except Exception:
+        pass
+    _offset = 2 if 3 <= datetime.now(timezone.utc).month <= 10 else 1
+    return (datetime.now(timezone.utc) + timedelta(hours=_offset)).strftime("%d.%m.%Y %H:%M MET")
+
+
+_POS_EVENTS_HEADER = [
+    "Zeitstempel", "Symbol", "Richtung", "Event", "Alter_SL", "Neuer_SL",
+    "DCA_Preis", "TP_Level", "TP_Preis", "Info",
+]
+
+def _log_pos_event(symbol: str, direction: str, event: str, **kwargs):
+    """v4.46 — Schreibt ein Position-Event in position_events.csv (non-blocking).
+    Events: TRADE_OPEN, SL_ENTRY, SL_HARSI, SL_SLING, DCA_PLACED, TRADE_CLOSE
+    """
+    if not POSITION_EVENTS_CSV:
+        return
+
+    def _write():
+        try:
+            os.makedirs(os.path.dirname(POSITION_EVENTS_CSV), exist_ok=True)
+            file_exists = os.path.isfile(POSITION_EVENTS_CSV)
+            with open(POSITION_EVENTS_CSV, "a", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f, delimiter=";")
+                if not file_exists:
+                    writer.writerow(_POS_EVENTS_HEADER)
+                writer.writerow([
+                    _met_timestamp(),
+                    symbol,
+                    direction.upper() if direction else "",
+                    event,
+                    kwargs.get("old_sl", ""),
+                    kwargs.get("new_sl", ""),
+                    kwargs.get("dca_price", ""),
+                    kwargs.get("tp_level", ""),
+                    kwargs.get("tp_price", ""),
+                    kwargs.get("info", ""),
+                ])
+        except Exception as e:
+            log(f"[pos_event] Log-Fehler: {e}")
 
     threading.Thread(target=_write, daemon=True).start()
 
@@ -2908,6 +2977,10 @@ def set_sl_at_entry(symbol: str, direction: str, entry_price: float,
 
     if result.get("code") == "00000":
         log(f"  ✓ SL auf Entry gesetzt: {sl_str} USDT ({symbol})")
+        _old_sl = get_sl_price(symbol, direction) if not sl_at_entry.get(symbol) else entry_price
+        _log_pos_event(symbol, direction, "SL_ENTRY",
+                       old_sl=f"{_old_sl:.5f}" if _old_sl else "",
+                       new_sl=sl_str, info="TP1 ausgelöst → SL auf Entry")
         sl_at_entry[symbol] = True
         save_state()
         cancel_open_dca_orders(symbol, direction)
@@ -3063,6 +3136,9 @@ def set_sl_harsi(symbol: str, direction: str, harsi_price: float, cur_size: floa
 
     result = api_post("/api/v2/mix/order/place-pos-tpsl", body_sl)
     if result.get("code") == "00000":
+        _log_pos_event(symbol, direction, "SL_HARSI",
+                       old_sl=f"{current_sl:.5f}" if current_sl else "",
+                       new_sl=sl_str, info="HARSI-Exit Trailing-SL")
         harsi_sl[symbol]  = harsi_price
         sl_set_ts[symbol] = time.time()
         save_state()
@@ -3264,6 +3340,9 @@ def set_sl_sling(symbol: str, direction: str, pivot_price: float,
 
     result = api_post("/api/v2/mix/order/place-pos-tpsl", body_sl)
     if result.get("code") == "00000":
+        _log_pos_event(symbol, direction, "SL_SLING",
+                       old_sl=f"{current_sl:.5f}" if current_sl else "",
+                       new_sl=sl_str, info=f"Sling-Pivot {pivot_price:.5f} → SL Trail")
         sling_sl[symbol]  = new_sl
         sl_set_ts[symbol] = time.time()
         save_state()
@@ -3384,6 +3463,9 @@ def place_dca_orders(symbol: str, entry: float, sl: float,
         if res.get("code") == "00000":
             log(f"  ✓ {label} Limit @ {price_str} USDT × {qty_str} {base_coin} (≈ {notional:.2f} USDT)")
             results.append(f"{label}: {price_str} USDT × {qty_str} {base_coin} (≈ {notional:.2f} USDT)")
+            _log_pos_event(symbol, direction, "DCA_PLACED",
+                           dca_price=price_str,
+                           info=f"{label} @ {price_str} × {qty_str} {base_coin}")
         else:
             log(f"  ✗ {label} FEHLER: {res.get('msg', res)}")
 
@@ -4066,6 +4148,9 @@ def setup_new_trade(pos: dict):
         "demo":       DEMO_MODE,
         "score_data": _score_data,
     }
+    _log_pos_event(symbol, direction, "TRADE_OPEN",
+                   new_sl=str(round(sl_price, 8)),
+                   info=f"Entry={entry:.8g} Lev={leverage}x [DEMO]")
 
     # ── 6. Telegram-Zusammenfassung ─────────────────────────
     dca1_str = dca_results[0] if len(dca_results) > 0 else "Fehler"
@@ -6812,7 +6897,12 @@ def cmd_hilfe():
         "━━━━━━━━━━━━\n"
         "\n"
         "📊 <b>Info &amp; Überblick:</b>\n"
-        "/status — Kurzstatus aller offenen Positionen\n"
+        "/status — Kurzstatus aller offenen Demo-Positionen\n"
+        "/pos SYMBOL — Live-Detail: Entry/SL/DCAs/TPs + Event-History\n"
+        "   Beispiel: <code>/pos TRXUSDT</code>\n"
+        "/show SYMBOL — Letzter Trade + Statistik für einen Coin\n"
+        "   Beispiel: <code>/show TRXUSDT</code>\n"
+        "/coins [n] — Ranking aller Coins nach Gesamt-PnL (Top+Flop)\n"
         "/berechnen — Kontostand + Money-Management + Chart-Links\n"
         "/makro — BTC &amp; Total2 Impuls-Richtung + Trade-Erlaubnis\n"
         "/report — Tages- &amp; Monats-P&amp;L Report\n"
@@ -7529,6 +7619,358 @@ def cmd_report():
         reply(f"❌ Report Fehler: {e}")
 
 
+def cmd_pos(parts: list):
+    """v4.46 [DEMO] — /pos SYMBOL: Live-Detailansicht einer offenen Demo-Position."""
+    if len(parts) < 2:
+        reply("❌ <b>Verwendung:</b> <code>/pos SYMBOL</code>\nBeispiel: <code>/pos TRXUSDT</code>")
+        return
+    symbol = parts[1].strip().upper()
+    positions = get_all_positions()
+    pos = next((p for p in positions if p.get("symbol", "").upper() == symbol), None)
+    if not pos:
+        reply(f"ℹ️ <b>{symbol}</b> — keine offene Demo-Position.\nTipp: <code>/show {symbol}</code> für History.")
+        return
+
+    direction = pos.get("holdSide", "long").lower()
+    dir_icon  = "🟢" if direction == "long" else "🔴"
+    td        = trade_data.get(symbol, {})
+    leverage  = int(td.get("leverage", 0)) or int(float(pos.get("leverage", 0))) or 1
+    avg       = float(pos.get("openPriceAvg", 0) or td.get("entry", 0) or 0)
+    qty       = float(pos.get("total", 0))
+    mark      = get_mark_price(symbol)
+    upnl      = float(pos.get("unrealizedPL", 0))
+    decimals  = get_price_decimals(symbol)
+    qty_dec   = get_qty_decimals(symbol)
+    base_coin = get_base_coin(symbol)
+    open_ts   = td.get("open_ts", 0)
+
+    if open_ts:
+        secs = int(time.time() - open_ts / 1000)
+        h, m = divmod(secs // 60, 60)
+        d, h = divmod(h, 24)
+        duration_str = (f"{d}d {h}h {m}m" if d > 0 else f"{h}h {m}m" if h > 0 else f"{m}m")
+    else:
+        duration_str = "—"
+
+    roi_pct = 0.0
+    if avg > 0 and mark > 0:
+        roi_pct = (mark - avg) / avg * leverage * 100
+        if direction == "short":
+            roi_pct = -roi_pct
+
+    # SL: erst aus Position-Feldern, dann _get_pos_sl_price()
+    sl = 0.0
+    for _f in ("stopLossPrice", "stopLoss", "stopLossTriggerPrice", "slPrice", "sl"):
+        _v = float(pos.get(_f, 0) or 0)
+        if _v > 0:
+            sl = _v
+            break
+    if sl == 0:
+        sl = _get_pos_sl_price(symbol, direction)
+
+    sl_secured = sl_at_entry.get(symbol, False)
+    trl_lvl    = infer_trailing_level(symbol, direction, avg, leverage)
+    _sling_px  = sling_sl.get(symbol, 0)
+    _harsi_px  = harsi_sl.get(symbol, 0)
+    if sl_secured or trl_lvl >= 1:
+        sl_type = "🔒 Entry (gesichert)"
+    elif _sling_px and sl > 0 and abs(_sling_px - sl) / max(sl, 0.00001) < 0.001:
+        sl_type = "🏹 Sling-Trail"
+    elif _harsi_px and sl > 0 and abs(_harsi_px - sl) / max(sl, 0.00001) < 0.001:
+        sl_type = "📉 HARSI-Trail"
+    elif sl > 0:
+        sl_type = "🛡 Manuell / Original"
+    else:
+        sl_type = "⚠️ Kein SL gesetzt!"
+
+    if sl > 0:
+        sl_dist_entry = abs(avg - sl) / avg * 100 if avg > 0 else 0
+        sl_dist_mark  = abs(mark - sl) / mark * 100 if mark > 0 else 0
+        sl_liq_pct    = sl_dist_entry * leverage
+        sl_line = (f"  {sl_type}\n"
+                   f"  Preis: <code>{sl:.{decimals}f}</code>\n"
+                   f"  Abstand Entry: {sl_dist_entry:.2f}%  |  Mark: {sl_dist_mark:.2f}%\n"
+                   f"  Max. Verlust bei Stop: −{sl_liq_pct:.0f}% Margin")
+    else:
+        sl_line = f"  {sl_type}"
+
+    # DCAs: LONG absteigend, SHORT aufsteigend (nächste zuerst)
+    dca_orders = get_existing_dca_orders(symbol, direction)
+    dca_orders.sort(key=lambda o: float(o.get("price", 0)), reverse=(direction == "long"))
+    if dca_orders:
+        dca_lines = []
+        for i, o in enumerate(dca_orders, 1):
+            px    = float(o.get("price", 0))
+            qty_o = float(o.get("size", 0))
+            notional   = px * qty_o
+            dist_entry = abs(avg  - px) / avg  * 100 if avg  > 0 else 0
+            dist_mark  = abs(mark - px) / mark * 100 if mark > 0 else 0
+            dca_lines.append(
+                f"  DCA{i}: <code>{px:.{decimals}f}</code>  ×{qty_o:.{qty_dec}f} {base_coin}"
+                f"  (≈ {notional:.1f} USDT)\n"
+                f"    Entry +{dist_entry:.1f}%  |  Mark +{dist_mark:.1f}%")
+        dca_block = "\n".join(dca_lines)
+    else:
+        dca_block = "  (keine ausstehenden DCA-Orders)"
+
+    # TPs: sortiert nach Auslösereihenfolge
+    tps = get_existing_tps(symbol)
+    tp4_price = _get_pos_tp_price(symbol, direction)
+    if tp4_price > 0:
+        tps.append({"price": tp4_price, "qty": 0, "orderId": "pos_tpsl"})
+    tps.sort(key=lambda x: x["price"], reverse=(direction == "short"))
+    expected_rois = [TP1_ROI, TP2_ROI, TP3_ROI, TP4_ROI]
+    if tps:
+        tp_lines = []
+        for i, tp in enumerate(tps, 1):
+            px     = tp["price"]
+            qty_t  = tp.get("qty", 0)
+            roi_e  = expected_rois[i - 1] * 100 if i <= len(expected_rois) else 0
+            hit    = (mark >= px if direction == "long" else mark <= px)
+            status = "✅ ausgelöst" if hit else "⏳ ausstehend"
+            dist_pct = abs(mark - px) / mark * 100 if mark > 0 else 0
+            is_tp4 = tp.get("orderId") == "pos_tpsl"
+            label  = "TP4 (TP-SL)" if is_tp4 else f"TP{i}"
+            qty_str = f"  ×{qty_t:.{qty_dec}f} {base_coin}" if qty_t > 0 else ""
+            tp_lines.append(
+                f"  {label}: <code>{px:.{decimals}f}</code>"
+                f"  +{roi_e:.0f}% ROI{qty_str}  [{status}]\n"
+                f"    Mark-Abstand: {dist_pct:.2f}%")
+        tp_block = "\n".join(tp_lines)
+    else:
+        tp_block = "  (keine TP-Orders gefunden)"
+
+    # Event-History
+    events: list = []
+    try:
+        if POSITION_EVENTS_CSV and os.path.isfile(POSITION_EVENTS_CSV):
+            with open(POSITION_EVENTS_CSV, "r", encoding="utf-8") as f:
+                reader = csv.reader(f, delimiter=";")
+                next(reader, None)
+                for row in reader:
+                    if len(row) >= 4 and row[1].strip().upper() == symbol:
+                        events.append(row)
+            events = events[-12:]
+    except Exception:
+        pass
+
+    ev_labels = {
+        "TRADE_OPEN":  "🟢 Trade geöffnet",
+        "SL_ENTRY":    "🔒 SL → Entry",
+        "SL_HARSI":    "📉 HARSI-SL nachgezogen",
+        "SL_SLING":    "🏹 Sling-SL nachgezogen",
+        "DCA_PLACED":  "📥 DCA platziert",
+        "TRADE_CLOSE": "⛳ Trade geschlossen",
+    }
+    has_open_event = any(len(r) > 3 and r[3].strip() == "TRADE_OPEN" for r in events)
+    ev_lines = []
+    if not has_open_event and open_ts:
+        try:
+            from zoneinfo import ZoneInfo as _ZI
+            _tz = _ZI("Europe/Zurich")
+            _open_dt = datetime.fromtimestamp(open_ts / 1000, tz=_ZI("UTC")).astimezone(_tz)
+            _suffix  = "MESZ" if _open_dt.dst() and _open_dt.dst().seconds > 0 else "MEZ"
+            _open_str = _open_dt.strftime(f"%d.%m.%Y %H:%M {_suffix}")
+        except Exception:
+            _offset = 2 if 3 <= datetime.now(timezone.utc).month <= 10 else 1
+            _open_dt = datetime.fromtimestamp(open_ts / 1000, tz=timezone.utc)
+            _open_str = (_open_dt + timedelta(hours=_offset)).strftime("%d.%m.%Y %H:%M MET")
+        _entry_str = f"{avg:.{decimals}f}" if avg > 0 else "—"
+        _sl_str    = f"{td.get('sl', 0):.{decimals}f}" if td.get("sl", 0) > 0 else "—"
+        ev_lines.append(
+            f"  {_open_str}  🟢 Trade geöffnet\n"
+            f"    Entry {_entry_str} · {leverage}x · SL {_sl_str}")
+
+    for row in events:
+        ts     = row[0] if len(row) > 0 else "?"
+        ev     = row[3] if len(row) > 3 else "?"
+        old_sl = row[4] if len(row) > 4 else ""
+        new_sl = row[5] if len(row) > 5 else ""
+        info   = row[9] if len(row) > 9 else ""
+        label  = ev_labels.get(ev, f"• {ev}")
+        if ev in ("SL_ENTRY", "SL_HARSI", "SL_SLING") and old_sl and new_sl:
+            detail = f"{old_sl} → {new_sl}"
+        elif info:
+            detail = info
+        elif new_sl:
+            detail = new_sl
+        else:
+            detail = ""
+        ev_lines.append(f"  {ts}  {label}" + (f"\n    {detail}" if detail else ""))
+
+    history_block = ("\n".join(ev_lines) if ev_lines else
+                     "  (Events ab v4.46 aufgezeichnet — nächstes SL-Move\n"
+                     "   oder neuer Trade erscheint hier automatisch)")
+
+    roi_sign  = "+" if roi_pct >= 0 else ""
+    upnl_sign = "+" if upnl >= 0 else ""
+    pos_usdt  = qty * mark if mark > 0 else qty * avg
+    margin_usdt = pos_usdt / leverage if leverage > 0 else 0
+
+    reply(
+        f"🧪 [DEMO]  {dir_icon} <b>{symbol} {direction.upper()} {leverage}x</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"\n"
+        f"📍 <b>Position</b>\n"
+        f"  Qty:     <code>{qty:.{qty_dec}f} {base_coin}</code>"
+        f"  ≈ {pos_usdt:.2f} USDT  ({margin_usdt:.2f} USDT Margin)\n"
+        f"  Entry:   <code>{avg:.{decimals}f}</code>\n"
+        f"  Mark:    <code>{mark:.{decimals}f}</code>  {roi_sign}{roi_pct:.1f}% ROI\n"
+        f"  PnL:     <b>{upnl_sign}{upnl:.2f} USDT</b>\n"
+        f"  Dauer:   {duration_str}\n"
+        f"\n"
+        f"🛡 <b>Stop-Loss</b>\n"
+        f"{sl_line}\n"
+        f"\n"
+        f"📥 <b>DCAs</b>  (sortiert nach Auslösereihenfolge)\n"
+        f"{dca_block}\n"
+        f"\n"
+        f"🎯 <b>Take-Profits</b>  (sortiert nach Auslösereihenfolge)\n"
+        f"{tp_block}\n"
+        f"\n"
+        f"📜 <b>Event-History</b>\n"
+        f"{history_block}"
+    )
+
+
+def cmd_show(parts: list):
+    """v4.45 [DEMO] — /show SYMBOL: letzter Trade + Coin-Statistik."""
+    if len(parts) < 2:
+        reply("❌ <b>Verwendung:</b> <code>/show SYMBOL</code>\nBeispiel: <code>/show TRXUSDT</code>")
+        return
+    symbol = parts[1].strip().upper()
+    rows: list = []
+    try:
+        if TRADES_CSV and os.path.isfile(TRADES_CSV):
+            with open(TRADES_CSV, "r", encoding="utf-8") as f:
+                reader = csv.reader(f, delimiter=";")
+                next(reader, None)
+                for row in reader:
+                    if len(row) >= 12 and row[2].strip().upper() == symbol:
+                        rows.append(row)
+    except Exception as e:
+        reply(f"❌ CSV-Lesefehler: {e}"); return
+    if not rows:
+        reply(f"❌ Keine Trades für <b>{symbol}</b> gefunden."); return
+
+    total  = len(rows)
+    wins   = sum(1 for r in rows if r[11].strip().lower() in ("ja", "yes", "true", "1"))
+    losses = total - wins
+    wr     = wins / total if total > 0 else 0.0
+    pnls   = [float(r[7].replace(",", ".")) for r in rows if len(r) > 7 and r[7].replace(",","").replace(".","").lstrip("-").isdigit() or (len(r) > 7 and r[7])]
+    try:
+        pnls = [float(r[7].replace(",", ".")) for r in rows]
+    except Exception:
+        pnls = []
+    try:
+        rois = [float(r[8].replace(",", ".")) for r in rows]
+    except Exception:
+        rois = []
+    total_pnl = sum(pnls)
+    avg_pnl   = total_pnl / len(pnls) if pnls else 0.0
+    avg_roi   = sum(rois) / len(rois) if rois else 0.0
+    best_pnl  = max(pnls) if pnls else 0.0
+    worst_pnl = min(pnls) if pnls else 0.0
+
+    last = rows[-1]
+    last_won = last[11].strip().lower() in ("ja", "yes", "true", "1")
+    dir_icon = "🟢" if last[3].upper() == "LONG" else "🔴"
+    filled   = round(wr * 10)
+    bar      = "█" * filled + "░" * (10 - filled)
+    recent   = rows[-5:]
+    trend    = " ".join("✅" if r[11].strip().lower() in ("ja","yes","true","1") else "❌" for r in recent)
+    pnl_sign = "+" if total_pnl >= 0 else ""
+    apnl_s   = "+" if avg_pnl >= 0 else ""
+    aroi_s   = "+" if avg_roi >= 0 else ""
+
+    reply(
+        f"🧪 [DEMO]  📊 <b>{symbol} — Trade-Übersicht</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🕐 <b>Letzter Trade</b> — {last[0]}  {last[1]} UTC\n"
+        f"{dir_icon} {last[3].upper()} · {last[4]}x · {'✅' if last_won else '❌'}\n"
+        f"  Entry:  <code>{last[5]}</code>\n"
+        f"  Close:  <code>{last[6]}</code>\n"
+        f"  PnL:    <b>{last[7]} USDT</b>  ({last[8]}%)\n"
+        f"  Dauer:  {last[9] if len(last) > 9 else '—'}\n\n"
+        f"📈 <b>Gesamt — {total} Trades</b>\n"
+        f"  Wins / Losses:  {wins} ✅ / {losses} ❌\n"
+        f"  Win-Rate:  {wr*100:.1f}%  {bar}\n"
+        f"  Ø PnL/Trade:  <b>{apnl_s}{avg_pnl:.2f} USDT</b>\n"
+        f"  Ø ROI/Trade:  {aroi_s}{avg_roi:.1f}%\n"
+        f"  Gesamt PnL:   <b>{pnl_sign}{total_pnl:.2f} USDT</b>\n"
+        f"  Bester Trade:  +{best_pnl:.2f} USDT\n"
+        f"  Schlechtester: {worst_pnl:.2f} USDT\n\n"
+        f"🔥 <b>Trend (letzte {len(recent)}):</b>  {trend}"
+    )
+
+
+def cmd_coins(parts: list = None):
+    """v4.45 [DEMO] — /coins [n]: Ranking aller Coins nach Gesamt-PnL."""
+    sym_data: dict = {}
+    try:
+        if not TRADES_CSV or not os.path.isfile(TRADES_CSV):
+            reply(f"❌ trades.csv nicht gefunden: <code>{TRADES_CSV}</code>"); return
+        with open(TRADES_CSV, "r", encoding="utf-8") as f:
+            reader = csv.reader(f, delimiter=";")
+            next(reader, None)
+            for row in reader:
+                if len(row) < 12: continue
+                sym = row[2].strip().upper()
+                if not sym: continue
+                won = row[11].strip().lower() in ("ja", "yes", "true", "1")
+                try:
+                    pnl = float(row[7].replace(",", "."))
+                except Exception:
+                    pnl = 0.0
+                if sym not in sym_data:
+                    sym_data[sym] = {"wins": 0, "n": 0, "pnl": 0.0}
+                sym_data[sym]["n"]   += 1
+                sym_data[sym]["pnl"] += pnl
+                if won:
+                    sym_data[sym]["wins"] += 1
+    except Exception as e:
+        reply(f"❌ CSV-Lesefehler: {e}"); return
+    if not sym_data:
+        reply("❌ Keine Trade-Daten gefunden."); return
+
+    ranked = sorted(sym_data.items(), key=lambda x: x[1]["pnl"], reverse=True)
+    total_syms = len(ranked)
+    n_show = 5
+    if parts and len(parts) >= 2:
+        try: n_show = max(1, min(int(parts[1]), 20))
+        except ValueError: pass
+
+    lines = [
+        f"🧪 [DEMO]  🏆 <b>Coin-Ranking — {total_syms} Coins"
+        f" ({sum(v['n'] for v in sym_data.values())} Trades)</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+    ]
+
+    def _line(rank, sym, d):
+        wr  = d["wins"] / d["n"] if d["n"] > 0 else 0.0
+        pnl = d["pnl"]
+        sign = "+" if pnl >= 0 else ""
+        medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(rank, f"  {rank}.")
+        bar = "█" * round(wr * 5) + "░" * (5 - round(wr * 5))
+        return (f"{medal} <b>{sym}</b>  {sign}{pnl:.2f} USDT\n"
+                f"    {d['wins']}✅/{d['n']-d['wins']}❌  ({wr*100:.0f}%) {bar}")
+
+    if total_syms <= n_show * 2:
+        lines.append("")
+        for i, (sym, d) in enumerate(ranked, 1):
+            lines.append(_line(i, sym, d))
+    else:
+        lines.append(f"\n🚀 <b>Top {n_show}</b>")
+        for i, (sym, d) in enumerate(ranked[:n_show], 1):
+            lines.append(_line(i, sym, d))
+        lines.append(f"\n💀 <b>Flop {n_show}</b>")
+        for i, (sym, d) in enumerate(ranked[total_syms - n_show:], total_syms - n_show + 1):
+            lines.append(_line(i, sym, d))
+
+    lines.append("\n📊 /show SYMBOL — Details zu einem Coin")
+    reply("\n".join(lines))
+
+
 def cmd_trades():
     """v4.34 — /trades: schickt die aktuelle trades.csv als Telegram-Dokument
     zurück. Caption enthält Zeilenzahl, Dateigrösse und Mtime, damit man
@@ -7777,6 +8219,12 @@ def poll_telegram_commands():
             cmd_refresh(parts)
         elif cmd == "/report":
             cmd_report()
+        elif cmd == "/pos":
+            cmd_pos(parts)
+        elif cmd == "/show":
+            cmd_show(parts)
+        elif cmd == "/coins":
+            cmd_coins(parts)
         elif cmd == "/trades":
             cmd_trades()
         elif cmd == "/backup":
@@ -8868,7 +9316,7 @@ def start_webhook_server():
     @app.route("/", methods=["GET"])
     @app.route("/health", methods=["GET"])
     def health():
-        return jsonify({"status": "running", "version": "v4.44", "mode": "DEMO"}), 200
+        return jsonify({"status": "running", "version": "v4.46", "mode": "DEMO"}), 200
 
     @app.route("/dashboard", methods=["GET"])
     def dashboard():
