@@ -9449,6 +9449,15 @@ def start_webhook_server():
                 _track_watchlist_drop("keine matching Position", symbol, "SLING_SL", direction)
                 return  # ignored: no matching position
 
+            # v4.49 Option B: Ab TP2 (trailing_sl_level >= 2) übernimmt HARSI
+            # den Trail — Sling-Updates werden ignoriert um dem Trade mehr
+            # Spielraum bei grösseren Candles/Volatilität zu geben.
+            _tp_level = trailing_sl_level.get(symbol, 0)
+            if _tp_level >= 2:
+                log(f"  ⏭ SLING_SL {symbol} ignoriert — TP{_tp_level} erreicht, "
+                    f"HARSI übernimmt Trail ab TP2 (Option B)")
+                return  # ignored: HARSI takes over after TP2
+
             set_sl_sling(symbol, direction, pivot_price,
                          cur_size=cur_size, atr_val=atr_raw)
             cache_invalidate("all_positions")
