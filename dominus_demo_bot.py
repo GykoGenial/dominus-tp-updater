@@ -985,6 +985,7 @@ new_trade_done:   dict = {}   # {symbol: bool} — DCA bereits gesetzt?
 price_decimals_cache: dict = {}  # {symbol: int}  — Preis-Dezimalstellen
 qty_decimals_cache:   dict = {}  # {symbol: int}  — Mengen-Dezimalstellen (volumePlace)
 base_coin_cache:      dict = {}  # {symbol: str}  — BaseCoin-Name (z.B. "THETA", "BTC")
+max_lever_cache:      dict = {}  # {symbol: int}  — Bitget-Max-Hebel für dieses Symbol
 last_update_id:   int  = 0    # Telegram: letzter verarbeiteter Update-ID
 
 # Trade-Daten für Auswertung bei Abschluss
@@ -1740,6 +1741,10 @@ def get_price_decimals(symbol: str) -> int:
             price_dec = int(c.get("pricePlace",  "4"))
             qty_dec   = int(c.get("volumePlace", "4"))
             base_coin = c.get("baseCoin", base_coin) or base_coin
+            try:
+                max_lever_cache[symbol] = int(c.get("maxLever", MAX_LEVERAGE))
+            except Exception:
+                max_lever_cache[symbol] = MAX_LEVERAGE
     except Exception:
         pass
     price_decimals_cache[symbol] = price_dec
@@ -1760,6 +1765,14 @@ def get_base_coin(symbol: str) -> str:
     if symbol not in base_coin_cache:
         get_price_decimals(symbol)
     return base_coin_cache.get(symbol, symbol.replace("USDT", ""))
+
+
+def get_max_leverage(symbol: str) -> int:
+    """Maximaler Hebel laut Bitget für dieses Symbol (aus Contract-Cache).
+    Frischt den Cache bei Bedarf nach. Fallback: MAX_LEVERAGE."""
+    if symbol not in max_lever_cache:
+        get_price_decimals(symbol)  # befüllt max_lever_cache als Nebeneffekt
+    return max_lever_cache.get(symbol, MAX_LEVERAGE)
 
 
 def snap_qty(symbol: str, qty: float) -> float:
@@ -3610,8 +3623,29 @@ def execute_trade_order(symbol: str, direction: str, leverage: int,
     log(f"  Initial-Margin: {initial_margin:.2f} USDT | Qty: {qty_str} | "
         f"Notional: {notional:.2f} USDT")
 
-    # ── 3. Hebel auf Bitget setzen ──────────────────────────────
-    set_leverage_on_bitget(symbol, direction, leverage)
+    # ── 3. Hebel auf Bitget setzen (mit Auto-Fallback auf Bitget-Max) ──
+    lev_res = set_leverage_on_bitget(symbol, direction, leverage)
+    if lev_res.get("code") != "00000":
+        # Bitget lehnt Hebel ab → maximalen erlaubten Hebel für dieses Symbol abfragen
+        bitget_max = get_max_leverage(symbol)
+        fallback_lev = min(leverage - 1, bitget_max)
+        fallback_lev = max(fallback_lev, 1)
+        log(f"  ⚠ [DEMO] Hebel {leverage}x abgelehnt — Bitget-Max für {symbol}: {bitget_max}x "
+            f"→ Fallback auf {fallback_lev}x")
+        # Qty mit neuem Hebel neu berechnen
+        contracts_raw = (initial_margin * fallback_lev) / entry
+        qty           = snap_qty(symbol, contracts_raw)
+        if qty <= 0:
+            return {"ok": False, "reason": f"Qty nach Hebel-Fallback ({fallback_lev}x) zu klein"}
+        qty_str  = round_qty(symbol, qty)
+        notional = qty * entry
+        leverage = fallback_lev
+        log(f"  ↳ Neu: Hebel={leverage}x | Qty={qty_str} | Notional={notional:.2f} USDT")
+        lev_res2 = set_leverage_on_bitget(symbol, direction, leverage)
+        if lev_res2.get("code") != "00000":
+            lev_err = lev_res2.get("msg", str(lev_res2))
+            log(f"  ✗ [DEMO] Trade abgebrochen — auch Fallback-Hebel {leverage}x fehlgeschlagen: {lev_err}")
+            return {"ok": False, "reason": f"set-leverage Fallback({leverage}x) fehlgeschlagen: {lev_err}"}
 
     # ── 4. Market-Order platzieren ──────────────────────────────
     side = "buy" if direction == "long" else "sell"
