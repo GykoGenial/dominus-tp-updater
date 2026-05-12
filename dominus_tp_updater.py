@@ -1,5 +1,5 @@
 """
-DOMINUS Trade-Automatisierung v4.46
+DOMINUS Trade-Automatisierung v4.50
 ══════════════════════════════════════════════════════════════
 Vollautomatisches Setup nach DOMINUS-Strategie (Handbuch März 2026)
 Finanzmathematische Optimierungen:
@@ -7099,8 +7099,9 @@ def cmd_hilfe():
         "/dedup_trades [apply] — Duplikate im Trade-Archiv suchen\n"
         "   ohne Argument: Dry-Run | mit <code>apply</code>: bereinigen\n"
         "\n"
-        "📦 <b>Archiv-Transfer (v4.34):</b>\n"
-        "/trades — trades.csv als Telegram-Dokument herunterladen\n"
+        "📦 <b>Archiv-Transfer (v4.50):</b>\n"
+        "/trades — trades.csv <b>+ entry_queue_log.csv</b> herunterladen\n"
+        "   (Score, Leverage, R-Multiple + Outcome jedes Signals)\n"
         "/restore_trades — Anleitung: bereinigte CSV wieder hochladen\n"
         "   (Datei anhängen + Caption <code>/restore_trades</code>)\n"
         "\n"
@@ -8167,51 +8168,89 @@ def cmd_coins(parts: list = None):
 
 
 def cmd_trades():
-    """v4.34 — /trades: schickt die aktuelle trades.csv als Telegram-Dokument
-    zurück. Caption enthält Zeilenzahl, Dateigrösse und Mtime, damit man
-    vor dem Edit lokal weiss, welche Version man in den Händen hält."""
-    if not TRADES_CSV:
-        reply("❌ TRADES_CSV ist nicht konfiguriert.")
-        return
-    if not os.path.isfile(TRADES_CSV):
-        reply(f"❌ trades.csv nicht gefunden: <code>{TRADES_CSV}</code>")
-        return
-    try:
-        size_bytes = os.path.getsize(TRADES_CSV)
-        mtime_str  = datetime.fromtimestamp(os.path.getmtime(TRADES_CSV)) \
+    """v4.50 — /trades: schickt trades.csv + entry_queue_log.csv als Telegram-Dokumente.
+    Caption enthält Zeilenzahl, Dateigrösse und Mtime beider Dateien."""
+
+    def _file_info(path: str) -> tuple:
+        """Gibt (size_str, mtime_str, data_rows) zurück."""
+        size_bytes = os.path.getsize(path)
+        mtime_str  = datetime.fromtimestamp(os.path.getmtime(path)) \
                         .strftime("%Y-%m-%d %H:%M:%S")
-        # Zeilen zählen (ohne ganze Datei in den RAM zu laden)
         line_count = 0
-        with open(TRADES_CSV, "r", encoding="utf-8") as fh:
+        with open(path, "r", encoding="utf-8") as fh:
             for _ in fh:
                 line_count += 1
-        data_rows = max(0, line_count - 1)  # erste Zeile = Header
-
-        # Human-readable Grösse
+        data_rows = max(0, line_count - 1)
         if size_bytes < 1024:
             size_str = f"{size_bytes} B"
         elif size_bytes < 1024 * 1024:
             size_str = f"{size_bytes / 1024:.1f} KB"
         else:
             size_str = f"{size_bytes / (1024 * 1024):.2f} MB"
+        return size_str, mtime_str, data_rows
 
-        fname   = f"trades_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-        caption = (
-            "📦 <b>Trade-Archiv</b>\n"
-            f"━━━━━━━━━━━━\n"
-            f"Datei:   <code>{os.path.basename(TRADES_CSV)}</code>\n"
-            f"Trades:  <b>{data_rows}</b> Zeile(n) + Header\n"
-            f"Grösse:  {size_str}\n"
-            f"Mtime:   {mtime_str} (lokal)\n"
-            "\n"
-            "Zurückspielen: Datei anhängen, Bildunterschrift "
-            "<code>/restore_trades</code>."
-        )
-        ok = telegram_document(TRADES_CSV, caption=caption, filename=fname)
-        if not ok:
-            reply("❌ sendDocument fehlgeschlagen — siehe Railway-Logs.")
-    except Exception as e:
-        reply(f"❌ /trades Fehler: {e}")
+    ts_tag   = datetime.now().strftime("%Y%m%d_%H%M%S")
+    any_sent = False
+    errors   = []
+
+    # ── 1. trades.csv ──────────────────────────────────────────────────────────
+    if not TRADES_CSV:
+        errors.append("TRADES_CSV nicht konfiguriert")
+    elif not os.path.isfile(TRADES_CSV):
+        errors.append(f"trades.csv nicht gefunden (<code>{TRADES_CSV}</code>)")
+    else:
+        try:
+            size_str, mtime_str, data_rows = _file_info(TRADES_CSV)
+            fname   = f"trades_{ts_tag}.csv"
+            caption = (
+                "📦 <b>Trade-Archiv — trades.csv</b>\n"
+                f"━━━━━━━━━━━━\n"
+                f"Trades:  <b>{data_rows}</b> Zeile(n) + Header\n"
+                f"Grösse:  {size_str}\n"
+                f"Mtime:   {mtime_str}\n"
+                "\n"
+                "Zurückspielen: Datei anhängen + Caption "
+                "<code>/restore_trades</code>."
+            )
+            ok = telegram_document(TRADES_CSV, caption=caption, filename=fname)
+            if ok:
+                any_sent = True
+            else:
+                errors.append("sendDocument für trades.csv fehlgeschlagen")
+        except Exception as e:
+            errors.append(f"trades.csv Fehler: {e}")
+
+    # ── 2. entry_queue_log.csv ─────────────────────────────────────────────────
+    if not ENTRY_LOG_CSV:
+        errors.append("ENTRY_LOG_CSV nicht konfiguriert")
+    elif not os.path.isfile(ENTRY_LOG_CSV):
+        errors.append(f"entry_queue_log.csv nicht gefunden (<code>{ENTRY_LOG_CSV}</code>)")
+    else:
+        try:
+            size_str, mtime_str, data_rows = _file_info(ENTRY_LOG_CSV)
+            fname   = f"entry_queue_log_{ts_tag}.csv"
+            caption = (
+                "📊 <b>Entry-Queue-Log — entry_queue_log.csv</b>\n"
+                f"━━━━━━━━━━━━\n"
+                f"Einträge: <b>{data_rows}</b> Zeile(n) + Header\n"
+                f"Grösse:   {size_str}\n"
+                f"Mtime:    {mtime_str}\n"
+                "\n"
+                "Enthält Score, Leverage, R-Multiple + Outcome jedes Signals."
+            )
+            ok = telegram_document(ENTRY_LOG_CSV, caption=caption, filename=fname)
+            if ok:
+                any_sent = True
+            else:
+                errors.append("sendDocument für entry_queue_log.csv fehlgeschlagen")
+        except Exception as e:
+            errors.append(f"entry_queue_log.csv Fehler: {e}")
+
+    # ── Feedback ───────────────────────────────────────────────────────────────
+    if errors:
+        reply("⚠️ " + "\n".join(errors))
+    if not any_sent and not errors:
+        reply("❌ Keine Datei gefunden — Railway Volume verbunden?")
 
 
 def handle_trades_restore(document: dict) -> None:
