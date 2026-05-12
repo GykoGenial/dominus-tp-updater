@@ -1882,6 +1882,32 @@ if barstate.isconfirmed and not na(pl)
   </div>
   <div class="info" style="margin-top:10px">Telegram-Benachrichtigung bei jedem Level mit Restposition und gesichertem Mindestgewinn. <strong>/refresh</strong> pr&uuml;ft und repariert das Trailing-Niveau automatisch.</div>
   <div class="hint" style="margin-top:6px"><strong>Erkennungssystem:</strong> Fill-basiert (prim&auml;r, 48h) + Gr&ouml;ssenbasiert (Fallback bei &auml;lteren Trades)</div>
+
+  <div style="margin-top:16px;border-top:0.5px solid rgba(255,255,255,0.07);padding-top:14px">
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
+      <span style="background:#22203e;color:#A89FF5;font-size:10px;font-weight:600;padding:2px 8px;border-radius:4px;letter-spacing:.03em">NEU v4.49</span>
+      <span style="font-size:14px;font-weight:500;color:#deded8">Option B &mdash; HARSI-Trail ab TP2</span>
+    </div>
+    <div style="font-size:13px;color:#b0b0a8;line-height:1.65">
+      Ab TP2 &uuml;bernimmt <strong style="color:#deded8">HARSI</strong> das Trailing &mdash; Sling-SL-Updates werden ab diesem Punkt ignoriert. Der HARSI-Exit-Alarm l&auml;uft weiter und gibt dem Trade deutlich mehr Spielraum als ein fixer Pivot-SL.
+    </div>
+    <div style="display:grid;grid-template-columns:1fr auto 1fr auto 1fr;gap:6px;align-items:center;margin-top:10px">
+      <div style="background:#162a16;border-radius:8px;padding:8px 10px;font-size:12px;text-align:center;line-height:1.4;color:#5EC45E">
+        <strong>TP1 erreicht</strong><br>&darr;<br>SL auf Entry<br><span style="font-size:11px;opacity:.7">Sling-SL aktiv</span>
+      </div>
+      <div style="font-size:16px;color:#b0b0a8;text-align:center">&rarr;</div>
+      <div style="background:#22203e;border-radius:8px;padding:8px 10px;font-size:12px;text-align:center;line-height:1.4;color:#A89FF5;border:0.5px solid rgba(168,159,245,0.3)">
+        <strong>TP2 erreicht</strong><br>&darr;<br>HARSI &uuml;bernimmt<br><span style="font-size:11px;opacity:.7">Sling-SL ignoriert</span>
+      </div>
+      <div style="font-size:16px;color:#b0b0a8;text-align:center">&rarr;</div>
+      <div style="background:#0e1f33;border-radius:8px;padding:8px 10px;font-size:12px;text-align:center;line-height:1.4;color:#7BB8F5">
+        <strong>HARSI-Exit</strong><br>&darr;<br>Position schliesst<br><span style="font-size:11px;opacity:.7">Maximum Spielraum</span>
+      </div>
+    </div>
+    <div style="background:#22203e;border-radius:8px;padding:9px 12px;font-size:12px;color:#A89FF5;margin-top:10px;line-height:1.55">
+      <strong>Warum?</strong> Ab TP2 ist der Mindestgewinn bereits gesichert. Ein fixer Pivot-SL w&uuml;rde den Trade bei normalen Schwankungen vorzeitig beenden. HARSI erkennt den echten Trendwechsel &mdash; der Trade l&auml;uft bis zum n&auml;chsten Exit-Signal.
+    </div>
+  </div>
   <div style="margin-top:14px">
     <div style="font-size:11px;color:#666;text-transform:uppercase;letter-spacing:.04em;margin-bottom:6px">Telegram-Benachrichtigung (Vorschau)</div>
     <div style="background:#0d0d10;border-radius:10px;padding:12px 14px;font-family:'SF Mono','Fira Mono',monospace;font-size:12px;color:#e0e0e0;line-height:1.7">
@@ -1982,9 +2008,9 @@ if barstate.isconfirmed and not na(pl)
         <div style="font-size:12px;color:#b0b0a8;line-height:1.65">
           Das R:R-Verhältnis setzt den möglichen Gewinn (bis TP) in Relation zum möglichen Verlust (bis SL). Ein R:R von <strong style="color:#5EC45E">2.0</strong> bedeutet: für jeden riskierten Franken wird 2 Franken Gewinn angestrebt.<br><br>
           <strong style="color:#deded8">Beispiel:</strong> Entry 100, SL 98 (−2%), TP 104 (+4%) → R:R = 4/2 = <strong style="color:#5EC45E">2.0</strong><br><br>
-          Ein R:R von mindestens <strong style="color:#deded8">1.5</strong> ist Minimum (Railway-Variable <code style="background:#252528;padding:1px 5px;border-radius:3px">MIN_RR</code>). Darunter lohnt sich der Trade statistisch nicht, selbst bei guter Winrate &mdash; die schlechten Trades fressen die guten auf.
+          Ein R:R von mindestens <strong style="color:#deded8">2.0</strong> ist Minimum (Railway-Variable <code style="background:#252528;padding:1px 5px;border-radius:3px">MIN_RR</code>). Darunter lohnt sich der Trade statistisch nicht, selbst bei guter Winrate &mdash; die schlechten Trades fressen die guten auf.
         </div>
-        <div class="warn" style="margin-top:8px"><strong>Warnung ausgelöst wenn:</strong> R:R &lt; MIN_RR (Standard: 1.5). Abhilfe: SL enger setzen oder einen besseren Entry abwarten. Das Setup wird trotzdem aufgebaut &mdash; die Entscheidung liegt bei dir.</div>
+        <div class="warn" style="margin-top:8px"><strong>Warnung ausgelöst wenn:</strong> R:R &lt; MIN_RR (Standard: 2.0). Abhilfe: SL enger setzen oder einen besseren Entry abwarten. Das Setup wird trotzdem aufgebaut &mdash; die Entscheidung liegt bei dir.</div>
       </div>
     </div>
   </div>
