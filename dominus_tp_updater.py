@@ -867,7 +867,7 @@ MIN_RR  = _env_float("MIN_RR", 1.5)    # Mindest R:R Ratio
 # inkl. Hebel bei vollem DCA-Setup). Default 25% = 10%-Margin × Hebel-Cap 25x /
 # Aufteilung entspricht dem DOMINUS-25%-Max-Loss-Framework.
 MAX_EXPOSURE_PCT = _env_float("MAX_EXPOSURE_PCT", 0.25)
-MAX_LEVERAGE     = _env_int("MAX_LEVERAGE", 25)
+MAX_LEVERAGE     = _env_int("MAX_LEVERAGE", 20)
 
 # v4.12: Sling-SL Fallback-Puffer (wenn Pivot < pct_floor vom Preis entfernt,
 # wird mindestens max(pct_floor%, atr_mult × ATR) als Puffer gewahrt).
