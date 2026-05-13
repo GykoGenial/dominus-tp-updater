@@ -1,5 +1,5 @@
 """
-DOMINUS Trade-Automatisierung v4.50
+DOMINUS Trade-Automatisierung v4.51
 ══════════════════════════════════════════════════════════════
 Vollautomatisches Setup nach DOMINUS-Strategie (Handbuch März 2026)
 Finanzmathematische Optimierungen:
@@ -30,6 +30,20 @@ Changelog v4.46 — /pos Live-Position-Detail + position_events.csv Event-Log:
       (SL_ENTRY), set_sl_harsi (SL_HARSI), set_sl_sling (SL_SLING), place_dca_orders
       (DCA_PLACED per DCA1/DCA2). TRADE_CLOSE kann via csv_log_trade nachgerüstet werden.
   P3: /pos und position_events.csv in cmd_hilfe() und Dispatcher registriert.
+
+Changelog v4.51 — FIX14: DCA-Duplikat-Bug bei /refresh nach DCA1-Fill:
+  F1: check_and_repair_position() zählte offene DCAs (n_dca=1) und platzierte
+      via place_dca_orders() immer BEIDE neu — wenn DCA1 gefüllt war, entstanden
+      3 DCA-Orders statt 1. Fix: initial_size wird in trade_data["initial_size"]
+      gespeichert. Beim /refresh wird aus size/initial_size das Fill-Verhältnis
+      berechnet (≥1.75× → DCA1 gefüllt) und n_expected_open korrekt bestimmt.
+      Ergebnis: nach DCA1-Fill → n_expected_open=1, n_dca=1 → kein Re-Place.
+  F2: base_size in check_and_repair_position() nutzt jetzt initial_size statt
+      size (aktuelle Position) — verhindert überdimensionierte DCA-Grössen nach
+      einem Nachkauf.
+  F3: setup_new_trade() und report_position_startup() speichern initial_size.
+  (Bugauslöser OPUSDT 2026-05-13: DCA1 @ 0.1515 gefüllt, /refresh setzte 2
+  weitere DCAs → 3 offene DCA-Orders auf Bitget)
 
 Changelog v4.45 — /show + /coins Coin-Statistik-Befehle:
   S1: cmd_show(SYMBOL) — /show TRXUSDT zeigt letzten Trade (Datum, Richtung, Hebel,
@@ -4153,12 +4167,13 @@ def setup_new_trade(pos: dict):
     dca_void.pop(symbol, None)
     # Trade-Daten für spätere Auswertung
     trade_data[symbol] = {
-        "entry":     entry,
-        "direction": direction,
-        "leverage":  leverage,
-        "sl":        sl_price,
-        "peak_size": size,
-        "open_ts":   int(time.time() * 1000),
+        "entry":        entry,
+        "direction":    direction,
+        "leverage":     leverage,
+        "sl":           sl_price,
+        "peak_size":    size,
+        "initial_size": size,   # v4.51 FIX14: Basis für DCA-Fill-Erkennung in check_and_repair
+        "open_ts":      int(time.time() * 1000),
     }
 
     # ── 6. Telegram-Zusammenfassung ─────────────────────────
@@ -10781,15 +10796,50 @@ def check_and_repair_position(pos: dict):
         return
 
     # ── 4. DCAs prüfen (nur wenn kein TP passiert) ────────────────────────
+    # v4.51 FIX14: Bevor fehlende DCAs platziert werden, ermitteln wir wie viele
+    # DCAs bereits GEFÜLLT wurden (nicht nur "fehlen"). DCA1-Fill erhöht die
+    # Positionsgrösse um Faktor 2.5x. Ohne diese Prüfung würde /refresh nach
+    # DCA1-Fill (n_dca=1) beide DCAs neu setzen → 3 DCA-Orders auf Bitget.
     existing_dcas = get_existing_dca_orders(symbol, direction)
     n_dca         = len(existing_dcas)
 
-    if n_dca >= 2:
-        dca_info = " | ".join(
-            f"{o.get('price','?')} × {o.get('size','?')}" for o in existing_dcas[:2]
-        )
-        log(f"  ✓ {n_dca} DCA-Orders vorhanden: {dca_info}")
+    _initial_size = trade_data.get(symbol, {}).get("initial_size", 0)
+    if _initial_size and _initial_size > 0:
+        # DCA-Sizing 20/30/50: nach DCA1-Fill ≈ 2.5× initial; nach DCA2-Fill ≈ 5.0×
+        _ratio = size / _initial_size
+        if _ratio >= 3.75:
+            n_dca_filled = 2    # Beide DCAs absorbiert (≈5.0× initial)
+        elif _ratio >= 1.75:
+            n_dca_filled = 1    # DCA1 absorbiert (≈2.5× initial)
+        else:
+            n_dca_filled = 0    # Noch kein DCA gefüllt (≈1.0× initial)
     else:
+        n_dca_filled = 0        # initial_size unbekannt — konservativ annehmen
+
+    n_expected_open = max(0, 2 - n_dca_filled)
+
+    if n_dca >= n_expected_open:
+        if n_dca > 0:
+            dca_info = " | ".join(
+                f"{o.get('price','?')} × {o.get('size','?')}" for o in existing_dcas[:n_expected_open]
+            )
+            log(f"  ✓ {n_dca} DCA-Orders vorhanden (erwartet {n_expected_open}, "
+                f"gefüllt {n_dca_filled}): {dca_info}")
+        else:
+            log(f"  ✓ {n_dca_filled}/2 DCAs gefüllt — keine offenen DCA-Orders erwartet")
+    elif n_dca_filled > 0:
+        # Teilweise gefüllt, aber n_dca < n_expected_open → unvollständige Situation
+        # Kein automatischer Fix (Sizing unklar), stattdessen Telegram-Warnung.
+        log(f"  ⚠ {n_dca}/{n_expected_open} DCA-Orders offen "
+            f"({n_dca_filled} gefüllt, {n_expected_open - n_dca} fehlen) — manuelle Prüfung empfohlen")
+        telegram(
+            f"⚠️ <b>DCA-Check — {symbol}</b>\n"
+            f"{n_dca_filled}/2 DCAs bereits gefüllt, nur {n_dca}/{n_expected_open} "
+            f"offene DCA-Orders gefunden.\n"
+            f"Bitte Situation manuell prüfen (kein Auto-Fix um falsches Sizing zu vermeiden)."
+        )
+    else:
+        # n_dca_filled == 0: keine DCAs gefüllt, aber zu wenige offen → normal reparieren
         log(f"  ⚠ Nur {n_dca}/2 DCA-Orders vorhanden → fehlende setzen")
         if sl_price == 0:
             log("  Kein SL-Preis bekannt — DCA-Platzierung übersprungen")
@@ -10799,7 +10849,8 @@ def check_and_repair_position(pos: dict):
                 f"Bitte DCA-Orders manuell platzieren."
             )
         else:
-            base_size  = size   # aktuelle Grösse = Initial-Order (kein DCA gefüllt)
+            # v4.51: initial_size als Basis nutzen (nicht inflated current size)
+            base_size  = _initial_size if _initial_size and _initial_size > 0 else size
             dca_result = place_dca_orders(
                 symbol, avg, sl_price, direction, base_size,
                 balance=get_futures_balance(), leverage=leverage
@@ -10876,13 +10927,14 @@ def report_position_startup(pos: dict):
     # Trade-Daten für Polling-Loop speichern
     _prev_td_p = trade_data.get(symbol, {})
     trade_data[symbol] = {
-        "entry":     avg,
-        "direction": direction,
-        "leverage":  leverage,
-        "sl":        0,   # nicht lesbar via API
-        "peak_size": size,
-        "open_ts":   int(time.time() * 1000),
-        "tp4":       _prev_td_p.get("tp4", 0),   # v4.16 — TP4 erhalten
+        "entry":        avg,
+        "direction":    direction,
+        "leverage":     leverage,
+        "sl":           0,   # nicht lesbar via API
+        "peak_size":    size,
+        "initial_size": _prev_td_p.get("initial_size", size),  # v4.51: erhalten wenn bekannt, sonst aktuelle Grösse
+        "open_ts":      int(time.time() * 1000),
+        "tp4":          _prev_td_p.get("tp4", 0),   # v4.16 — TP4 erhalten
     }
     # sl_at_entry nur zurücksetzen wenn trailing_sl_level NOCH NICHT gesetzt
     # (d.h. Script hat SL noch nie selbst gesetzt). Wenn trailing Level >= 1
