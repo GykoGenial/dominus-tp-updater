@@ -1,5 +1,5 @@
 """
-DOMINUS Trade-Automatisierung v4.51
+DOMINUS Trade-Automatisierung v4.52
 ══════════════════════════════════════════════════════════════
 Vollautomatisches Setup nach DOMINUS-Strategie (Handbuch März 2026)
 Finanzmathematische Optimierungen:
@@ -30,6 +30,20 @@ Changelog v4.46 — /pos Live-Position-Detail + position_events.csv Event-Log:
       (SL_ENTRY), set_sl_harsi (SL_HARSI), set_sl_sling (SL_SLING), place_dca_orders
       (DCA_PLACED per DCA1/DCA2). TRADE_CLOSE kann via csv_log_trade nachgerüstet werden.
   P3: /pos und position_events.csv in cmd_hilfe() und Dispatcher registriert.
+
+Changelog v4.52 — Option A: SL nach TP1 = avg statt Entry bei gefüllten DCAs:
+  A1: set_sl_at_entry() erhält neuen Parameter sl_label (str, Default "Entry").
+      Log, Telegram und position_events.csv spiegeln korrekt ob SL auf "Entry"
+      oder "Avg (0.xxxxx)" gesetzt wurde.
+  A2: Im Polling-Loop (TP1-Erkennung, Zeile ~11206) wird vor set_sl_at_entry()
+      geprüft wieviele DCAs bereits gefüllt wurden (via initial_size-Ratio,
+      identisch FIX14). Bei n_dca_filled ≥ 1: SL = cur_avg (echter Breakeven).
+      Bei 0 DCAs gefüllt: SL = original Entry (unverändertes Verhalten).
+  A3: Vorteil: Nach 2 DCAs (avg tief unter Entry) gibt TP1 der Restposition
+      genug Spielraum um TP2-4 zu erreichen. Worst case: TP1-Gewinn gesichert,
+      Rest schliesst bei avg = Breakeven. Kein negativer Trade möglich.
+  (Auslöser LDOUSDT 17.05: avg=0.3522 nach 2 DCAs, TP1=0.3544, SL-Entry=0.3541
+   → nur 0.0003 Puffer → SL sofort getriggert, Preis lief danach weiter hoch)
 
 Changelog v4.51 — FIX14: DCA-Duplikat-Bug bei /refresh nach DCA1-Fill:
   F1: check_and_repair_position() zählte offene DCAs (n_dca=1) und platzierte
@@ -2900,8 +2914,11 @@ def _get_pos_tp_price(symbol: str, direction: str) -> float:
 
 
 def set_sl_at_entry(symbol: str, direction: str, entry_price: float,
-                    cur_size: float = 0):
-    """SL auf Einstiegspreis setzen — DOMINUS-Regel nach TP1."""
+                    cur_size: float = 0, sl_label: str = "Entry"):
+    """SL auf Break-even setzen — DOMINUS-Regel nach TP1.
+    v4.52: sl_label gibt an ob SL auf "Entry" oder "Avg (x.xxxxx)" gesetzt wird.
+    Bei gefüllten DCAs wird entry_price = cur_avg (echter Breakeven) übergeben.
+    """
     decimals = get_price_decimals(symbol)
     sl_str   = round_price(entry_price, decimals)
 
@@ -2937,11 +2954,11 @@ def set_sl_at_entry(symbol: str, direction: str, entry_price: float,
     result = api_post("/api/v2/mix/order/place-pos-tpsl", body_sl)
 
     if result.get("code") == "00000":
-        log(f"  ✓ SL auf Entry gesetzt: {sl_str} USDT ({symbol})")
+        log(f"  ✓ SL auf {sl_label} gesetzt: {sl_str} USDT ({symbol})")
         _old_sl = get_sl_price(symbol, direction) if not sl_at_entry.get(symbol) else entry_price
         _log_pos_event(symbol, direction, "SL_ENTRY",
                        old_sl=f"{_old_sl:.5f}" if _old_sl else "",
-                       new_sl=sl_str, info="TP1 ausgelöst → SL auf Entry")
+                       new_sl=sl_str, info=f"TP1 ausgelöst → SL auf {sl_label}")
         sl_at_entry[symbol] = True
         save_state()
         cancel_open_dca_orders(symbol, direction)
@@ -2961,7 +2978,7 @@ def set_sl_at_entry(symbol: str, direction: str, entry_price: float,
         profit_str = f"+{tp1_profit:.2f} USDT" if tp1_profit > 0 else "—"
         telegram(
             f"🔒 <b>TP1 ausgelöst — {symbol}</b>\n"
-            f"SL → Entry @ {sl_str} USDT (Break-even gesichert)\n"
+            f"SL → {sl_label} @ {sl_str} USDT (Break-even gesichert)\n"
             f"━━━━━━━━━━\n"
             f"💰 Realisiert:      {profit_str}\n"
             f"📦 Restposition:    {size_str}\n"
@@ -11205,9 +11222,22 @@ def main():
 
                         if cur_size < _ref * 0.87 and not sl_at_entry.get(sym, False):
                             red = (_ref - cur_size) / _ref * 100
-                            log(f"TP1 erkannt ({sym}): peak={_ref:.2f} → jetzt={cur_size:.2f} (-{red:.0f}%) → SL auf Entry")
+                            # v4.52 Option A: SL nach TP1 = cur_avg wenn DCAs gefüllt (echter Breakeven),
+                            # sonst original Entry. _ref = peak_size (vor TP1), initial_size gespeichert
+                            # beim Trade-Open. Ratio ≥ 1.75 → mind. DCA1 gefüllt.
+                            _initial_s = _td.get("initial_size", 0)
+                            if _initial_s and _initial_s > 0:
+                                _dca_ratio = _ref / _initial_s
+                                _n_dca_tp1 = 2 if _dca_ratio >= 3.75 else (1 if _dca_ratio >= 1.75 else 0)
+                            else:
+                                _n_dca_tp1 = 0
+                            _sl_be    = cur_avg if _n_dca_tp1 >= 1 else _avg
+                            _sl_label = f"Avg ({cur_avg:.5f})" if _n_dca_tp1 >= 1 else "Entry"
+                            log(f"TP1 erkannt ({sym}): peak={_ref:.2f} → jetzt={cur_size:.2f} "
+                                f"(-{red:.0f}%) → SL auf {_sl_label} "
+                                f"({'%d DCA(s) gefüllt' % _n_dca_tp1 if _n_dca_tp1 else 'kein DCA'})")
                             trailing_sl_level[sym] = max(trailing_sl_level.get(sym, 0), 1)
-                            set_sl_at_entry(sym, _dir, _avg, cur_size=cur_size)
+                            set_sl_at_entry(sym, _dir, _sl_be, cur_size=cur_size, sl_label=_sl_label)
                             _size_changed = True
 
                         if cur_size < _ref * 0.69 and trailing_sl_level.get(sym, 0) < 2:
