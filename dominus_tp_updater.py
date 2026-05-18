@@ -1,5 +1,5 @@
 """
-DOMINUS Trade-Automatisierung v4.52
+DOMINUS Trade-Automatisierung v4.53
 ══════════════════════════════════════════════════════════════
 Vollautomatisches Setup nach DOMINUS-Strategie (Handbuch März 2026)
 Finanzmathematische Optimierungen:
@@ -44,6 +44,20 @@ Changelog v4.52 — Option A: SL nach TP1 = avg statt Entry bei gefüllten DCAs:
       Rest schliesst bei avg = Breakeven. Kein negativer Trade möglich.
   (Auslöser LDOUSDT 17.05: avg=0.3522 nach 2 DCAs, TP1=0.3544, SL-Entry=0.3541
    → nur 0.0003 Puffer → SL sofort getriggert, Preis lief danach weiter hoch)
+
+Changelog v4.53 — FIX15: initial_size-Verlust in check_and_repair_position():
+  F1: check_and_repair_position() überschrieb trade_data[symbol] ohne initial_size
+      zu erhalten. Resultat: jeder /refresh-Aufruf löschte initial_size aus dem
+      State → DCA-Fill-Erkennung (size/initial_size-Ratio) fiel auf Fallback 0
+      zurück → n_dca_filled=0 → DCA1 wurde trotz Fill neu platziert.
+      Bugauslöser: CRVUSDT 2026-05-18 — DCA1 gefüllt (qty 52→122, ratio=2.35),
+      /refresh 15:40 setzte DCA1 @ 0.2275 × 70 CRV erneut.
+  Fix: _prev_td.get("initial_size", 0) in trade_data[symbol]-Update ergänzt
+      (analog zu report_position_startup(), Zeile 10952, die initial_size korrekt
+      erhalten hat).
+
+Changelog v4.52 — OPT A: SL nach TP1 = cur_avg (Breakeven nach DCA):
+  A1: Wenn DCAs gefüllt → TP1-Auslösung → SL auf cur_avg statt original Entry.
 
 Changelog v4.51 — FIX14: DCA-Duplikat-Bug bei /refresh nach DCA1-Fill:
   F1: check_and_repair_position() zählte offene DCAs (n_dca=1) und platzierte
@@ -10750,6 +10764,7 @@ def check_and_repair_position(pos: dict):
         "open_ts":      _prev_ts,                                      # Öffnungszeit erhalten
         "tp_order_ids": _prev_td.get("tp_order_ids", []),
         "tp4":          _prev_tp4,                                     # v4.16 — TP4-Preis persistent
+        "initial_size": _prev_td.get("initial_size", 0),              # v4.53 FIX15: DCA-Fill-Ratio erhalten
     }
 
     # ── 2. TPs prüfen ─────────────────────────────────────────────────────
@@ -11004,7 +11019,7 @@ def main():
         log("In Railway → Variables eintragen.")
         return
 
-    log("DOMINUS Trade-Automatisierung v4.36 gestartet — mit finanzmathematischen Optimierungen")
+    log("DOMINUS Trade-Automatisierung v4.53 gestartet — mit finanzmathematischen Optimierungen")
     log(f"Intervall: {POLL_INTERVAL}s")
     log("Warte auf neue Trades...")
     log("─" * 55)
