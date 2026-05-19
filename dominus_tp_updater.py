@@ -1,5 +1,5 @@
 """
-DOMINUS Trade-Automatisierung v4.53
+DOMINUS Trade-Automatisierung v4.54
 ══════════════════════════════════════════════════════════════
 Vollautomatisches Setup nach DOMINUS-Strategie (Handbuch März 2026)
 Finanzmathematische Optimierungen:
@@ -44,6 +44,22 @@ Changelog v4.52 — Option A: SL nach TP1 = avg statt Entry bei gefüllten DCAs:
       Rest schliesst bei avg = Breakeven. Kein negativer Trade möglich.
   (Auslöser LDOUSDT 17.05: avg=0.3522 nach 2 DCAs, TP1=0.3544, SL-Entry=0.3541
    → nur 0.0003 Puffer → SL sofort getriggert, Preis lief danach weiter hoch)
+
+Changelog v4.54 — FIX16: TP4-vor-TP1-3 Reihenfolge + Auto-Repair nach Verifikationsfehler:
+  F1: place_tp_orders() platziert TP4 (place-pos-tpsl) jetzt VOR TP1-3.
+      Ursache: Bitget's place-pos-tpsl cancelt als Nebeneffekt alle bestehenden
+      profit_plan Orders (TP1-3). Bisherige Reihenfolge: TP1→TP2→TP3→TP4
+      resultierte darin, dass TP4 alle drei vorher gesetzten TPs löschte.
+      Bugauslöser: SPELLUSDT 2026-05-18 — Nachkauf → TP1-3 gesetzt, TP4 löschte
+      sie sofort → Telegram "✓ 4/4 TPs" aber auf Exchange 0 profit_plan aktiv.
+  F2: _update_tp_for_position_impl() wertet Rückgabewert von verify_tp_orders()
+      aus. Bei False → Auto-Repair: 5s warten, place_tp_orders() erneut aufrufen.
+      Telegram-Meldung nur nach erfolgreicher Verifikation (oder Auto-Repair).
+  F3: verify_tp_orders() Fehler-Telegram geändert von "manuell prüfen / /refresh"
+      zu "Auto-Repair wird in 5s gestartet..." (da jetzt automatisch repariert).
+  F4: "✓ Alle 4 TPs gesetzt" Telegram-Log erscheint erst nach verify_tp_orders()
+      Erfolg, nicht mehr direkt nach place_tp_orders() Rückgabe.
+  (Bugauslöser: SPELLUSDT 2026-05-18 Nachkauf — TPs nach DCA fehlend)
 
 Changelog v4.53 — FIX15: initial_size-Verlust in check_and_repair_position():
   F1: check_and_repair_position() überschrieb trade_data[symbol] ohne initial_size
@@ -2309,18 +2325,114 @@ def place_tp_orders(symbol: str, avg: float, size: float,
                     mark_price: float, known_sl: float = 0) -> tuple:
     """
     Setzt TP1–TP4 nach DOMINUS-Schema:
+      TP4 (40% ROI): Full Position Close         → place-pos-tpsl  ← ZUERST (FIX16 v4.54)
       TP1 (10% ROI): schliesst 15% der Position  → place-tpsl-order
       TP2 (20% ROI): schliesst 20% der Position  → place-tpsl-order
       TP3 (30% ROI): schliesst 25% der Position  → place-tpsl-order
-      TP4 (40% ROI): Full Position Close         → place-pos-tpsl
-                     Schliesst automatisch ALLES was noch offen ist.
-                     (DOMINUS: "letzte TP schliesst Trade automatisch")
+
+    FIX16 v4.54: TP4 (place-pos-tpsl) wird VOR TP1-3 gesetzt.
+    Ursache: Bitget's place-pos-tpsl cancelt alle bestehenden profit_plan Orders
+    als Nebeneffekt (beobachtet beim Nachkauf-TP-Update: TP1-3 platziert @11:21:29,
+    TP4 @11:21:32 → Verifikation @11:23:05 findet 0/3). Im Erstsetup existieren
+    keine profit_plan Orders wenn TP4 gesetzt wird → kein Problem dort.
+    Fix: TP4 zuerst → dann TP1-3 (keine bestehenden profit_plan zum Canceln).
     """
     decimals = get_price_decimals(symbol)
     count    = 0
     prices   = []
 
-    # ── TP1–TP3: Teilschliessungen ───────────────────────────────
+    # ── TP4: Full Position Close via place-pos-tpsl ── ZUERST (FIX16 v4.54) ──
+    # place-pos-tpsl cancelt bestehende profit_plan Orders auf Bitget.
+    # Daher TP4 VOR TP1-3 setzen — dann sind keine profit_plan Orders vorhanden.
+    tp4_raw = calc_tp_price(avg, TP4_ROI, direction, leverage)
+    tp4_str = round_price(tp4_raw, decimals)
+    tp4_val = float(tp4_str)
+
+    tp4_skip = (direction == "long"  and mark_price > 0 and tp4_val <= mark_price) or \
+               (direction == "short" and mark_price > 0 and tp4_val >= mark_price)
+
+    if tp4_skip:
+        log(f"    ⏭ TP4 (40%) @ {tp4_str} bereits überschritten — übersprungen")
+    else:
+        # Aktuellen SL-Preis lesen um ihn mitzuschicken.
+        current_sl = get_sl_price(symbol, direction)
+        if current_sl == 0 and known_sl > 0:
+            current_sl = known_sl
+            log(f"    SL aus Trade-Setup als Fallback: {current_sl}")
+        if current_sl == 0:
+            _trl = trailing_sl_level.get(symbol, 0)
+            _td  = trade_data.get(symbol, {})
+            _e   = float(_td.get("entry", 0))
+            _lev = int(_td.get("leverage", 10))
+            _dir = _td.get("direction", direction)
+            if _trl >= 3 and _e > 0:
+                current_sl = calc_tp_price(_e, TP2_ROI, _dir, _lev)
+                log(f"    SL aus Trailing Level 3 (TP2-Preis): {current_sl:.5f}")
+            elif _trl == 2 and _e > 0:
+                current_sl = calc_tp_price(_e, TP1_ROI, _dir, _lev)
+                log(f"    SL aus Trailing Level 2 (TP1-Preis): {current_sl:.5f}")
+            elif _trl == 1 and _e > 0:
+                current_sl = _e
+                log(f"    SL aus Trailing Level 1 (Entry): {current_sl:.5f}")
+        if current_sl == 0 and symbol in trade_data:
+            current_sl = trade_data[symbol].get("sl", 0)
+            if current_sl > 0:
+                log(f"    SL aus Trade-Daten als Fallback: {current_sl}")
+        if current_sl == 0:
+            log(f"    ⚠ Kein SL ermittelbar — TP4 wird ohne SL gesetzt")
+        sl_for_tp4 = round_price(current_sl, decimals) if current_sl > 0 else "0"
+
+        body4 = {
+            "symbol":                  symbol,
+            "productType":             PRODUCT_TYPE,
+            "marginCoin":              MARGIN_COIN,
+            "holdSide":                direction,
+            "stopSurplusTriggerPrice": tp4_str,
+            "stopSurplusTriggerType":  "mark_price",
+        }
+        if current_sl > 0:
+            body4["stopLossTriggerPrice"] = sl_for_tp4
+            body4["stopLossTriggerType"]  = "mark_price"
+            log(f"    TP4 kombiniert mit SL @ {sl_for_tp4}")
+
+        res4 = api_post("/api/v2/mix/order/place-pos-tpsl", body4)
+        if res4.get("code") == "00000":
+            log(f"    ✓ TP4 Full Close @ {tp4_str} USDT (schliesst gesamte Restposition)")
+            count += 1
+            prices.append(f"TP4 Full Close: {tp4_str}")
+            _td = trade_data.setdefault(symbol, {})
+            _td["tp4"] = float(tp4_str)
+            save_state()
+            cache_invalidate()
+        else:
+            msg4 = res4.get("msg", str(res4))
+            log(f"    ✗ TP4 FEHLER: {msg4}")
+            if "checkBDScale" in msg4 or "checkScale" in msg4:
+                new_dec   = max(1, decimals - 1)
+                price_decimals_cache[symbol] = new_dec
+                tp4_str2  = round_price(tp4_raw, new_dec)
+                body4b    = {
+                    "symbol":                  symbol,
+                    "productType":             PRODUCT_TYPE,
+                    "marginCoin":              MARGIN_COIN,
+                    "holdSide":                direction,
+                    "stopSurplusTriggerPrice": tp4_str2,
+                    "stopSurplusTriggerType":  "mark_price",
+                }
+                if current_sl > 0:
+                    body4b["stopLossTriggerPrice"] = sl_for_tp4
+                    body4b["stopLossTriggerType"]  = "mark_price"
+                res4b = api_post("/api/v2/mix/order/place-pos-tpsl", body4b)
+                if res4b.get("code") == "00000":
+                    log(f"    ✓ TP4 Full Close @ {tp4_str2} USDT [retry OK]")
+                    count += 1
+                    prices.append(f"TP4 Full Close: {tp4_str2}")
+                    _td = trade_data.setdefault(symbol, {})
+                    _td["tp4"] = float(tp4_str2)
+                    save_state()
+                    cache_invalidate()
+
+    # ── TP1–TP3: Teilschliessungen (nach TP4, FIX16 v4.54) ──────────────────
     partial_tps = [
         (TP1_ROI, "TP1 (10%)", TP_CLOSE_PCTS[0]),
         (TP2_ROI, "TP2 (20%)", TP_CLOSE_PCTS[1]),
@@ -2416,106 +2528,6 @@ def place_tp_orders(symbol: str, avg: float, size: float,
         )
         log(warn_msg)
         send_telegram(warn_msg)
-
-    # ── TP4: Full Position Close via place-pos-tpsl ──────────────
-    # WICHTIG: place-pos-tpsl verwaltet NUR EINEN kombinierten
-    # Eintrag pro Position. TP4 und SL MÜSSEN zusammen gesetzt werden,
-    # sonst überschreibt TP4 den bestehenden SL (oder umgekehrt).
-    tp4_raw = calc_tp_price(avg, TP4_ROI, direction, leverage)
-    tp4_str = round_price(tp4_raw, decimals)
-    tp4_val = float(tp4_str)
-
-    tp4_skip = (direction == "long"  and mark_price > 0 and tp4_val <= mark_price) or                (direction == "short" and mark_price > 0 and tp4_val >= mark_price)
-
-    if tp4_skip:
-        log(f"    ⏭ TP4 (40%) @ {tp4_str} bereits überschritten — übersprungen")
-    else:
-        # Aktuellen SL-Preis lesen um ihn mitzuschicken.
-        # Fallback-Kette: API → übergebener known_sl → Trailing-Level → trade_data (Original-SL)
-        current_sl = get_sl_price(symbol, direction)
-        if current_sl == 0 and known_sl > 0:
-            current_sl = known_sl
-            log(f"    SL aus Trade-Setup als Fallback: {current_sl}")
-        # Trailing-Level-Fallback: genauer als Original-SL aus trade_data
-        if current_sl == 0:
-            _trl = trailing_sl_level.get(symbol, 0)
-            _td  = trade_data.get(symbol, {})
-            _e   = float(_td.get("entry", 0))
-            _lev = int(_td.get("leverage", 10))
-            _dir = _td.get("direction", direction)
-            if _trl >= 3 and _e > 0:
-                current_sl = calc_tp_price(_e, TP2_ROI, _dir, _lev)
-                log(f"    SL aus Trailing Level 3 (TP2-Preis): {current_sl:.5f}")
-            elif _trl == 2 and _e > 0:
-                current_sl = calc_tp_price(_e, TP1_ROI, _dir, _lev)
-                log(f"    SL aus Trailing Level 2 (TP1-Preis): {current_sl:.5f}")
-            elif _trl == 1 and _e > 0:
-                current_sl = _e
-                log(f"    SL aus Trailing Level 1 (Entry): {current_sl:.5f}")
-        if current_sl == 0 and symbol in trade_data:
-            current_sl = trade_data[symbol].get("sl", 0)
-            if current_sl > 0:
-                log(f"    SL aus Trade-Daten als Fallback: {current_sl}")
-        if current_sl == 0:
-            log(f"    ⚠ Kein SL ermittelbar — TP4 wird ohne SL gesetzt "
-                f"(bestehender Bitget-SL bleibt erhalten wenn API das unterstützt)")
-        sl_for_tp4 = round_price(current_sl, decimals) if current_sl > 0 else "0"
-
-        body4 = {
-            "symbol":                 symbol,
-            "productType":            PRODUCT_TYPE,
-            "marginCoin":             MARGIN_COIN,
-            "holdSide":               direction,
-            "stopSurplusTriggerPrice": tp4_str,
-            "stopSurplusTriggerType":  "mark_price",
-        }
-        # SL mitschicken wenn vorhanden — verhindert Überschreiben
-        if current_sl > 0:
-            body4["stopLossTriggerPrice"] = sl_for_tp4
-            body4["stopLossTriggerType"]  = "mark_price"
-            log(f"    TP4 kombiniert mit SL @ {sl_for_tp4}")
-
-        res4 = api_post("/api/v2/mix/order/place-pos-tpsl", body4)
-        if res4.get("code") == "00000":
-            log(f"    ✓ TP4 Full Close @ {tp4_str} USDT "
-                f"(schliesst gesamte Restposition)")
-            count += 1
-            prices.append(f"TP4 Full Close: {tp4_str}")
-            # v4.16 — TP4-Preis im lokalen State speichern (Quelle 1 für
-            # _get_pos_tp_price). Garantiert, dass folgende SL-Updates den
-            # TP4 mitführen können, auch wenn Bitget-Read-API hängt.
-            _td = trade_data.setdefault(symbol, {})
-            _td["tp4"] = float(tp4_str)
-            save_state()
-            cache_invalidate()
-        else:
-            msg4 = res4.get("msg", str(res4))
-            log(f"    ✗ TP4 FEHLER: {msg4}")
-            if "checkBDScale" in msg4 or "checkScale" in msg4:
-                new_dec   = max(1, decimals - 1)
-                price_decimals_cache[symbol] = new_dec
-                tp4_str2  = round_price(tp4_raw, new_dec)
-                body4b    = {
-                    "symbol":                 symbol,
-                    "productType":            PRODUCT_TYPE,
-                    "marginCoin":             MARGIN_COIN,
-                    "holdSide":               direction,
-                    "stopSurplusTriggerPrice": tp4_str2,
-                    "stopSurplusTriggerType":  "mark_price",
-                }
-                if current_sl > 0:
-                    body4b["stopLossTriggerPrice"] = sl_for_tp4
-                    body4b["stopLossTriggerType"]  = "mark_price"
-                res4b = api_post("/api/v2/mix/order/place-pos-tpsl", body4b)
-                if res4b.get("code") == "00000":
-                    log(f"    ✓ TP4 Full Close @ {tp4_str2} USDT [retry OK]")
-                    count += 1
-                    prices.append(f"TP4 Full Close: {tp4_str2}")
-                    # v4.16 — auch im Retry-Pfad State speichern
-                    _td = trade_data.setdefault(symbol, {})
-                    _td["tp4"] = float(tp4_str2)
-                    save_state()
-                    cache_invalidate()
 
     return count, prices
 
@@ -4363,7 +4375,7 @@ def verify_tp_orders(symbol: str, expected_count: int,
         active = 0
     msg = (f"⚠️ <b>TP-Verifikation fehlgeschlagen — {symbol}</b>\n"
            f"Erwartet: {expected_count} profit_plan | Aktiv: {active}\n"
-           f"Bitte manuell prüfen oder /refresh senden!")
+           f"FIX16: Auto-Repair wird in 5s gestartet...")
     log(msg.replace("<b>", "").replace("</b>", ""))
     telegram(msg)
     return False
@@ -4454,9 +4466,27 @@ def _update_tp_for_position_impl(pos: dict, reason: str):
     # count enthält alle platzierten TPs inkl. TP4 (pos_profit). Die Verifikation
     # zählt nur profit_plan Orders (TP1/2/3), daher expected = count - 1 (ohne TP4).
     # cancelled_count steuert die Wartezeit: 0s → 5s, >0 → 90s (Bitget Blackout).
+    # FIX16 v4.54: verify_tp_orders() Rückgabe auswerten → Auto-Repair bei False.
+    _verify_ok = True
     if count > 0:
         _pp_expected = max(0, count - 1)  # TP4 (pos_profit) nicht mitzählen
-        verify_tp_orders(symbol, _pp_expected, cancelled_count=len(_old_tp_ids))
+        _verify_ok = verify_tp_orders(symbol, _pp_expected, cancelled_count=len(_old_tp_ids))
+        if not _verify_ok:
+            log(f"  FIX16: Auto-Repair — TPs nach Verifikationsfehler neu setzen (5s Wartezeit)...")
+            time.sleep(5)
+            count, prices = place_tp_orders(
+                symbol, avg, total, direction, leverage, mark, known_sl=known_sl
+            )
+            if count > 0:
+                log(f"  ✓ FIX16 Auto-Repair: {count}/4 TPs neu gesetzt")
+                _verify_ok = True
+            else:
+                log(f"  ✗ FIX16 Auto-Repair fehlgeschlagen — /refresh empfohlen")
+                telegram(
+                    f"❌ <b>Auto-Repair fehlgeschlagen — {symbol}</b>\n"
+                    f"TPs konnten nach Verifikationsfehler nicht neu gesetzt werden.\n"
+                    f"Bitte /refresh senden oder manuell prüfen!"
+                )
 
     # FIX 5 v4.36: Funding Rate Warnung
     try:
@@ -4490,9 +4520,10 @@ def _update_tp_for_position_impl(pos: dict, reason: str):
         last_known_size[symbol] = total
         return
 
-    if count > 0:
+    if count > 0 and _verify_ok:
+        # FIX16 v4.54: Telegram-Bestätigung erst nach erfolgreicher Verifikation
         status = "✓ Alle 4" if count == 4 else f"⚠ {count}/4"
-        log(f"  {status} TPs für {symbol} gesetzt.")
+        log(f"  {status} TPs für {symbol} gesetzt und verifiziert.")
         sl_info = f"{known_sl} USDT" if known_sl > 0 else "nicht ermittelbar"
         telegram(
             f"♻️ {dir_icon(direction)} <b>TPs nach DCA — {symbol}</b>\n"
@@ -4502,7 +4533,7 @@ def _update_tp_for_position_impl(pos: dict, reason: str):
             f"Grund: {reason}\n\n"
             + "\n".join(prices)
         )
-    else:
+    elif count == 0:
         log(f"  ✗ Keine TPs gesetzt (Position evtl. im Ziel).")
 
     last_known_avg[symbol]  = avg
@@ -11019,7 +11050,7 @@ def main():
         log("In Railway → Variables eintragen.")
         return
 
-    log("DOMINUS Trade-Automatisierung v4.53 gestartet — mit finanzmathematischen Optimierungen")
+    log("DOMINUS Trade-Automatisierung v4.54 gestartet — mit finanzmathematischen Optimierungen")
     log(f"Intervall: {POLL_INTERVAL}s")
     log("Warte auf neue Trades...")
     log("─" * 55)
