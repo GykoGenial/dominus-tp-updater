@@ -1,5 +1,5 @@
 """
-DOMINUS Trade-Automatisierung v4.54
+DOMINUS Trade-Automatisierung v4.55
 ══════════════════════════════════════════════════════════════
 Vollautomatisches Setup nach DOMINUS-Strategie (Handbuch März 2026)
 Finanzmathematische Optimierungen:
@@ -44,6 +44,28 @@ Changelog v4.52 — Option A: SL nach TP1 = avg statt Entry bei gefüllten DCAs:
       Rest schliesst bei avg = Breakeven. Kein negativer Trade möglich.
   (Auslöser LDOUSDT 17.05: avg=0.3522 nach 2 DCAs, TP1=0.3544, SL-Entry=0.3541
    → nur 0.0003 Puffer → SL sofort getriggert, Preis lief danach weiter hoch)
+
+Changelog v4.55 — Neue SL-Trailing-Strategie + LIQ-Aware SL-Positionierung:
+  S1: TP2 zieht SL NICHT mehr auf TP1-Preis. Stattdessen wird nur das interne
+      trailing_sl_level=2 gesetzt, der SL bleibt auf Entry/Avg. Begründung:
+      natürlicher Pullback nach TP2 liegt oft genau auf TP1-Preis (Liquiditäts-
+      Pool), statischer SL dort wurde sofort getriggert (LSKUSDT/AGLDUSDT 22.05.).
+  S2: TP3 setzt SL auf max(TP1-Preis, letzter Sling-Pivot) — nimmt automatisch
+      den schützenderern der beiden Werte. Bei Long: höher = schützender.
+      Bei Short: tiefer = schützender. Sling läuft ab TP3 schon lange mit und
+      hat oft bereits einen günstigeren Pivot geliefert.
+  S3: Sling-SL Option-B-Cutoff entfernt. Bisher wurden SLING_SL-Signale ab
+      trailing_sl_level >= 2 komplett ignoriert ("HARSI übernimmt Trail ab TP2").
+      Neu: Sling läuft durchgehend aktiv (protective-only), kein harter Cut-off.
+  S4: liq_pool_cache — globales Dict {symbol: {price, tp, ts}} speichert den
+      zuletzt empfangenen LIQ_WARNING Pool-Preis pro Symbol (max. 4h gültig).
+  S5: _liq_aware_sl(symbol, direction, sl_candidate) — prüft ob der geplante
+      SL-Preis innerhalb LIQ_SL_PROXIMITY_PCT (Default 0.5%) eines bekannten
+      Liquiditäts-Pools liegt. Falls ja: SL um SLING_LIQ_BUFFER_PCT (Default 0.3%)
+      vom Pool weggeschoben (ausserhalb der Hunt-Zone).
+  (Auslöser: LSKUSDT/AGLDUSDT 22.05.2026 — SL nach TP2 auf TP1-Preis = genau
+   im LIQ-Pool → sofort getriggert durch Stop-Hunt. Strategiediskussion mit
+   Verweis auf Dominus Handbuch und finanzmathematische R:R-Analyse.)
 
 Changelog v4.54 — FIX16: TP4-vor-TP1-3 Reihenfolge + Auto-Repair nach Verifikationsfehler:
   F1: place_tp_orders() platziert TP4 (place-pos-tpsl) jetzt VOR TP1-3.
@@ -779,9 +801,10 @@ WAS PASSIERT AUTOMATISCH:
                          → TP1–TP4 (15/20/25/40% + Rest)
                          → Telegram-Vollbericht
   2. Nachkauf erkannt   → Alle TPs neu berechnet
-  3. TP1 ausgelöst      → SL auf Entry gezogen
-     TP2 ausgelöst      → Trailing SL auf TP1-Preis
-     TP3 ausgelöst      → Trailing SL auf TP2-Preis
+  3. TP1 ausgelöst      → SL auf Entry/Avg gezogen
+     TP2 ausgelöst      → Level 2 markiert, SL bleibt Entry/Avg (v4.55)
+     TP3 ausgelöst      → SL auf max(TP1-Preis, letzter Sling-Pivot), LIQ-aware (v4.55)
+     Sling-SL           → durchgehend aktiv, protective-only (v4.55)
 
 WAS DU TUN MUSST:
   - Market Order auf Bitget platzieren (Long/Short)
@@ -1104,6 +1127,10 @@ harsi_sl: dict = {}
 # v4.12: Sling-SL (Swing-Pivot-basiert) — letzter gesetzter Sling-SL pro Symbol
 # {symbol: float}  — Short: Sling-High  |  Long: Sling-Low
 sling_sl: dict = {}
+
+# v4.55: LIQ-Pool-Cache — letzter empfangener Liquiditäts-Pool pro Symbol
+# {symbol: {"price": float, "tp": int, "ts": float}}  (max. 4h gültig)
+liq_pool_cache: dict = {}
 
 # v4.12: DCA Auto-Void — markiert welche DCAs nach SL-Nachzug bereits
 # storniert wurden, damit sie nicht erneut zu stornieren versucht werden.
@@ -3026,12 +3053,47 @@ def _get_pos_sl_price(symbol: str, direction: str) -> float:
     return get_sl_price(symbol, direction)
 
 
+def _liq_aware_sl(symbol: str, direction: str, sl_candidate: float) -> float:
+    """
+    v4.55: Verschiebt den SL-Kandidaten ausserhalb eines bekannten LIQ-Pools,
+    falls der geplante SL innerhalb LIQ_SL_PROXIMITY_PCT (Default 0.5%) liegt.
+      Long:  Pool unter Mark → SL = pool * (1 - buffer)  (weiter unten, mehr Luft)
+      Short: Pool über Mark  → SL = pool * (1 + buffer)  (weiter oben, mehr Luft)
+    Nutzt liq_pool_cache (max. 4h gültig) und SLING_LIQ_BUFFER_PCT (Default 0.3%).
+    """
+    cache = liq_pool_cache.get(symbol)
+    if not cache:
+        return sl_candidate
+    pool_price = float(cache.get("price", 0))
+    pool_ts    = float(cache.get("ts", 0))
+    if pool_price <= 0:
+        return sl_candidate
+    # Cache älter als 4 Stunden → ignorieren
+    if time.time() - pool_ts > 14400:
+        log(f"  LIQ-Aware SL: Cache für {symbol} abgelaufen — kein Adjustment")
+        return sl_candidate
+    # Prüfen ob SL-Kandidat nahe am Pool (innerhalb LIQ_SL_PROXIMITY_PCT)
+    proximity_pct = float(os.environ.get("LIQ_SL_PROXIMITY_PCT", "0.5")) / 100
+    if abs(sl_candidate - pool_price) / max(pool_price, 1e-12) > proximity_pct:
+        return sl_candidate  # Pool zu weit weg — kein Adjustment nötig
+    buffer_pct = float(os.environ.get("SLING_LIQ_BUFFER_PCT", "0.3")) / 100
+    if direction == "long":
+        adjusted = pool_price * (1.0 - buffer_pct)
+        log(f"  ⚠ LIQ-Aware SL [{symbol} LONG]: Pool @ {pool_price:.6f} "
+            f"→ SL {sl_candidate:.6f} → {adjusted:.6f} (-{buffer_pct*100:.2f}% Buffer)")
+    else:
+        adjusted = pool_price * (1.0 + buffer_pct)
+        log(f"  ⚠ LIQ-Aware SL [{symbol} SHORT]: Pool @ {pool_price:.6f} "
+            f"→ SL {sl_candidate:.6f} → {adjusted:.6f} (+{buffer_pct*100:.2f}% Buffer)")
+    return adjusted
+
+
 def set_sl_trailing(symbol: str, direction: str, sl_price: float, level: int,
                     cur_size: float = 0):
     """
-    TP-Step Trailing: SL auf den vorherigen TP-Preis nachziehen.
-    TP2 ausgelöst → SL auf TP1-Preis  (level=2)
-    TP3 ausgelöst → SL auf TP2-Preis  (level=3)
+    TP-Step Trailing: SL auf den schützendersten Wert nachziehen.
+    v4.55: Nur noch level=3 (TP3 ausgelöst → SL auf max(TP1-Preis, Sling-Pivot)).
+    level=2 wird nicht mehr aufgerufen — TP2 markiert Level ohne SL-Verschiebung.
     """
     if trailing_sl_level.get(symbol, 0) >= level:
         log(f"  Trailing Level {level} bereits gesetzt — skip")
@@ -3072,8 +3134,8 @@ def set_sl_trailing(symbol: str, direction: str, sl_price: float, level: int,
         body_sl["stopSurplusTriggerType"]  = "mark_price"
         log(f"  TP4 @ {existing_tp4} wird mitgeführt")
 
-    tp_label   = {2: "TP2", 3: "TP3"}.get(level, "?")
-    prev_label = {2: "TP1 (10% ROI)", 3: "TP2 (20% ROI)"}.get(level, "?")
+    tp_label   = {3: "TP3", 4: "TP4"}.get(level, f"TP{level}")
+    prev_label = {3: "TP1 (10% ROI)", 4: "TP2 (20% ROI)"}.get(level, "vorherigem TP")
 
     result = api_post("/api/v2/mix/order/place-pos-tpsl", body_sl)
     if result.get("code") == "00000":
@@ -9565,15 +9627,10 @@ def start_webhook_server():
                 _track_watchlist_drop("keine matching Position", symbol, "SLING_SL", direction)
                 return  # ignored: no matching position
 
-            # v4.49 Option B: Ab TP2 (trailing_sl_level >= 2) übernimmt HARSI
-            # den Trail — Sling-Updates werden ignoriert um dem Trade mehr
-            # Spielraum bei grösseren Candles/Volatilität zu geben.
-            _tp_level = trailing_sl_level.get(symbol, 0)
-            if _tp_level >= 2:
-                log(f"  ⏭ SLING_SL {symbol} ignoriert — TP{_tp_level} erreicht, "
-                    f"HARSI übernimmt Trail ab TP2 (Option B)")
-                return  # ignored: HARSI takes over after TP2
-
+            # v4.55: Sling läuft durchgehend aktiv (Option-B-Cutoff entfernt).
+            # Bisher: ab trailing_sl_level >= 2 komplett ignoriert ("Option B").
+            # Neu: Sling protective-only durch alle TP-Levels hindurch.
+            # HARSI und Sling ergänzen sich — kein harter Cutoff mehr.
             set_sl_sling(symbol, direction, pivot_price,
                          cur_size=cur_size, atr_val=atr_raw)
             cache_invalidate("all_positions")
@@ -9724,6 +9781,14 @@ def start_webhook_server():
             unrealised = float(pos.get("unrealizedPL", 0) or 0)
 
             log(f"  LIQ_WARNING: {symbol} {d_txt} Pool bei TP{liq_tp} — offene Position!")
+            # v4.55: Pool-Preis für LIQ-Aware SL cachen (max. 4h gültig)
+            if liq_pool > 0:
+                liq_pool_cache[symbol] = {
+                    "price": liq_pool,
+                    "tp":    liq_tp,
+                    "ts":    time.time(),
+                }
+                log(f"  LIQ-Cache: {symbol} Pool @ {liq_pool:.6f} (TP{liq_tp}) gespeichert")
             telegram(
                 f"{tp_emoji} <b>Liquidity Warning \u2014 {symbol}</b>\n"
                 f"Richtung: {d_txt}  \u00b7  Avg: {avg_px:.5f}\n"
@@ -11050,7 +11115,7 @@ def main():
         log("In Railway → Variables eintragen.")
         return
 
-    log("DOMINUS Trade-Automatisierung v4.54 gestartet — mit finanzmathematischen Optimierungen")
+    log("DOMINUS Trade-Automatisierung v4.55 gestartet — mit finanzmathematischen Optimierungen")
     log(f"Intervall: {POLL_INTERVAL}s")
     log("Warte auf neue Trades...")
     log("─" * 55)
@@ -11288,16 +11353,51 @@ def main():
 
                         if cur_size < _ref * 0.69 and trailing_sl_level.get(sym, 0) < 2:
                             red = (_ref - cur_size) / _ref * 100
-                            tp1_price = calc_tp_price(_avg, TP1_ROI, _dir, _lev)
-                            log(f"TP2 erkannt ({sym}): peak={_ref:.2f} → jetzt={cur_size:.2f} (-{red:.0f}%) → Trailing SL auf TP1 @ {tp1_price:.5f}")
-                            set_sl_trailing(sym, _dir, tp1_price, level=2, cur_size=cur_size)
+                            # v4.55: SL NICHT auf TP1-Preis ziehen — nur Level markieren.
+                            # TP1-Preis liegt oft im LIQ-Pool → sofortiger Stop-Hunt.
+                            # SL bleibt auf Entry/Avg. Sling + HARSI laufen weiter.
+                            trailing_sl_level[sym] = max(trailing_sl_level.get(sym, 0), 2)
+                            save_state()
+                            log(f"TP2 erkannt ({sym}): peak={_ref:.2f} → jetzt={cur_size:.2f} "
+                                f"(-{red:.0f}%) → Level 2 markiert, SL bleibt Entry/Avg (v4.55)")
+                            _td2  = trade_data.get(sym, {})
+                            _base2 = get_base_coin(sym)
+                            _qty_d2 = get_qty_decimals(sym)
+                            _sl_now = get_sl_price(sym, _dir)
+                            _sl_str = f"{_sl_now:.6f} USDT" if _sl_now > 0 else "Entry/Avg (unbewegt)"
+                            telegram(
+                                f"📈 <b>TP2 ausgelöst — {sym}</b>\n"
+                                f"SL bleibt bei {_sl_str}\n"
+                                f"━━━━━━━━━━\n"
+                                f"📦 Restposition: {cur_size:.{_qty_d2}f} {_base2}\n"
+                                f"🔄 Sling + HARSI aktiv — SL folgt Marktstruktur"
+                            )
                             _size_changed = True
 
                         if cur_size < _ref * 0.42 and trailing_sl_level.get(sym, 0) < 3:
                             red = (_ref - cur_size) / _ref * 100
-                            tp2_price = calc_tp_price(_avg, TP2_ROI, _dir, _lev)
-                            log(f"TP3 erkannt ({sym}): peak={_ref:.2f} → jetzt={cur_size:.2f} (-{red:.0f}%) → Trailing SL auf TP2 @ {tp2_price:.5f}")
-                            set_sl_trailing(sym, _dir, tp2_price, level=3, cur_size=cur_size)
+                            # v4.55: SL auf max(TP1-Preis, letzter Sling-Pivot) + LIQ-aware.
+                            # Sling läuft seit Trade-Open mit und hat oft schon einen
+                            # günstigeren Pivot als TP1-Preis gesetzt.
+                            tp1_price_t3  = calc_tp_price(_avg, TP1_ROI, _dir, _lev)
+                            sling_pivot   = sling_sl.get(sym, 0)
+                            if sling_pivot > 0:
+                                # Schützenderer Wert: Long→ höher, Short→ tiefer
+                                if _dir == "long":
+                                    sl_t3 = max(tp1_price_t3, sling_pivot)
+                                    _src  = "Sling" if sling_pivot > tp1_price_t3 else "TP1"
+                                else:
+                                    sl_t3 = min(tp1_price_t3, sling_pivot)
+                                    _src  = "Sling" if sling_pivot < tp1_price_t3 else "TP1"
+                            else:
+                                sl_t3 = tp1_price_t3
+                                _src  = "TP1"
+                            # LIQ-Aware: SL ausserhalb bekannter Pool-Zone verschieben
+                            sl_t3_adj = _liq_aware_sl(sym, _dir, sl_t3)
+                            _liq_note = f" (LIQ-Adj: {sl_t3_adj:.6f})" if sl_t3_adj != sl_t3 else ""
+                            log(f"TP3 erkannt ({sym}): peak={_ref:.2f} → jetzt={cur_size:.2f} "
+                                f"(-{red:.0f}%) → SL auf {_src}-Basis @ {sl_t3:.5f}{_liq_note} (v4.55)")
+                            set_sl_trailing(sym, _dir, sl_t3_adj, level=3, cur_size=cur_size)
                             _size_changed = True
 
                         if _size_changed or cur_size != kno_size:
