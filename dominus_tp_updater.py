@@ -1,5 +1,5 @@
 """
-DOMINUS Trade-Automatisierung v4.55
+DOMINUS Trade-Automatisierung v4.57
 ══════════════════════════════════════════════════════════════
 Vollautomatisches Setup nach DOMINUS-Strategie (Handbuch März 2026)
 Finanzmathematische Optimierungen:
@@ -15,6 +15,64 @@ Finanzmathematische Optimierungen:
   ⑩ Klick-UX          — Button-Driven Rangliste mit adaptivem Keyboard (v4.25)
   ⑪ One-Click-Exec    — 🚀 Trade jetzt Button mit Two-Tap-Confirm (v4.28)
   ⑫ Inline-Berechnung — 🚀 1. Tap zeigt volle /trade-Vorschau (v4.35.1)
+
+Changelog v4.57 — Bybit-Integration + Quarter-Kelly + Drawdown-Circuit-Breaker:
+  B1: Bybit V5 API — paralleler Exchange-Adapter (exchange_bybit_*) neben Bitget.
+      Eigene Auth (HMAC-SHA256 Hex, X-BAPI-* Headers), bybit_get/bybit_post mit
+      Retry. Bybit-Precision via /v5/market/instruments-info (qtyStep, tickSize).
+      Bybit Balance via /v5/account/wallet-balance (Unified-Account), Positions
+      via /v5/position/list, normalisiert auf Bitget-kompatibles Dict-Format.
+  B2: Symbol-Routing via get_symbol_exchange(symbol) — liest aus master_watchlist.txt
+      (BYBIT:-Prefix) und aus trade_data[symbol]["exchange"]. Default: "BITGET".
+      MASTER_WATCHLIST_FILE env var (default /app/data/master_watchlist.txt).
+  B3: execute_trade_order() ist jetzt exchange-aware — routing zu
+      _execute_trade_bybit() wenn symbol → BYBIT. Bybit: Hebel via
+      /v5/position/set-leverage, Order via /v5/order/create (reduceOnly=false),
+      SL via /v5/position/trading-stop.
+  B4: set_sl_at_entry/set_sl_harsi/set_sl_sling/set_sl_trailing sind exchange-aware
+      — bei BYBIT Symbolen wird /v5/position/trading-stop verwendet.
+  B5: place_tp_orders() + place_dca_orders() + cancel_all_tp_orders() +
+      cancel_open_dca_orders() sind exchange-aware.
+  B6: get_all_positions() gibt kombinierte Bitget + Bybit Positionen zurück.
+      Bybit-Positionen erhalten Feld _exchange="BYBIT" für Downstream-Routing.
+  B7: Telegram-Prefix 🔵 BITGET / 🟣 BYBIT — telegram() akzeptiert exchange=
+      Parameter. tv_chart_links() ist exchange-aware.
+  B8: Quarter-Kelly — KELLY_FRACTION env var (default 0.25). execute_trade_order
+      multipliziert half_kelly_usdt mit KELLY_FRACTION.
+  B9: Drawdown-Circuit-Breaker — DAILY_DD_LIMIT_PCT (default 10) und
+      WEEKLY_DD_LIMIT_PCT (default 20). Bei Überschreitung → AUTO_TRADE_ENABLED=False
+      + Telegram-Alert. /risk_reset Telegram-Befehl zum manuellen Reset.
+  B10: MAX_AUTO_TRADE_USDT_BYBIT env var — separater Hard-Cap für Bybit-Trades.
+  B11: Neue Railway-Variablen: BYBIT_API_KEY, BYBIT_SECRET_KEY,
+       MASTER_WATCHLIST_FILE, KELLY_FRACTION, DAILY_DD_LIMIT_PCT,
+       WEEKLY_DD_LIMIT_PCT, MAX_AUTO_TRADE_USDT_BYBIT.
+
+Changelog v4.56 — Coin-Silence-Detection: Stumme Coins automatisch erkennen:
+  CS1: Coin-Silence-Tracking — _coin_signal_ts-Dict (Symbol → Unix-Timestamp)
+       hält den Zeitpunkt des letzten eingehenden Signals pro Coin. Wird beim
+       Start aus COIN_SILENCE_FILE (/app/data/coin_signal_ts.json) geladen und
+       nach jedem empfangenen H2_SIGNAL/HARSI_EXIT/HARSI_SL/SLING_SL aktualisiert
+       (periodisch persistiert, nicht bei jedem einzelnen Signal). Hintergrund:
+       wenn TV für ein Symbol den Indikator nicht berechnen kann (wie bei dem
+       XLMUSDT.P-Fall — Warnsymbol im Alert), sendet TV keinerlei Webhooks mehr
+       für dieses Symbol. Das fällt ohne Tracking nicht auf.
+  CS2: _get_monitor_known_coins() liest die known_coins-Basiswährungen aus dem
+       Channel-Monitor-State (MONITOR_STATE_FILE, default /app/data/monitor_state.json)
+       und normalisiert sie zu USDT-Symbolen (BTC → BTCUSDT). So weiss der
+       TP-Updater, welche Coins überhaupt Signale liefern sollten, ohne selbst
+       eine eigene Watchlist zu führen.
+  CS3: _check_coin_silence() generiert einen Telegram-Report in drei Kategorien:
+       🚨 >COIN_SILENCE_ALERT_DAYS (default 30d) kein Signal
+       ⚠️  >COIN_SILENCE_WARN_DAYS (default 14d) kein Signal
+       ❓  Noch nie ein Signal seit Tracking-Start (verdächtigste Gruppe)
+       Der Report erscheint täglich um COIN_SILENCE_CHECK_HOUR (default 9 UTC) im
+       Polling-Loop, analog zu daily_report. Nur gesendet wenn mind. 1 Coin auffällig.
+  CS4: Neue Env-Variablen:
+       COIN_SILENCE_FILE       — Pfad zur Persistence (default /app/data/coin_signal_ts.json)
+       MONITOR_STATE_FILE      — Pfad zum Channel-Monitor State (default /app/data/dominus_watchlist.json)
+       COIN_SILENCE_WARN_DAYS  — Warnschwelle in Tagen (default 14)
+       COIN_SILENCE_ALERT_DAYS — Alarmsschwelle in Tagen (default 30)
+       COIN_SILENCE_CHECK_HOUR — Stunde des täglichen Checks in UTC (default 9)
 
 Changelog v4.46 — /pos Live-Position-Detail + position_events.csv Event-Log:
   P1: cmd_pos(SYMBOL) — /pos TRXUSDT zeigt vollständige Live-Ansicht einer offenen
@@ -898,6 +956,9 @@ GOOGLE_SHEET_ID    = os.environ.get("GOOGLE_SHEET_ID",    "")  # Spreadsheet ID 
 TRADES_CSV         = os.environ.get("TRADES_CSV", "/app/data/trades.csv")  # Persistentes Trade-Archiv auf Railway Volume
 ENTRY_LOG_CSV      = os.environ.get("ENTRY_LOG_CSV", "/app/data/entry_queue_log.csv")  # Queue-Entscheidungen + Outcomes (v4.20)
 POSITION_EVENTS_CSV = os.environ.get("POSITION_EVENTS_CSV", "/app/data/position_events.csv")  # v4.46: SL/DCA/TP Event-History
+# v4.56: Coin-Silence-Detection
+COIN_SILENCE_FILE   = os.environ.get("COIN_SILENCE_FILE",   "/app/data/coin_signal_ts.json")
+MONITOR_STATE_FILE  = os.environ.get("MONITOR_STATE_FILE",  "/app/data/dominus_watchlist.json")  # gleicher Default wie Channel-Monitor
 
 
 # v4.13: Robuste Env-Parser — Railway-Variablen können "" statt fehlend sein,
@@ -999,6 +1060,17 @@ _raw_at = os.environ.get("AUTO_TRADE_ENABLED", "0").strip().lower()
 AUTO_TRADE_ENABLED        = _raw_at in ("1", "true", "yes", "on")
 AUTO_TRADE_CONFIRM_TTL_SEC = _env_int("AUTO_TRADE_CONFIRM_TTL_SEC", 10)
 MAX_AUTO_TRADE_USDT       = _env_float("MAX_AUTO_TRADE_USDT", 0.0)
+BYBIT_API_KEY             = os.environ.get("BYBIT_API_KEY", "")
+BYBIT_SECRET_KEY          = os.environ.get("BYBIT_SECRET_KEY", "")
+MAX_AUTO_TRADE_USDT_BYBIT = _env_float("MAX_AUTO_TRADE_USDT_BYBIT", 0.0)
+# v4.57: Quarter-Kelly — reduziert Positionsgrösse, senkt Drawdown
+KELLY_FRACTION            = _env_float("KELLY_FRACTION", 0.25)
+# v4.57: Drawdown-Circuit-Breaker — setzt AUTO_TRADE_ENABLED=False bei -x% Tag/Woche
+DAILY_DD_LIMIT_PCT        = _env_float("DAILY_DD_LIMIT_PCT",  10.0)
+WEEKLY_DD_LIMIT_PCT       = _env_float("WEEKLY_DD_LIMIT_PCT", 20.0)
+# v4.57: Pfad zur master_watchlist.txt für Exchange-Routing
+MASTER_WATCHLIST_FILE     = os.environ.get("MASTER_WATCHLIST_FILE", "/app/data/master_watchlist.txt")
+
 
 # Mindest-Score fuer automatische Ausfuehrung (MIN_AUTO_TRADE_SCORE).
 # Trades unterhalb dieser Schwelle werden nicht ausgefuehrt — Telegram zeigt
@@ -1040,6 +1112,170 @@ WATCHLIST_DROP_VERBOSE          = _raw_wdv in ("1", "true", "yes", "on")
 WATCHLIST_DROP_SUMMARY_EVERY_N  = _env_int("WATCHLIST_DROP_SUMMARY_EVERY_N", 50)
 _watchlist_drop_counter = {"count": 0}
 
+# ── v4.56: Coin-Silence-Detection ────────────────────────────────────────────
+# Schwellwerte (via Env konfigurierbar)
+COIN_SILENCE_WARN_DAYS  = _env_int("COIN_SILENCE_WARN_DAYS",  14)   # ⚠️ Warnung
+COIN_SILENCE_ALERT_DAYS = _env_int("COIN_SILENCE_ALERT_DAYS", 30)   # 🚨 Alarm
+COIN_SILENCE_CHECK_HOUR = _env_int("COIN_SILENCE_CHECK_HOUR",  9)   # UTC-Stunde täglicher Check
+
+# In-Memory Dict: Symbol (z.B. "BTCUSDT") → Unix-Timestamp letztes Signal
+_coin_signal_ts: dict = {}
+# Zähler für periodisches Speichern (alle COIN_SILENCE_SAVE_EVERY Signale)
+_coin_signal_save_counter = 0
+COIN_SILENCE_SAVE_EVERY   = 20   # nach je 20 Signalen auf Disk schreiben
+
+# Tagesmarke: verhindert mehrfache Reports am gleichen Tag
+_coin_silence_sent_date: str = ""
+
+
+def _load_coin_signal_ts() -> None:
+    """Lädt den letzten Signal-Timestamp pro Coin vom Railway-Volume."""
+    global _coin_signal_ts
+    try:
+        with open(COIN_SILENCE_FILE) as f:
+            _coin_signal_ts = json.load(f)
+        log(f"[Silence] {len(_coin_signal_ts)} Coin-Timestamps geladen "
+            f"aus {COIN_SILENCE_FILE}")
+    except FileNotFoundError:
+        _coin_signal_ts = {}
+        log(f"[Silence] Kein vorhandenes Coin-Timestamp-File — starte frisch")
+    except Exception as e:
+        _coin_signal_ts = {}
+        log(f"[Silence] Laden fehlgeschlagen ({e}) — starte frisch")
+
+
+def _save_coin_signal_ts() -> None:
+    """Persistiert den Signal-Timestamp-Dict auf das Railway-Volume."""
+    try:
+        with open(COIN_SILENCE_FILE, "w") as f:
+            json.dump(_coin_signal_ts, f, indent=2)
+    except Exception as e:
+        log(f"[Silence] Speichern fehlgeschlagen: {e}")
+
+
+def _update_coin_signal_ts(symbol: str) -> None:
+    """Aktualisiert letzten Signal-Timestamp für symbol; periodisches Speichern."""
+    global _coin_signal_save_counter
+    _coin_signal_ts[symbol] = time.time()
+    _coin_signal_save_counter += 1
+    if _coin_signal_save_counter % COIN_SILENCE_SAVE_EVERY == 0:
+        _save_coin_signal_ts()
+
+
+def _get_monitor_known_coins() -> set:
+    """
+    Liest known_coins (Basis-Symbole wie 'BTC', 'ETH', 'SYN') aus dem
+    Channel-Monitor State-File und gibt normalisierte USDT-Symbole zurück
+    (z.B. {'BTCUSDT', 'ETHUSDT', 'SYNUSDT'}).
+    Gibt leeres Set zurück wenn das File nicht lesbar ist.
+    """
+    try:
+        with open(MONITOR_STATE_FILE) as f:
+            st = json.load(f)
+        raw = st.get("known_coins", [])
+        result = set()
+        for base in raw:
+            b = base.strip().upper()
+            sym = b if b.endswith("USDT") else b + "USDT"
+            result.add(sym)
+        return result
+    except FileNotFoundError:
+        return set()
+    except Exception as e:
+        log(f"[Silence] Monitor-State nicht lesbar ({e})")
+        return set()
+
+
+def _check_coin_silence() -> None:
+    """
+    Erstellt und sendet einen Telegram-Report über stumme Coins.
+    Kategorien:
+      🚨 >COIN_SILENCE_ALERT_DAYS — kein Signal (kritisch)
+      ⚠️  >COIN_SILENCE_WARN_DAYS  — kein Signal (Warnung)
+      ❓  Noch nie ein Signal seit Tracking-Start (verdächtig)
+    Nur gesendet wenn mind. 1 auffälliger Coin gefunden.
+    """
+    global _coin_silence_sent_date
+    now      = time.time()
+    warn_s   = COIN_SILENCE_WARN_DAYS  * 86400
+    alert_s  = COIN_SILENCE_ALERT_DAYS * 86400
+
+    expected = _get_monitor_known_coins()
+    if not expected:
+        log("[Silence] Monitor-State leer oder nicht lesbar — kein Report")
+        return
+
+    never_seen:  list = []          # coin in expected, aber kein Eintrag
+    warn_coins:  list = []          # age > warn_s, aber <= alert_s
+    alert_coins: list = []          # age > alert_s
+
+    for sym in sorted(expected):
+        if sym not in _coin_signal_ts:
+            never_seen.append(sym)
+        else:
+            age = now - _coin_signal_ts[sym]
+            if age > alert_s:
+                alert_coins.append((sym, age))
+            elif age > warn_s:
+                warn_coins.append((sym, age))
+
+    if not never_seen and not warn_coins and not alert_coins:
+        log(f"[Silence] Alle {len(expected)} bekannten Coins aktiv — kein Report")
+        return
+
+    def _fmt_age(secs: float) -> str:
+        d = int(secs / 86400)
+        h = int((secs % 86400) / 3600)
+        return f"{d}T {h}h" if d > 0 else f"{h}h"
+
+    lines = ["🔇 <b>Coin-Silence-Report</b>",
+             f"<i>Erwartete Coins: {len(expected)} | Tracking seit: "
+             f"check täglich {COIN_SILENCE_CHECK_HOUR}:00 UTC</i>"]
+
+    if alert_coins:
+        alert_sorted = sorted(alert_coins, key=lambda x: -x[1])[:25]
+        lines.append(
+            f"\n🚨 <b>Kein Signal seit >{COIN_SILENCE_ALERT_DAYS} Tagen "
+            f"({len(alert_coins)} Coins):</b>")
+        for sym, age in alert_sorted:
+            lines.append(f"  • <code>{sym}</code> — {_fmt_age(age)}")
+        if len(alert_coins) > 25:
+            lines.append(f"  <i>…und {len(alert_coins)-25} weitere</i>")
+
+    if warn_coins:
+        warn_sorted = sorted(warn_coins, key=lambda x: -x[1])[:25]
+        lines.append(
+            f"\n⚠️ <b>Kein Signal seit >{COIN_SILENCE_WARN_DAYS} Tagen "
+            f"({len(warn_coins)} Coins):</b>")
+        for sym, age in warn_sorted:
+            lines.append(f"  • <code>{sym}</code> — {_fmt_age(age)}")
+        if len(warn_coins) > 25:
+            lines.append(f"  <i>…und {len(warn_coins)-25} weitere</i>")
+
+    if never_seen:
+        ns_show = sorted(never_seen)[:25]
+        lines.append(
+            f"\n❓ <b>Noch nie ein Signal empfangen ({len(never_seen)} Coins):</b>")
+        for sym in ns_show:
+            lines.append(f"  • <code>{sym}</code>")
+        if len(never_seen) > 25:
+            lines.append(f"  <i>…und {len(never_seen)-25} weitere</i>")
+
+    lines.append(
+        "\n💡 TV-Alert-Warnsymbol prüfen (⚠️ im Alert-Manager) "
+        "oder Coin aus Watchlist entfernen.")
+
+    try:
+        telegram("\n".join(lines))
+        _coin_silence_sent_date = time.strftime("%Y-%m-%d")
+        log(f"[Silence] Report gesendet: {len(alert_coins)} alert, "
+            f"{len(warn_coins)} warn, {len(never_seen)} never_seen")
+    except Exception as e:
+        log(f"[Silence] Report-Send fehlgeschlagen: {e}")
+
+# ── Ende v4.56 Coin-Silence-Detection ────────────────────────────────────────
+
+
 def _track_watchlist_drop(reason: str, symbol: str, signal_type: str, direction: str = ""):
     """v4.35: zählt Watchlist-Master-Drops und loggt nur eine Summary alle
     WATCHLIST_DROP_SUMMARY_EVERY_N Events. WATCHLIST_DROP_VERBOSE=1 → altes
@@ -1054,6 +1290,152 @@ def _track_watchlist_drop(reason: str, symbol: str, signal_type: str, direction:
             f"{symbol} {dir_lbl} — {reason})")
 
 BASE_URL = "https://api.bitget.com"
+# ═══════════════════════════════════════════════════════════════
+# BYBIT V5 — KONSTANTEN
+# ═══════════════════════════════════════════════════════════════
+BYBIT_BASE_URL     = "https://api.bybit.com"
+BYBIT_PRODUCT_TYPE = "linear"   # USDT-Perpetual
+BYBIT_SETTLE_COIN  = "USDT"
+BYBIT_RECV_WINDOW  = "5000"
+
+# Symbol → Exchange Routing (geladen aus master_watchlist.txt beim Start)
+_symbol_exchange_map: dict = {}   # {XDCUSDT: "BYBIT", ETHUSDT: "BITGET", ...}
+
+
+def _load_symbol_exchange_map() -> None:
+    """Liest master_watchlist.txt und baut _symbol_exchange_map.
+    Format: BITGET:ETHUSDT  oder  BYBIT:MNTUSDT (ohne .P möglich).
+    """
+    global _symbol_exchange_map
+    try:
+        with open(MASTER_WATCHLIST_FILE, "r", encoding="utf-8") as _f:
+            content = _f.read()
+        # Unterstützt beide Formate:
+        # 1) Eine Zeile, komma-separiert: BITGET:ETHUSDT.P,BYBIT:MNTUSDT.P,...
+        # 2) Eine Zeile pro Symbol (Standardformat)
+        raw_entries = []
+        for line in content.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "," in line:
+                raw_entries.extend([e.strip() for e in line.split(",") if e.strip()])
+            else:
+                raw_entries.append(line)
+        mapping: dict = {}
+        for raw in raw_entries:
+            up = raw.upper()
+            exch = "BITGET"
+            for px in ("BYBIT:", "BITGET:"):
+                if up.startswith(px):
+                    exch = px[:-1]
+                    up   = up[len(px):]
+                    break
+            sym = up.replace(".P", "")
+            if not sym.endswith("USDT"):
+                sym += "USDT"
+            mapping[sym] = exch
+        _symbol_exchange_map = mapping
+        n_bybit  = sum(1 for v in mapping.values() if v == "BYBIT")
+        n_bitget = len(mapping) - n_bybit
+        log(f"[Routing] {len(mapping)} Symbole geladen — "
+            f"Bitget: {n_bitget}, Bybit: {n_bybit}")
+    except FileNotFoundError:
+        log(f"[Routing] {MASTER_WATCHLIST_FILE!r} nicht gefunden — alle Symbole → BITGET")
+        _symbol_exchange_map = {}
+    except Exception as _e:
+        log(f"[Routing] Watchlist-Ladefehler: {_e}")
+        _symbol_exchange_map = {}
+
+
+def get_symbol_exchange(symbol: str) -> str:
+    """Gibt 'BITGET' oder 'BYBIT' zurück.
+    Priorität: (1) trade_data[symbol]['exchange'], (2) _symbol_exchange_map, (3) BITGET.
+    """
+    sym = symbol.upper().replace(".P", "")
+    if not sym.endswith("USDT"):
+        sym += "USDT"
+    td = trade_data.get(sym, {})
+    if td.get("exchange") in ("BITGET", "BYBIT"):
+        return td["exchange"]
+    return _symbol_exchange_map.get(sym, "BITGET")
+
+
+# v4.57: Drawdown-Circuit-Breaker Tracking
+_dd_balance_day_start:  float = 0.0   # Balance bei Tagesstart
+_dd_balance_week_start: float = 0.0   # Balance bei Wochenstart
+_dd_circuit_date:       str   = ""    # Datum des letzten Day-Resets
+_dd_circuit_week:       str   = ""    # Woche des letzten Week-Resets
+
+
+def _check_drawdown_circuit_breaker() -> None:
+    """Prüft täglichen und wöchentlichen Drawdown.
+    Setzt AUTO_TRADE_ENABLED=False und sendet Telegram-Alert wenn Limit überschritten.
+    """
+    global AUTO_TRADE_ENABLED
+    global _dd_balance_day_start, _dd_balance_week_start
+    global _dd_circuit_date, _dd_circuit_week
+
+    if not AUTO_TRADE_ENABLED:
+        return   # bereits ausgelöst
+
+    now   = datetime.now()
+    today = now.strftime("%Y-%m-%d")
+    week  = now.strftime("%Y-W%W")
+
+    # Balance holen (ohne Cache)
+    bal = _get_futures_balance_raw()
+    if bal <= 0:
+        return
+
+    # Tages-Reset
+    if _dd_circuit_date != today:
+        _dd_balance_day_start = bal
+        _dd_circuit_date = today
+
+    # Wochen-Reset
+    if _dd_circuit_week != week:
+        _dd_balance_week_start = bal
+        _dd_circuit_week = week
+
+    # Drawdown prüfen
+    if _dd_balance_day_start > 0:
+        day_dd_pct = (_dd_balance_day_start - bal) / _dd_balance_day_start * 100
+        if day_dd_pct >= DAILY_DD_LIMIT_PCT:
+            AUTO_TRADE_ENABLED = False
+            log(f"  🚨 Tages-Circuit-Breaker ausgelöst: -{day_dd_pct:.1f}% "
+                f"(Limit: -{DAILY_DD_LIMIT_PCT}%)")
+            try:
+                telegram(
+                    f"🚨 <b>CIRCUIT BREAKER — Tages-Drawdown</b>\n\n"
+                    f"Verlust heute: <b>-{day_dd_pct:.1f}%</b> "
+                    f"(Limit: -{DAILY_DD_LIMIT_PCT:.0f}%)\n"
+                    f"Balance: {_dd_balance_day_start:.2f} → {bal:.2f} USDT\n\n"
+                    f"🔴 AUTO_TRADE_ENABLED = False\n"
+                    f"Kein neuer Trade bis /risk_reset"
+                )
+            except Exception:
+                pass
+            return
+
+    if _dd_balance_week_start > 0:
+        week_dd_pct = (_dd_balance_week_start - bal) / _dd_balance_week_start * 100
+        if week_dd_pct >= WEEKLY_DD_LIMIT_PCT:
+            AUTO_TRADE_ENABLED = False
+            log(f"  🚨 Wochen-Circuit-Breaker ausgelöst: -{week_dd_pct:.1f}% "
+                f"(Limit: -{WEEKLY_DD_LIMIT_PCT}%)")
+            try:
+                telegram(
+                    f"🚨 <b>CIRCUIT BREAKER — Wochen-Drawdown</b>\n\n"
+                    f"Verlust diese Woche: <b>-{week_dd_pct:.1f}%</b> "
+                    f"(Limit: -{WEEKLY_DD_LIMIT_PCT:.0f}%)\n"
+                    f"Balance: {_dd_balance_week_start:.2f} → {bal:.2f} USDT\n\n"
+                    f"🔴 AUTO_TRADE_ENABLED = False\n"
+                    f"/risk_reset zum manuellen Entsperren notwendig"
+                )
+            except Exception:
+                pass
+
 
 # ═══════════════════════════════════════════════════════════════
 # ZUSTANDSSPEICHER
@@ -1580,7 +1962,13 @@ def forward_to_demo(payload: dict) -> None:
         log(f"  ⚠ Demo-Weiterleitung: {e}")
 
 
-def telegram(msg: str, reply_markup: dict = None, return_id: bool = False):
+def telegram(msg: str, reply_markup: dict = None, return_id: bool = False,
+             exchange: str = None):
+    """v4.57: exchange= Parameter für 🔵/🟣 Prefix.
+    exchange='BYBIT' → 🟣 Prefix, exchange='BITGET' oder None → kein Prefix.
+    """
+    if exchange == "BYBIT" and not msg.startswith("🟣"):
+        msg = f"🟣 {msg}"
     """
     Sendet Telegram-Nachricht wenn konfiguriert.
 
@@ -1809,6 +2197,552 @@ def api_post(path: str, body: dict) -> dict:
     return {}
 
 
+
+
+# ═══════════════════════════════════════════════════════════════
+# BYBIT V5 — AUTH + REQUESTS
+# ═══════════════════════════════════════════════════════════════
+
+def _sign_bybit(timestamp: str, body_or_query: str) -> str:
+    """Bybit V5 HMAC-SHA256 Signatur — Hex-Digest."""
+    msg = timestamp + BYBIT_API_KEY + BYBIT_RECV_WINDOW + body_or_query
+    return hmac.new(BYBIT_SECRET_KEY.encode(), msg.encode(), hashlib.sha256).hexdigest()
+
+
+def _make_headers_bybit(body_or_query: str = "") -> dict:
+    ts = str(int(time.time() * 1000))
+    return {
+        "X-BAPI-API-KEY":    BYBIT_API_KEY,
+        "X-BAPI-SIGN":       _sign_bybit(ts, body_or_query),
+        "X-BAPI-TIMESTAMP":  ts,
+        "X-BAPI-RECV-WINDOW": BYBIT_RECV_WINDOW,
+        "Content-Type":      "application/json",
+    }
+
+
+def bybit_get(path: str, params: dict = None) -> dict:
+    """GET-Anfrage an Bybit V5 API (signiert, mit Retry)."""
+    query_str = ""
+    if params:
+        query_str = "&".join(f"{k}={v}" for k, v in params.items())
+    full_url = BYBIT_BASE_URL + path + ("?" + query_str if query_str else "")
+    for attempt in range(3):
+        try:
+            r = requests.get(full_url,
+                             headers=_make_headers_bybit(query_str),
+                             timeout=10)
+            data = r.json()
+            if r.status_code >= 500 and attempt < 2:
+                time.sleep(1.5 ** attempt)
+                continue
+            return data
+        except Exception as e:
+            if attempt < 2:
+                time.sleep(1.5 ** attempt)
+                continue
+            log(f"BYBIT GET Fehler ({path}): {e}")
+            return {}
+    return {}
+
+
+def bybit_post(path: str, body: dict) -> dict:
+    """POST-Anfrage an Bybit V5 API (signiert, mit Retry)."""
+    body_str = json.dumps(body)
+    for attempt in range(3):
+        try:
+            r = requests.post(BYBIT_BASE_URL + path,
+                              headers=_make_headers_bybit(body_str),
+                              data=body_str, timeout=10)
+            data = r.json()
+            if r.status_code >= 500 and attempt < 2:
+                time.sleep(1.5 ** attempt)
+                continue
+            return data
+        except Exception as e:
+            if attempt < 2:
+                time.sleep(1.5 ** attempt)
+                continue
+            log(f"BYBIT POST Fehler ({path}): {e}")
+            return {}
+    return {}
+
+
+def _bybit_ok(res: dict) -> bool:
+    """Prüft ob eine Bybit V5 Response erfolgreich war (retCode == 0)."""
+    rc = res.get("retCode", res.get("ret_code", -1))
+    return int(rc) == 0
+
+
+# ─── Bybit Precision Caches ──────────────────────────────────
+_bybit_price_dec_cache: dict = {}
+_bybit_qty_dec_cache:   dict = {}
+_bybit_qty_step_cache:  dict = {}
+_bybit_max_lev_cache:   dict = {}
+
+
+def _get_bybit_instrument_info(symbol: str) -> None:
+    """Bybit /v5/market/instruments-info — befüllt Precision-Caches."""
+    res = bybit_get("/v5/market/instruments-info", {
+        "category": BYBIT_PRODUCT_TYPE,
+        "symbol":   symbol,
+    })
+    try:
+        items = (res.get("result") or {}).get("list") or []
+        for item in items:
+            if item.get("symbol") != symbol:
+                continue
+            lot_f   = item.get("lotSizeFilter", {})
+            price_f = item.get("priceFilter", {})
+            lev_f   = item.get("leverageFilter", {})
+
+            qty_step = float(lot_f.get("qtyStep", "0.001") or "0.001")
+            _bybit_qty_step_cache[symbol] = qty_step
+            if qty_step >= 1:
+                qty_dec = 0
+            else:
+                s = f"{qty_step:.10f}".rstrip("0")
+                qty_dec = len(s.split(".")[-1]) if "." in s else 0
+            _bybit_qty_dec_cache[symbol] = qty_dec
+
+            tick = float(price_f.get("tickSize", "0.0001") or "0.0001")
+            if tick >= 1:
+                price_dec = 0
+            else:
+                s = f"{tick:.10f}".rstrip("0")
+                price_dec = len(s.split(".")[-1]) if "." in s else 4
+            _bybit_price_dec_cache[symbol] = price_dec
+
+            max_lev = int(float(lev_f.get("maxLeverage", str(MAX_LEVERAGE)) or str(MAX_LEVERAGE)))
+            _bybit_max_lev_cache[symbol] = max_lev
+            return
+    except Exception as _e:
+        log(f"[Bybit] instrument-info parse error ({symbol}): {_e}")
+
+
+def get_price_decimals_bybit(symbol: str) -> int:
+    if symbol not in _bybit_price_dec_cache:
+        _get_bybit_instrument_info(symbol)
+    return _bybit_price_dec_cache.get(symbol, 4)
+
+
+def get_qty_decimals_bybit(symbol: str) -> int:
+    if symbol not in _bybit_qty_dec_cache:
+        _get_bybit_instrument_info(symbol)
+    return _bybit_qty_dec_cache.get(symbol, 3)
+
+
+def snap_qty_bybit(symbol: str, qty: float) -> float:
+    """Rundet Qty auf Bybit qtyStep (math.floor)."""
+    step = _bybit_qty_step_cache.get(symbol)
+    if step is None:
+        _get_bybit_instrument_info(symbol)
+        step = _bybit_qty_step_cache.get(symbol, 0.001)
+    if not step or step <= 0:
+        step = 0.001
+    snapped = math.floor(qty / step) * step
+    return round(snapped, get_qty_decimals_bybit(symbol))
+
+
+def round_qty_bybit(symbol: str, qty: float) -> str:
+    dec = get_qty_decimals_bybit(symbol)
+    if dec == 0:
+        return str(int(math.floor(qty)))
+    return f"{qty:.{dec}f}"
+
+
+def get_max_leverage_bybit(symbol: str) -> int:
+    if symbol not in _bybit_max_lev_cache:
+        _get_bybit_instrument_info(symbol)
+    return _bybit_max_lev_cache.get(symbol, MAX_LEVERAGE)
+
+
+def _get_mark_price_bybit_raw(symbol: str) -> float:
+    """Mark Price von Bybit (ungecacht)."""
+    res = bybit_get("/v5/market/tickers", {
+        "category": BYBIT_PRODUCT_TYPE,
+        "symbol":   symbol,
+    })
+    try:
+        items = (res.get("result") or {}).get("list") or []
+        if items:
+            return float(items[0].get("markPrice", 0) or 0)
+    except Exception:
+        pass
+    return 0.0
+
+
+def get_mark_price_bybit(symbol: str) -> float:
+    """Mark Price von Bybit (mit Cache)."""
+    return _cached_read(
+        f"mark_price_bybit:{symbol}",
+        CACHE_TTL_MARK_PRICE,
+        _get_mark_price_bybit_raw,
+        symbol,
+    )
+
+
+def _get_futures_balance_bybit_raw() -> float:
+    """Bybit Wallet Balance USDT (Unified Trading Account)."""
+    if not BYBIT_API_KEY:
+        return 0.0
+    res = bybit_get("/v5/account/wallet-balance", {
+        "accountType": "UNIFIED",
+        "coin": "USDT",
+    })
+    try:
+        for acct in (res.get("result") or {}).get("list") or []:
+            for coin in (acct.get("coin") or []):
+                if coin.get("coin") == "USDT":
+                    return float(coin.get("walletBalance", 0) or 0)
+    except Exception as _e:
+        log(f"[Bybit] balance parse error: {_e}")
+    return 0.0
+
+
+def get_futures_balance_bybit() -> float:
+    return _cached_read(
+        "futures_balance_bybit",
+        CACHE_TTL_BALANCE,
+        _get_futures_balance_bybit_raw,
+    )
+
+
+def _normalize_bybit_position(p: dict) -> dict:
+    size = float(p.get("size", 0) or 0)
+    if size <= 0:
+        return {}
+    side = (p.get("side") or "").lower()
+    direction = "long" if side == "buy" else "short"
+    return {
+        "symbol":        p.get("symbol", ""),
+        "holdSide":      direction,
+        "total":         str(size),
+        "openPriceAvg":  str(float(p.get("avgPrice", 0) or 0)),
+        "unrealizedPL":  str(float(p.get("unrealisedPnl", 0) or 0)),
+        "leverage":      str(float(p.get("leverage", 1) or 1)),
+        "markPrice":     str(float(p.get("markPrice", 0) or 0)),
+        "liquidationPrice": str(float(p.get("liqPrice", 0) or 0)),
+        "marginSize":    str(float(p.get("positionIM", 0) or 0)),
+        "stopLossPrice": str(float(p.get("stopLoss", 0) or 0)),
+        "takeProfitPrice": str(float(p.get("takeProfit", 0) or 0)),
+        "_exchange":     "BYBIT",
+    }
+
+
+def _get_all_positions_bybit_raw() -> list:
+    if not BYBIT_API_KEY:
+        return []
+    res = bybit_get("/v5/position/list", {
+        "category":   BYBIT_PRODUCT_TYPE,
+        "settleCoin": BYBIT_SETTLE_COIN,
+    })
+    if not _bybit_ok(res):
+        if res:
+            log(f"[Bybit] position/list Fehler: {res.get('retMsg', res)}")
+        return []
+    items = (res.get("result") or {}).get("list") or []
+    result = []
+    for p in items:
+        norm = _normalize_bybit_position(p)
+        if norm:
+            result.append(norm)
+    return result
+
+
+def get_sl_price_bybit(symbol: str, direction: str) -> float:
+    if not BYBIT_API_KEY:
+        return 0.0
+    res = bybit_get("/v5/position/list", {
+        "category": BYBIT_PRODUCT_TYPE,
+        "symbol":   symbol,
+    })
+    try:
+        side_filter = "Buy" if direction == "long" else "Sell"
+        for p in (res.get("result") or {}).get("list") or []:
+            if p.get("side") == side_filter:
+                return float(p.get("stopLoss", 0) or 0)
+    except Exception:
+        pass
+    return 0.0
+
+
+def set_leverage_on_bybit(symbol: str, direction: str, leverage: int) -> dict:
+    lev_str = str(int(leverage))
+    res = bybit_post("/v5/position/set-leverage", {
+        "category":     BYBIT_PRODUCT_TYPE,
+        "symbol":       symbol,
+        "buyLeverage":  lev_str,
+        "sellLeverage": lev_str,
+    })
+    if _bybit_ok(res):
+        log(f"  ✓ [Bybit] Hebel {leverage}x gesetzt ({symbol})")
+    else:
+        log(f"  ⚠ [Bybit] set-leverage({symbol} {leverage}x): {res.get('retMsg', res)}")
+    return res
+
+
+def _bybit_set_trading_stop(symbol: str, direction: str,
+                             sl_price: str = "", tp_price: str = "") -> dict:
+    pos_idx = 1 if direction == "long" else 2
+    body = {
+        "category":    BYBIT_PRODUCT_TYPE,
+        "symbol":      symbol,
+        "positionIdx": pos_idx,
+        "tpslMode":    "Full",
+    }
+    if sl_price:
+        body["stopLoss"]    = sl_price
+        body["slTriggerBy"] = "MarkPrice"
+    if tp_price:
+        body["takeProfit"]    = tp_price
+        body["tpTriggerBy"]   = "MarkPrice"
+    return bybit_post("/v5/position/trading-stop", body)
+
+
+def _bybit_place_tp_order(symbol: str, direction: str,
+                           trigger_price: str, qty_str: str) -> dict:
+    side = "Sell" if direction == "long" else "Buy"
+    return bybit_post("/v5/order/create", {
+        "category":      BYBIT_PRODUCT_TYPE,
+        "symbol":        symbol,
+        "side":          side,
+        "orderType":     "Market",
+        "qty":           qty_str,
+        "reduceOnly":    True,
+        "triggerPrice":  trigger_price,
+        "triggerBy":     "MarkPrice",
+        "triggerDirection": 1 if direction == "long" else 2,
+        "timeInForce":   "GTC",
+        "orderLinkId":   f"domtp_{symbol}_{trigger_price}",
+    })
+
+
+def cancel_all_orders_bybit(symbol: str) -> None:
+    if not BYBIT_API_KEY:
+        return
+    bybit_post("/v5/order/cancel-all", {
+        "category": BYBIT_PRODUCT_TYPE,
+        "symbol":   symbol,
+    })
+    bybit_post("/v5/order/cancel-all", {
+        "category":    BYBIT_PRODUCT_TYPE,
+        "symbol":      symbol,
+        "orderFilter": "tpslOrder",
+    })
+    log(f"  ✓ [Bybit] Alle Orders storniert für {symbol}")
+
+
+def place_tp_orders_bybit(symbol: str, avg: float, size: float,
+                           direction: str, leverage: int) -> tuple:
+    dec_p  = get_price_decimals_bybit(symbol)
+    count  = 0
+    prices = {}
+    tp_rois = [TP1_ROI, TP2_ROI, TP3_ROI, TP4_ROI]
+    tp_pcts = TP_CLOSE_PCTS
+
+    # TP4 zuerst (position-level trading-stop)
+    tp4_price = calc_tp_price(avg, tp_rois[3], direction, leverage)
+    tp4_str   = round_price(tp4_price, dec_p)
+    res4 = _bybit_set_trading_stop(symbol, direction, tp_price=tp4_str)
+    if _bybit_ok(res4):
+        count += 1
+        prices["tp4"] = tp4_price
+        log(f"  ✓ [Bybit] TP4 @ {tp4_str}")
+    else:
+        log(f"  ✗ [Bybit] TP4 fehlgeschlagen: {res4.get('retMsg', res4)}")
+
+    # TP1-TP3 als reduceOnly Trigger-Orders
+    for i, (roi, pct) in enumerate(zip(tp_rois[:3], tp_pcts[:3]), start=1):
+        tp_price = calc_tp_price(avg, roi, direction, leverage)
+        tp_str   = round_price(tp_price, dec_p)
+        qty      = snap_qty_bybit(symbol, size * pct)
+        qty_str  = round_qty_bybit(symbol, qty)
+        if float(qty_str) <= 0:
+            continue
+        res = _bybit_place_tp_order(symbol, direction, tp_str, qty_str)
+        if _bybit_ok(res):
+            count += 1
+            prices[f"tp{i}"] = tp_price
+            log(f"  ✓ [Bybit] TP{i} @ {tp_str} qty={qty_str}")
+        else:
+            log(f"  ✗ [Bybit] TP{i}: {res.get('retMsg', res)}")
+    return count, prices
+
+
+def place_dca_orders_bybit(symbol: str, entry: float, sl: float,
+                            direction: str, leverage: int,
+                            base_qty: float) -> list:
+    dec_p  = get_price_decimals_bybit(symbol)
+    side   = "Buy" if direction == "long" else "Sell"
+    sl_dist = abs(entry - sl)
+    placed = []
+    for i, (ratio, mult) in enumerate([(DCA1_RATIO, DCA1_MULTIPLIER),
+                                        (DCA2_RATIO, DCA2_MULTIPLIER)], start=1):
+        if direction == "long":
+            dca_px = entry - sl_dist * ratio
+        else:
+            dca_px = entry + sl_dist * ratio
+        qty     = snap_qty_bybit(symbol, base_qty * mult)
+        qty_str = round_qty_bybit(symbol, qty)
+        if float(qty_str) <= 0:
+            continue
+        dca_str = round_price(dca_px, dec_p)
+        res = bybit_post("/v5/order/create", {
+            "category":    BYBIT_PRODUCT_TYPE,
+            "symbol":      symbol,
+            "side":        side,
+            "orderType":   "Limit",
+            "qty":         qty_str,
+            "price":       dca_str,
+            "timeInForce": "GTC",
+            "reduceOnly":  False,
+        })
+        if _bybit_ok(res):
+            placed.append(dca_px)
+            log(f"  ✓ [Bybit] DCA{i} @ {dca_str} qty={qty_str}")
+        else:
+            log(f"  ✗ [Bybit] DCA{i}: {res.get('retMsg', res)}")
+    return placed
+
+
+def _execute_trade_bybit(symbol: str, direction: str, leverage: int,
+                          entry: float, sl: float) -> dict:
+    """Market-Order + SL auf Bybit."""
+    direction = direction.lower()
+    if direction not in ("long", "short"):
+        return {"ok": False, "reason": f"Ungültige Richtung: {direction!r}"}
+
+    leverage = int(min(leverage, get_max_leverage_bybit(symbol)))
+    if leverage < 1:
+        return {"ok": False, "reason": "Hebel < 1"}
+
+    balance = get_futures_balance_bybit()
+    if balance <= 0:
+        return {"ok": False, "reason": f"Bybit Balance {balance} — API-Fehler"}
+
+    kelly          = kelly_recommendation(balance, WINRATE)
+    target_total   = (kelly.get("kelly_usdt", 0) or 0) * KELLY_FRACTION
+    initial_margin = target_total / 5.0
+
+    cap_10pct = (balance * 0.10) / 3.0
+    if initial_margin > cap_10pct:
+        initial_margin = cap_10pct
+    if MAX_AUTO_TRADE_USDT_BYBIT > 0 and initial_margin > MAX_AUTO_TRADE_USDT_BYBIT:
+        initial_margin = MAX_AUTO_TRADE_USDT_BYBIT
+    if initial_margin < 1.0:
+        return {"ok": False,
+                "reason": f"Initial-Margin {initial_margin:.2f} < 1 USDT (Bybit {balance:.2f})"}
+
+    qty_raw = (initial_margin * leverage) / entry
+    qty     = snap_qty_bybit(symbol, qty_raw)
+    if qty <= 0:
+        return {"ok": False, "reason": "Qty=0 nach snap_qty_bybit"}
+    qty_str = round_qty_bybit(symbol, qty)
+
+    log(f"══ AUTO-TRADE BYBIT: {symbol} ══")
+    log(f"  {direction.upper()} | Entry={entry} | SL={sl} | Hebel={leverage}x")
+    log(f"  Margin: {initial_margin:.2f} USDT | Qty: {qty_str}")
+
+    # Hebel setzen
+    lev_res = set_leverage_on_bybit(symbol, direction, leverage)
+    if not _bybit_ok(lev_res):
+        bybit_max = get_max_leverage_bybit(symbol)
+        leverage  = max(1, min(leverage - 1, bybit_max))
+        qty_raw   = (initial_margin * leverage) / entry
+        qty       = snap_qty_bybit(symbol, qty_raw)
+        qty_str   = round_qty_bybit(symbol, qty)
+        lev_res2  = set_leverage_on_bybit(symbol, direction, leverage)
+        if not _bybit_ok(lev_res2):
+            return {"ok": False,
+                    "reason": f"[Bybit] set-leverage fehlgeschlagen: {lev_res2.get('retMsg', lev_res2)}"}
+
+    # Market-Order
+    side    = "Buy" if direction == "long" else "Sell"
+    pos_idx = 1 if direction == "long" else 2
+    ord_res = bybit_post("/v5/order/create", {
+        "category":    BYBIT_PRODUCT_TYPE,
+        "symbol":      symbol,
+        "side":        side,
+        "orderType":   "Market",
+        "qty":         qty_str,
+        "reduceOnly":  False,
+        "positionIdx": pos_idx,
+        "timeInForce": "GTC",
+    })
+    if not _bybit_ok(ord_res):
+        return {"ok": False,
+                "reason": f"[Bybit] Market-Order rejected: {ord_res.get('retMsg', ord_res)}"}
+
+    order_id = (ord_res.get("result") or {}).get("orderId") or "?"
+    log(f"  ✓ [Bybit] Order {order_id}")
+
+    # Verifikation
+    time.sleep(3)
+    positions_bb = _get_all_positions_bybit_raw()
+    pos_match = next(
+        (p for p in positions_bb
+         if p.get("symbol") == symbol
+         and p.get("holdSide") == direction
+         and float(p.get("total", 0)) > 0),
+        None,
+    )
+    if not pos_match:
+        return {"ok": False,
+                "reason": f"[Bybit] Position nicht verifiziert — orderId {order_id}",
+                "orderId": order_id}
+
+    avg_price  = float(pos_match.get("openPriceAvg", entry))
+    filled_qty = float(pos_match.get("total", qty))
+    log(f"  ✓ [Bybit] Position: {filled_qty} @ {avg_price}")
+
+    # SL setzen
+    dec_p  = get_price_decimals_bybit(symbol)
+    sl_str = round_price(sl, dec_p)
+    sl_res = _bybit_set_trading_stop(symbol, direction, sl_price=sl_str)
+    if not _bybit_ok(sl_res):
+        err = sl_res.get("retMsg", str(sl_res))
+        log(f"  ✗ PANIC [Bybit]: SL-Set fehlgeschlagen: {err}")
+        try:
+            telegram(
+                f"🚨🟣 <b>PANIC BYBIT — {symbol}</b>\n"
+                f"Position offen, SL-Set fehlgeschlagen!\n"
+                f"{direction.upper()} {filled_qty} @ {avg_price}\n"
+                f"SL geplant: {sl_str}\nFehler: {err}\n"
+                f"⚠️ SL jetzt manuell auf Bybit setzen!"
+            )
+        except Exception:
+            pass
+        return {"ok": "partial",
+                "reason": f"[Bybit] SL-Fehler: {err}",
+                "orderId": order_id, "qty": qty_str,
+                "leverage": leverage, "entry": avg_price}
+
+    log(f"  ✓ [Bybit] SL @ {sl_str}")
+
+    if symbol not in trade_data:
+        trade_data[symbol] = {}
+    trade_data[symbol].update({
+        "leverage":     leverage,
+        "direction":    direction,
+        "entry":        avg_price,
+        "sl":           float(sl_str),
+        "exchange":     "BYBIT",
+        "initial_size": filled_qty,
+    })
+    save_state()
+
+    return {
+        "ok":            True,
+        "reason":        "Bybit Trade erfolgreich",
+        "orderId":       order_id,
+        "qty":           qty_str,
+        "leverage":      leverage,
+        "entry":         avg_price,
+        "sl":            sl_str,
+        "initial_margin": initial_margin,
+        "exchange":      "BYBIT",
+    }
+
 # ═══════════════════════════════════════════════════════════════
 # PREIS-PRÄZISION
 # ═══════════════════════════════════════════════════════════════
@@ -1933,7 +2867,9 @@ def _cache_is_valid(key: str, value) -> bool:
     """Entscheidet ob ein Rückgabewert cache-würdig ist."""
     if key.startswith("mark_price:"):
         return isinstance(value, (int, float)) and value > 0
-    if key == "futures_balance":
+    if key in ("futures_balance", "futures_balance_bybit"):
+        return isinstance(value, (int, float)) and value > 0
+    if key.startswith("mark_price_bybit:"):
         return isinstance(value, (int, float)) and value > 0
     if key == "all_positions":
         # Auch leere Liste ist gültig — "keine offenen Positionen" ist
@@ -2021,12 +2957,22 @@ def _get_all_positions_raw() -> list:
             if float(p.get("total", 0)) > 0]
 
 
+def _get_all_positions_combined_raw() -> list:
+    """Alle offenen Positionen (Bitget + Bybit), kombiniert."""
+    result = _get_all_positions_raw()   # Bitget
+    # Bybit-Positionen hinzufügen wenn API-Key vorhanden
+    if BYBIT_API_KEY:
+        bb_positions = _get_all_positions_bybit_raw()
+        result.extend(bb_positions)
+    return result
+
+
 def get_all_positions() -> list:
-    """Alle offenen Futures-Positionen (mit 5s-Cache)."""
+    """Alle offenen Futures-Positionen Bitget + Bybit (mit 5s-Cache)."""
     return _cached_read(
         "all_positions",
         CACHE_TTL_POSITIONS,
-        _get_all_positions_raw,
+        _get_all_positions_combined_raw,
     )
 
 
@@ -2223,17 +3169,15 @@ def kelly_recommendation(balance: float, winrate: float) -> dict:
 
 
 def cancel_all_tp_orders(symbol: str, dom_only: bool = True):
+    """Storniert alle TP/SL-Orders für ein Symbol.
+    v4.57: Exchange-aware — Bybit via cancel_all_orders_bybit().
+    Bitget: nur profit_plan Orders (dom_only=True) oder alle (dom_only=False).
     """
-    Storniert alle Einzel-TP-Orders (profit_plan) fuer ein Symbol.
-
-    v4.36 FIX 11 — dom_only=True (Standard): storniert nur Orders deren
-    clientOid mit ORDER_PREFIX beginnt. Manuell auf Bitget gesetzte Orders
-    ohne Prefix bleiben unberuehrt. dom_only=False storniert alle (z.B.
-    beim Close einer Position wenn aufgeraeumt werden muss).
-
-    SL (loss_plan, pos_loss) und TP4 (pos_profit via place-pos-tpsl)
-    werden NIE angefasst.
-    """
+    # v4.57: Bybit-Routing
+    if get_symbol_exchange(symbol) == "BYBIT":
+        cancel_all_orders_bybit(symbol)
+        return
+    # Bitget-Pfad: storniert profit_plan Orders (TP1-TP3)
     orders = _get_plan_orders(symbol)
     all_tp = [o for o in orders if o.get("planType") == "profit_plan"]
 
@@ -2352,18 +3296,13 @@ def place_tp_orders(symbol: str, avg: float, size: float,
                     mark_price: float, known_sl: float = 0) -> tuple:
     """
     Setzt TP1–TP4 nach DOMINUS-Schema:
-      TP4 (40% ROI): Full Position Close         → place-pos-tpsl  ← ZUERST (FIX16 v4.54)
-      TP1 (10% ROI): schliesst 15% der Position  → place-tpsl-order
-      TP2 (20% ROI): schliesst 20% der Position  → place-tpsl-order
-      TP3 (30% ROI): schliesst 25% der Position  → place-tpsl-order
-
-    FIX16 v4.54: TP4 (place-pos-tpsl) wird VOR TP1-3 gesetzt.
-    Ursache: Bitget's place-pos-tpsl cancelt alle bestehenden profit_plan Orders
-    als Nebeneffekt (beobachtet beim Nachkauf-TP-Update: TP1-3 platziert @11:21:29,
-    TP4 @11:21:32 → Verifikation @11:23:05 findet 0/3). Im Erstsetup existieren
-    keine profit_plan Orders wenn TP4 gesetzt wird → kein Problem dort.
-    Fix: TP4 zuerst → dann TP1-3 (keine bestehenden profit_plan zum Canceln).
+    v4.57: Exchange-aware — Bybit via place_tp_orders_bybit().
     """
+    # v4.57: Bybit-Routing
+    if get_symbol_exchange(symbol) == "BYBIT":
+        count, prices = place_tp_orders_bybit(symbol, avg, size, direction, leverage)
+        return count, prices
+    # Bitget-Pfad: TP4 (place-pos-tpsl) VOR TP1-3 (FIX16 v4.54)
     decimals = get_price_decimals(symbol)
     count    = 0
     prices   = []
@@ -2568,6 +3507,10 @@ def place_tp_orders(symbol: str, avg: float, size: float,
 # ═══════════════════════════════════════════════════════════════
 
 def cancel_open_dca_orders(symbol: str, direction: str):
+    # v4.57: Bybit-Routing
+    if get_symbol_exchange(symbol) == "BYBIT":
+        cancel_all_orders_bybit(symbol)   # Storniert alle nicht-TP-Orders
+        return
     """
     Storniert alle noch offenen DCA Limit-Orders nach TP1.
     Nach SL auf Entry sind DCA-Nachkäufe nicht mehr gewünscht.
@@ -2970,8 +3913,37 @@ def set_sl_at_entry(symbol: str, direction: str, entry_price: float,
                     cur_size: float = 0, sl_label: str = "Entry"):
     """SL auf Break-even setzen — DOMINUS-Regel nach TP1.
     v4.52: sl_label gibt an ob SL auf "Entry" oder "Avg (x.xxxxx)" gesetzt wird.
-    Bei gefüllten DCAs wird entry_price = cur_avg (echter Breakeven) übergeben.
+    v4.57: Exchange-aware — Bybit via trading-stop.
     """
+    # v4.57: Bybit-Routing
+    if get_symbol_exchange(symbol) == "BYBIT":
+        dec_p  = get_price_decimals_bybit(symbol)
+        sl_str = round_price(entry_price, dec_p)
+        mark   = get_mark_price_bybit(symbol)
+        if mark > 0:
+            if direction == "long" and entry_price >= mark:
+                log(f"  ⚠ [Bybit] SL-auf-Entry: entry {entry_price} >= Mark {mark} — skip")
+                return
+            if direction == "short" and entry_price <= mark:
+                log(f"  ⚠ [Bybit] SL-auf-Entry: entry {entry_price} <= Mark {mark} — skip")
+                return
+        res = _bybit_set_trading_stop(symbol, direction, sl_price=sl_str)
+        if _bybit_ok(res):
+            log(f"  ✓ [Bybit] SL auf {sl_label} @ {sl_str} ({symbol})")
+            _log_pos_event(symbol, direction, "SL_ENTRY", new_sl=sl_str,
+                           info=f"TP1 → SL auf {sl_label} [Bybit]")
+            sl_at_entry[symbol] = True
+            save_state()
+            cancel_all_orders_bybit(symbol)
+            telegram(
+                f"🔒🟣 <b>TP1 ausgelöst — {symbol}</b>\n"
+                f"SL → {sl_label} @ {sl_str} USDT (Bybit Break-even)\n"
+                f"✓ Orders storniert"
+            )
+        else:
+            log(f"  ✗ [Bybit] SL-auf-Entry fehlgeschlagen: {res.get('retMsg', res)}")
+        return
+
     decimals = get_price_decimals(symbol)
     sl_str   = round_price(entry_price, decimals)
 
@@ -3173,6 +4145,37 @@ def set_sl_trailing(symbol: str, direction: str, sl_price: float, level: int,
 
 
 def set_sl_harsi(symbol: str, direction: str, harsi_price: float, cur_size: float = 0):
+    # v4.57: Bybit-Routing
+    if get_symbol_exchange(symbol) == "BYBIT":
+        dec_p    = get_price_decimals_bybit(symbol)
+        sl_str   = round_price(harsi_price, dec_p)
+        mark     = get_mark_price_bybit(symbol)
+        if mark > 0:
+            if direction == "long" and harsi_price >= mark:
+                log(f"  ⚠ [Bybit] HARSI-SL {harsi_price} >= Mark {mark} — skip")
+                return
+            if direction == "short" and harsi_price <= mark:
+                log(f"  ⚠ [Bybit] HARSI-SL {harsi_price} <= Mark {mark} — skip")
+                return
+        # Nur setzen wenn SL verbessert wird (protective-only)
+        cur_sl = get_sl_price_bybit(symbol, direction)
+        if cur_sl > 0:
+            if direction == "long" and harsi_price <= cur_sl:
+                log(f"  ⚠ [Bybit] HARSI-SL {harsi_price} ≤ akt. SL {cur_sl} — skip (nicht besser)")
+                return
+            if direction == "short" and harsi_price >= cur_sl:
+                log(f"  ⚠ [Bybit] HARSI-SL {harsi_price} ≥ akt. SL {cur_sl} — skip")
+                return
+        existing_tp = 0.0  # TP4 bleibt via trading-stop erhalten — nicht überschreiben
+        res = _bybit_set_trading_stop(symbol, direction, sl_price=sl_str)
+        if _bybit_ok(res):
+            log(f"  ✓ [Bybit] HARSI-SL @ {sl_str} ({symbol})")
+            harsi_sl[symbol] = True
+            _log_pos_event(symbol, direction, "SL_HARSI", new_sl=sl_str)
+            cache_invalidate(f"all_positions")
+        else:
+            log(f"  ✗ [Bybit] HARSI-SL fehlgeschlagen: {res.get('retMsg', res)}")
+        return
     """
     Setzt den SL auf die Harsi-Ausstiegslinie — nur wenn schützender als aktueller SL.
     Long:  harsi_price > current_sl  → SL nachziehen
@@ -3325,10 +4328,40 @@ def _void_passed_dcas(symbol: str, direction: str, new_sl: float) -> list:
     return voided
 
 
+def _set_sl_sling_bybit(symbol: str, direction: str, pivot_price: float) -> None:
+    """Sling-SL auf Bybit setzen (nur wenn Verbesserung)."""
+    dec_p  = get_price_decimals_bybit(symbol)
+    sl_str = round_price(pivot_price, dec_p)
+    mark   = get_mark_price_bybit(symbol)
+    if mark > 0:
+        if direction == "long" and pivot_price >= mark:
+            log(f"  ⚠ [Bybit] Sling-SL {pivot_price} >= Mark {mark} — skip")
+            return
+        if direction == "short" and pivot_price <= mark:
+            log(f"  ⚠ [Bybit] Sling-SL {pivot_price} <= Mark {mark} — skip")
+            return
+    cur_sl = get_sl_price_bybit(symbol, direction)
+    if cur_sl > 0:
+        if direction == "long" and pivot_price <= cur_sl:
+            log(f"  ⚠ [Bybit] Sling-SL {pivot_price} ≤ akt. SL {cur_sl} — skip")
+            return
+        if direction == "short" and pivot_price >= cur_sl:
+            log(f"  ⚠ [Bybit] Sling-SL {pivot_price} ≥ akt. SL {cur_sl} — skip")
+            return
+    res = _bybit_set_trading_stop(symbol, direction, sl_price=sl_str)
+    if _bybit_ok(res):
+        log(f"  ✓ [Bybit] Sling-SL @ {sl_str} ({symbol})")
+        sling_sl[symbol] = True
+        _log_pos_event(symbol, direction, "SL_SLING", new_sl=sl_str)
+    else:
+        log(f"  ✗ [Bybit] Sling-SL fehlgeschlagen: {res.get('retMsg', res)}")
+
+
 def set_sl_sling(symbol: str, direction: str, pivot_price: float,
                  cur_size: float = 0, atr_val: float = 0.0):
     """
     v4.12 Sling-SL: setzt den SL auf den letzten bestätigten Swing-Pivot.
+    v4.57: Exchange-aware.
       Long:   pivot = Sling-Low  → SL = pivot - fallback_buffer (wenn zu nah)
       Short:  pivot = Sling-High → SL = pivot + fallback_buffer (wenn zu nah)
 
@@ -3340,6 +4373,11 @@ def set_sl_sling(symbol: str, direction: str, pivot_price: float,
 
     Nach Setzen: Auto-Void für DCA-Orders die im Gewinn liegen würden.
     """
+    # v4.57: Bybit-Routing
+    if get_symbol_exchange(symbol) == "BYBIT":
+        _set_sl_sling_bybit(symbol, direction, pivot_price)
+        return
+
     mark = get_mark_price(symbol)
     if mark <= 0 or pivot_price <= 0:
         log(f"  Sling-SL: ungültige Preise (mark={mark}, pivot={pivot_price}) — skip")
@@ -3472,7 +4510,13 @@ def place_dca_orders(symbol: str, entry: float, sl: float,
       DCA1 = base_size × 1.5  (entspricht 30% bei 20% Initial)
       DCA2 = base_size × 2.5  (entspricht 50% bei 20% Initial)
     Beispiel: Initial = 10 → DCA1 = 15 → DCA2 = 25 → Total = 50
+    v4.57: Exchange-aware.
     """
+    # v4.57: Bybit-Routing
+    if get_symbol_exchange(symbol) == "BYBIT":
+        placed = place_dca_orders_bybit(symbol, entry, sl, direction, leverage, base_size)
+        return placed, {}
+
     decimals  = get_price_decimals(symbol)
     sl_dist   = abs(entry - sl)
 
@@ -3603,6 +4647,20 @@ def execute_trade_order(symbol: str, direction: str, leverage: int,
               "qty": str, "leverage": int, "entry": float, "sl": str,
               "initial_margin": float}
     """
+    # ── 0. Exchange-Routing ─────────────────────────────────────
+    # Bybit-Symbole werden an _execute_trade_bybit() delegiert.
+    # Bitget-Symbole folgen dem normalen Pfad unten.
+    _exch = get_symbol_exchange(symbol)
+    if _exch == "BYBIT":
+        # Drawdown-Check auch für Bybit
+        _check_drawdown_circuit_breaker()
+        if not AUTO_TRADE_ENABLED:
+            return {"ok": False, "reason": "AUTO_TRADE_ENABLED=false (Circuit-Breaker)"}
+        return _execute_trade_bybit(symbol, direction, leverage, entry, sl)
+
+    # ── 0a. Drawdown-Circuit-Breaker ─────────────────────────
+    _check_drawdown_circuit_breaker()
+
     # ── 1a. Feature-Gate ────────────────────────────────────────
     if not AUTO_TRADE_ENABLED:
         return {"ok": False,
@@ -3676,9 +4734,9 @@ def execute_trade_order(symbol: str, direction: str, leverage: int,
         return {"ok": False,
                 "reason": f"Balance {balance} — Konto leer oder API-Fehler"}
 
-    # ── 2. Sizing: Half-Kelly / 5 (Initial in 20/30/50-Schema) ──
-    kelly         = kelly_recommendation(balance, WINRATE)
-    target_total  = kelly.get("half_kelly_usdt", 0) or 0
+    # ── 2. Sizing: Kelly×KELLY_FRACTION / 5 (v4.57: Quarter-Kelly default) ──
+    kelly          = kelly_recommendation(balance, WINRATE)
+    target_total   = (kelly.get("kelly_usdt", 0) or 0) * KELLY_FRACTION
     initial_margin = target_total / 5.0
 
     # Hard-Cap 1: 10%-Margin-Regel (max_margin / 3 pro Order)
@@ -3881,7 +4939,34 @@ def _exec_confirm_check_and_consume(msg_id: int, payload_sig: str) -> bool:
         return False
 
 
-def tv_chart_links(symbol: str) -> dict:
+def tv_chart_links(symbol: str, exchange: str = None) -> dict:
+    """v4.57: exchange-aware — BITGET oder BYBIT chart/trade Links."""
+    if exchange is None:
+        exchange = get_symbol_exchange(symbol)
+    exchange = exchange.upper()
+
+    tv_sym = symbol.upper().replace("USDT", "USDT.P")
+    base_sym = symbol.upper()
+    if not base_sym.endswith("USDT"):
+        base_sym += "USDT"
+
+    base = "https://www.tradingview.com/chart/lX5eDAis"
+    if exchange == "BYBIT":
+        trade_link = f"https://www.bybit.com/trade/usdt/{base_sym}"
+    else:
+        trade_link = f"https://www.bitget.com/futures/usdt/{base_sym}"
+
+    return {
+        "coin_h2":  f"{base}/?symbol={exchange}:{tv_sym}&interval=120",
+        "coin_h4":  f"{base}/?symbol={exchange}:{tv_sym}&interval=240",
+        "btc_h2":   f"{base}/?symbol=BITGET:BTCUSDT.P&interval=120",
+        "total2":   f"{base}/?symbol=CRYPTOCAP:TOTAL2&interval=120",
+        "trade":    trade_link,
+        "bitget":   trade_link,  # Backward-compat alias
+    }
+
+
+def _tv_chart_links_legacy(symbol: str) -> dict:  # noqa — kept for older callers
     """
     Generiert TradingView Chart-Links mit gespeichertem Layout lX5eDAis
     + direkten Bitget-Trading-Link. Symbol wird automatisch getauscht,
@@ -8642,6 +9727,16 @@ def poll_telegram_commands():
                 cmd_alarm(["/alarm"] + _tokens)
             else:
                 cmd_alarm(["/alarm"])
+        elif cmd == "/risk_reset":
+            global AUTO_TRADE_ENABLED
+            AUTO_TRADE_ENABLED = True
+            log("[risk_reset] Circuit-Breaker zurückgesetzt")
+            reply(
+                "✅ <b>/risk_reset — Circuit-Breaker zurückgesetzt</b>\n\n"
+                "AUTO_TRADE_ENABLED = True\n"
+                "Neue Trades sind wieder erlaubt.\n\n"
+                f"DAILY_DD={DAILY_DD_LIMIT_PCT:.0f}%, WEEKLY_DD={WEEKLY_DD_LIMIT_PCT:.0f}%"
+            )
         elif cmd == "/hilfe" or cmd == "/start" or cmd == "/help":
             cmd_hilfe()
         else:
@@ -9386,12 +10481,31 @@ def start_webhook_server():
                 direction = "short"
 
         # Symbol bereinigen: BITGET:ETHUSDT.P → ETHUSDT
+        # v4.57: Exchange aus Prefix oder exchange-Feld lesen
+        _wh_exchange = (data.get("exchange") or "").upper()
+        if not _wh_exchange:
+            if raw_symbol.upper().startswith("BYBIT:"):
+                _wh_exchange = "BYBIT"
+            else:
+                _wh_exchange = "BITGET"
         symbol = raw_symbol
         for prefix in ["BITGET:", "BYBIT:", "BINANCE:"]:
             symbol = symbol.replace(prefix, "")
         symbol = symbol.replace(".P", "").replace("PERP", "")
         if not symbol.endswith("USDT"):
             symbol += "USDT"
+
+        # Exchange im _symbol_exchange_map und trade_data aktualisieren
+        if _wh_exchange in ("BITGET", "BYBIT") and symbol:
+            _symbol_exchange_map[symbol] = _wh_exchange
+            if symbol in trade_data:
+                trade_data[symbol]["exchange"] = _wh_exchange
+
+        # v4.56: Coin-Silence-Tracking — letzten Signal-Timestamp pro Symbol aktualisieren.
+        # Nur Trade-relevante Signaltypen tracken (BTC_DIR / T2_DIR sind Makro-Signale,
+        # keine Coin-spezifischen Webhooks und daher nicht aussagekräftig).
+        if signal_type in ("H2_SIGNAL", "HARSI_EXIT", "HARSI_SL", "SLING_SL") and symbol:
+            _update_coin_signal_ts(symbol)
 
         # v4.11: HARSI_SL Universal — falls direction fehlt/auto, aus offener
         # Position ableiten. Ein einziger Watchlist-Alarm feuert dann für alle
@@ -11115,13 +12229,19 @@ def main():
         log("In Railway → Variables eintragen.")
         return
 
-    log("DOMINUS Trade-Automatisierung v4.55 gestartet — mit finanzmathematischen Optimierungen")
+    log("DOMINUS Trade-Automatisierung v4.57 gestartet — Bybit-Integration + Quarter-Kelly + Circuit-Breaker")
     log(f"Intervall: {POLL_INTERVAL}s")
     log("Warte auf neue Trades...")
     log("─" * 55)
 
     # Gespeicherten State laden
     load_state()
+
+    # v4.57: Symbol → Exchange Mapping laden (aus master_watchlist.txt)
+    _load_symbol_exchange_map()
+
+    # v4.56: Coin-Silence-Timestamps laden
+    _load_coin_signal_ts()
 
     # Webhook-Server in separatem Thread starten
     t = threading.Thread(target=start_webhook_server, daemon=True)
@@ -11150,6 +12270,8 @@ def main():
     # Bugs (neue Trades wurden als Nachkauf interpretiert). Beim Startup
     # gleichen wir state-File mit Bitget-Live-State ab und entfernen Ghosts.
     _active_syms = {p.get("symbol") for p in positions if p.get("symbol")}
+    # v4.57: Auch Bybit-Positionen sind aktiv
+    # (bereits in get_all_positions() kombiniert)
     _orphans = [s for s in list(new_trade_done.keys()) if s not in _active_syms]
     if _orphans:
         log(f"  ⚠ {len(_orphans)} verwaiste(s) Ghost-Flag(s) gefunden: "
@@ -11191,6 +12313,10 @@ def main():
             # ── 0. Telegram-Befehle prüfen ─────────────────
             poll_telegram_commands()
 
+            # ── 0z. Drawdown-Circuit-Breaker ────────────────
+            # Einmal pro Polling-Zyklus prüfen (nicht zu häufig)
+            _check_drawdown_circuit_breaker()
+
             # ── 0a. Auto Daily Report um 23:59 ─────────────
             global daily_report_sent_date, weekly_report_sent_week
             _now   = datetime.now()
@@ -11217,6 +12343,17 @@ def main():
                     log("[Weekly-Report] ✓ Report gesendet")
                 except Exception as _we:
                     log(f"[Weekly-Report] ✗ Fehler: {_we}")
+
+            # ── 0c. v4.56 Coin-Silence-Check (täglich um COIN_SILENCE_CHECK_HOUR UTC) ──
+            global _coin_silence_sent_date
+            if (_now.hour == COIN_SILENCE_CHECK_HOUR and _now.minute == 0
+                    and _coin_silence_sent_date != _today):
+                log(f"[Silence] Täglicher Coin-Silence-Check ({COIN_SILENCE_CHECK_HOUR}:00)...")
+                try:
+                    _check_coin_silence()
+                    _save_coin_signal_ts()   # finale Persistenz nach Check
+                except Exception as _se:
+                    log(f"[Silence] ✗ Fehler: {_se}")
 
             # ── 0b. H4 Puffer flushen wenn Zeitfenster abgelaufen ──
             # Lock für den ganzen Check — verhindert Race mit Webhook-Thread
