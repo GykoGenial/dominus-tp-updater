@@ -34,6 +34,10 @@ Changelog v4.58 — FIX: Setup-Schleife + get_sl_price pos_loss:
       pos_loss Plan-Order gesetzt wurde.
   F3: setup_new_trade() ruft jetzt save_state() am Ende auf um
       new_trade_done + last_known_size persistent zu machen.
+  F4: MIN_AUTO_TRADE_USDT env var (default 0 = off) — Mindest-Margin
+      als Floor wenn Kelly < MIN_AUTO_TRADE_USDT. Greift nach dem
+      10%-Cap. Löst das TP1/TP2-Problem bei kleinen Konten (<500 USDT).
+      Empfehlung: MIN_AUTO_TRADE_USDT=5 bis Kapital auf ~500 USDT.
 
 Changelog v4.57 — Bybit-Integration + Quarter-Kelly + Drawdown-Circuit-Breaker:
   B1: Bybit V5 API — paralleler Exchange-Adapter (exchange_bybit_*) neben Bitget.
@@ -1082,6 +1086,10 @@ MAX_AUTO_TRADE_USDT       = _env_float("MAX_AUTO_TRADE_USDT", 0.0)
 BYBIT_API_KEY             = os.environ.get("BYBIT_API_KEY", "")
 BYBIT_SECRET_KEY          = os.environ.get("BYBIT_SECRET_KEY", "")
 MAX_AUTO_TRADE_USDT_BYBIT = _env_float("MAX_AUTO_TRADE_USDT_BYBIT", 0.0)
+# v4.58: Mindest-Margin pro Trade — Floor wenn Kelly zu kleines Konto ergibt.
+# Verhindert dass TP1/TP2 wegen zu kleiner Position wegfallen.
+# Default 0 = deaktiviert (reines Kelly-Sizing). Empfehlung: 5.0 bei <500 USDT.
+MIN_AUTO_TRADE_USDT       = _env_float("MIN_AUTO_TRADE_USDT", 0.0)
 # v4.57: Quarter-Kelly — reduziert Positionsgrösse, senkt Drawdown
 KELLY_FRACTION            = _env_float("KELLY_FRACTION", 0.25)
 # v4.57: Drawdown-Circuit-Breaker — setzt AUTO_TRADE_ENABLED=False bei -x% Tag/Woche
@@ -2648,6 +2656,13 @@ def _execute_trade_bybit(symbol: str, direction: str, leverage: int,
         initial_margin = cap_10pct
     if MAX_AUTO_TRADE_USDT_BYBIT > 0 and initial_margin > MAX_AUTO_TRADE_USDT_BYBIT:
         initial_margin = MAX_AUTO_TRADE_USDT_BYBIT
+
+    # Floor v4.58: MIN_AUTO_TRADE_USDT
+    if MIN_AUTO_TRADE_USDT > 0 and initial_margin < MIN_AUTO_TRADE_USDT:
+        log(f"  [Bybit] Initial-Margin {initial_margin:.2f} < "
+            f"MIN_AUTO_TRADE_USDT {MIN_AUTO_TRADE_USDT:.2f} — auf Minimum angehoben")
+        initial_margin = MIN_AUTO_TRADE_USDT
+
     if initial_margin < 1.0:
         return {"ok": False,
                 "reason": f"Initial-Margin {initial_margin:.2f} < 1 USDT (Bybit {balance:.2f})"}
@@ -4786,10 +4801,16 @@ def execute_trade_order(symbol: str, direction: str, leverage: int,
             f"MAX_AUTO_TRADE_USDT {MAX_AUTO_TRADE_USDT:.2f} — capped")
         initial_margin = MAX_AUTO_TRADE_USDT
 
+    # Floor v4.58: MIN_AUTO_TRADE_USDT — Mindestgrösse bei kleinem Konto
+    if MIN_AUTO_TRADE_USDT > 0 and initial_margin < MIN_AUTO_TRADE_USDT:
+        log(f"  Initial-Margin {initial_margin:.2f} < "
+            f"MIN_AUTO_TRADE_USDT {MIN_AUTO_TRADE_USDT:.2f} — auf Minimum angehoben")
+        initial_margin = MIN_AUTO_TRADE_USDT
+
     if initial_margin < 1.0:
         return {"ok": False,
                 "reason": f"Initial-Margin {initial_margin:.2f} < 1 USDT — "
-                          f"Half-Kelly liefert zu wenig (Balance {balance:.2f}, "
+                          f"Kelly liefert zu wenig (Balance {balance:.2f}, "
                           f"Winrate {WINRATE})"}
 
     # Kontrakt-Grösse (Quantität in Base-Coin)
