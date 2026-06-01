@@ -16,6 +16,20 @@ Finanzmathematische Optimierungen:
   ⑪ One-Click-Exec    — 🚀 Trade jetzt Button mit Two-Tap-Confirm (v4.28)
   ⑫ Inline-Berechnung — 🚀 1. Tap zeigt volle /trade-Vorschau (v4.35.1)
 
+Changelog v4.59 — FIX: Queue-Log Reconciliation bei Restart:
+  R1: _reconcile_queue_log() — neue Funktion die beim Startup
+      queue-log Einträge mit taken=0 UND passenden trades.csv-Einträgen
+      automatisch nachträgt. Behebt den Fall wo der Bot mid-Trade
+      neu gestartet wurde und update_entry_log_outcome() keinen
+      offenen taken=1 Eintrag fand.
+      Ablauf: (1) Alle taken=0 Einträge älter als 1h scannen,
+      (2) trades.csv nach gleichem Symbol+Richtung+Datum durchsuchen,
+      (3) Bei Treffer: taken=1 setzen + ts_open/open_entry/close-Daten
+      aus trades.csv eintragen.
+      Repariert MUSDT-Trade 01.06.2026 automatisch beim Deploy.
+  R2: mark_trade_taken() — timestamp-Parse-Fehler führen nicht mehr
+      zu silent break (continue statt break bei Exception).
+
 Changelog v4.58 — FIX: Setup-Schleife + get_sl_price pos_loss:
   F1: setup_new_trade() Loop-Bug behoben — last_known_size[symbol] und
       new_trade_done[symbol]=True werden jetzt VOR DCA/TP-Placement gesetzt.
@@ -7459,8 +7473,10 @@ def mark_trade_taken(symbol: str, direction: str,
             # Timestamp parsen
             try:
                 ts_q = _parse_iso_utc(r.get("ts_queue", ""))
+                if ts_q <= 0:
+                    continue  # v4.59: Parse-Fehler → skip, nicht break
             except Exception:
-                continue
+                continue  # v4.59: Parse-Fehler → skip, nicht break
             if ts_q < cutoff_ts_ns:
                 break  # älter als Fenster → abbrechen
             target_idx = i
@@ -7555,6 +7571,158 @@ def update_entry_log_outcome(symbol: str, direction: str,
         log(f"[update_entry_log_outcome] {symbol} {direction} → R={r_mult:+.2f} "
             f"({close_reason})")
 
+
+
+
+def _reconcile_queue_log() -> None:
+    """v4.59: Startup-Reconciliation — repariert Queue-Einträge nach Bot-Restart.
+
+    Problem: Wenn der Bot nach einem Trade-Open aber vor dem Trade-Close
+    neugestartet wird, bleibt der Queue-Eintrag auf taken=0 und
+    update_entry_log_outcome() findet keinen passenden taken=1 Eintrag.
+
+    Lösung: Beim Startup taken=0 Einträge die älter als 1h sind mit
+    trades.csv abgleichen und nachträglich befüllen.
+    """
+    if not ENTRY_LOG_CSV or not TRADES_CSV:
+        return
+    if not os.path.isfile(ENTRY_LOG_CSV) or not os.path.isfile(TRADES_CSV):
+        return
+
+    import csv as _csv
+    from datetime import datetime as _dt, timezone as _tz
+
+    # trades.csv lesen (semicolon-separiert)
+    trades = []
+    try:
+        with open(TRADES_CSV, "r", encoding="utf-8") as _f:
+            content = _f.read()
+        # Erster Zeilen-Header: mehrere Felder mit ";" getrennt
+        lines = [l.strip() for l in content.splitlines() if l.strip()]
+        if not lines:
+            return
+        # Header-Zeile parsen (kann selbst Semikolons enthalten)
+        header_line = lines[0]
+        if ";" in header_line:
+            headers = [h.strip() for h in header_line.split(";")]
+        else:
+            return
+        for line in lines[1:]:
+            parts = [p.strip() for p in line.split(";")]
+            if len(parts) >= len(headers):
+                trades.append(dict(zip(headers, parts)))
+    except Exception as _e:
+        log(f"[Reconcile] trades.csv Lesefehler: {_e}")
+        return
+
+    if not trades:
+        return
+
+    with _entry_log_lock:
+        rows = _entry_log_read_all()
+        if not rows:
+            return
+
+        now = time.time()
+        cutoff = now - 3600  # Einträge älter als 1h
+        repaired = 0
+
+        for i, r in enumerate(rows):
+            if str(r.get("taken", "0")) == "1":
+                continue  # bereits verarbeitet
+            if r.get("exit_price", ""):
+                continue  # bereits geschlossen
+
+            # Timestamp prüfen — muss älter als 1h sein
+            try:
+                ts_q = _parse_iso_utc(r.get("ts_queue", ""))
+                if ts_q <= 0 or ts_q > cutoff:
+                    continue
+            except Exception:
+                continue
+
+            sym = r.get("symbol", "")
+            direction = (r.get("direction") or "").lower()
+            if not sym or not direction:
+                continue
+
+            # Passenden Trade in trades.csv suchen
+            # Sortiert nach Datum — neuester zuerst
+            match = None
+            for t in reversed(trades):
+                t_sym = t.get("Symbol", "").upper()
+                t_dir = t.get("Richtung", "").lower()
+                if t_sym != sym.upper():
+                    continue
+                if t_dir != direction:
+                    continue
+                # Datum prüfen: Trade muss nach queue_entry sein
+                try:
+                    t_datum = t.get("Datum", "")  # z.B. "01.06.2026"
+                    t_zeit  = t.get("Zeit (UTC)", "")  # z.B. "17:56"
+                    if t_datum and t_zeit:
+                        d, m, y = t_datum.split(".")
+                        hh, mm  = t_zeit.split(":")
+                        ts_close = _dt(int(y), int(m), int(d), int(hh), int(mm),
+                                       tzinfo=_tz.utc).timestamp()
+                        if ts_close > ts_q:
+                            match = (t, ts_close)
+                            break
+                except Exception:
+                    continue
+
+            if not match:
+                continue
+
+            t, ts_close = match
+            # Queue-Eintrag reparieren
+            try:
+                open_entry_q = float(r.get("entry") or r.get("open_entry") or 0)
+                open_sl_q    = float(r.get("sl") or r.get("open_sl") or 0)
+                exit_price   = float(t.get("Close", 0) or 0)
+                pnl_usdt     = float((t.get("PnL USDT") or "0").replace(",", "."))
+                won          = t.get("Won", "").lower() in ("ja", "yes", "1", "true")
+                leverage     = int(float(t.get("Hebel", 0) or 0))
+                duration_str = t.get("Dauer", "")
+
+                r_mult = calc_r_multiple(open_entry_q, open_sl_q, exit_price, direction)
+
+                # Dauer in Sekunden konvertieren (z.B. "4h 59m")
+                dur_sec = 0
+                try:
+                    import re as _re
+                    _h = _re.search(r"(\d+)h", duration_str)
+                    _m = _re.search(r"(\d+)m", duration_str)
+                    dur_sec = (int(_h.group(1)) * 3600 if _h else 0) +                               (int(_m.group(1)) * 60   if _m else 0)
+                except Exception:
+                    pass
+
+                ts_open_approx = ts_close - dur_sec if dur_sec > 0 else ts_q
+
+                rows[i]["taken"]         = 1
+                rows[i]["ts_open"]       = _dt.fromtimestamp(ts_open_approx, _tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                rows[i]["open_entry"]    = float(t.get("Entry", 0) or 0)
+                rows[i]["open_sl"]       = open_sl_q
+                rows[i]["open_leverage"] = leverage
+                rows[i]["ts_close"]      = _dt.fromtimestamp(ts_close, _tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                rows[i]["duration_sec"]  = dur_sec
+                rows[i]["exit_price"]    = exit_price
+                rows[i]["pnl_usdt"]      = round(pnl_usdt, 2)
+                rows[i]["r_multiple"]    = round(r_mult, 3)
+                rows[i]["won"]           = 1 if won else 0
+                rows[i]["close_reason"]  = "reconciled_on_restart"
+                repaired += 1
+                log(f"[Reconcile] ✓ {sym} {direction} repariert — "
+                    f"PnL={pnl_usdt:+.2f} USDT | R={r_mult:+.2f}")
+            except Exception as _e:
+                log(f"[Reconcile] ✗ {sym} {direction}: {_e}")
+                continue
+
+        if repaired > 0:
+            _entry_log_write_all(rows)
+            log(f"[Reconcile] {repaired} Queue-Eintrag/-Einträge repariert")
+        else:
+            log("[Reconcile] Kein Reparaturbedarf gefunden")
 
 # ── Statistik-Helfer ───────────────────────────────────────────
 
@@ -12290,7 +12458,7 @@ def main():
         log("In Railway → Variables eintragen.")
         return
 
-    log("DOMINUS Trade-Automatisierung v4.58 gestartet — Bybit-Integration + Quarter-Kelly + Circuit-Breaker")
+    log("DOMINUS Trade-Automatisierung v4.59 gestartet — Bybit-Integration + Quarter-Kelly + Circuit-Breaker")
     log(f"Intervall: {POLL_INTERVAL}s")
     log("Warte auf neue Trades...")
     log("─" * 55)
@@ -12300,6 +12468,12 @@ def main():
 
     # v4.57: Symbol → Exchange Mapping laden (aus master_watchlist.txt)
     _load_symbol_exchange_map()
+
+    # v4.59: Queue-Log Reconciliation — repariert taken=0 Einträge nach Restart
+    try:
+        _reconcile_queue_log()
+    except Exception as _re:
+        log(f'[Reconcile] Fehler: {_re}')
 
     # v4.56: Coin-Silence-Timestamps laden
     _load_coin_signal_ts()
