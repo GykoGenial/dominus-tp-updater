@@ -16,6 +16,25 @@ Finanzmathematische Optimierungen:
   ⑪ One-Click-Exec    — 🚀 Trade jetzt Button mit Two-Tap-Confirm (v4.28)
   ⑫ Inline-Berechnung — 🚀 1. Tap zeigt volle /trade-Vorschau (v4.35.1)
 
+Changelog v4.58 — FIX: Setup-Schleife + get_sl_price pos_loss:
+  F1: setup_new_trade() Loop-Bug behoben — last_known_size[symbol] und
+      new_trade_done[symbol]=True werden jetzt VOR DCA/TP-Placement gesetzt.
+      Vorher: wenn DCA/TP-Placement eine Exception warf (oder nach der
+      90s-Cooldown-Ablauf), blieben beide auf 0/False → Bot erkannte den
+      Trade jede Poll-Runde neu als "Neuer Trade erkannt" und wiederholte
+      das Setup 7× (beobachtet bei MUSDT 01.06.2026).
+  F2: get_sl_price() liest pos_loss Plan-Orders jetzt robust:
+      (a) holdSide-Vergleich case-insensitiv (Bitget liefert manchmal
+          "Long"/"Short" statt "long"/"short")
+      (b) Prüft zusätzliche Preis-Felder: triggerPrice, stopLossTriggerPrice,
+          price, executePrice
+      (c) pos_loss-Orders ohne holdSide-Feld werden ebenfalls akzeptiert
+          (position-level SL gilt für die ganze Position)
+      Folge: Auto-SL-Forensik zeigt nicht mehr fälschlich 0 wenn SL als
+      pos_loss Plan-Order gesetzt wurde.
+  F3: setup_new_trade() ruft jetzt save_state() am Ende auf um
+      new_trade_done + last_known_size persistent zu machen.
+
 Changelog v4.57 — Bybit-Integration + Quarter-Kelly + Drawdown-Circuit-Breaker:
   B1: Bybit V5 API — paralleler Exchange-Adapter (exchange_bybit_*) neben Bitget.
       Eigene Auth (HMAC-SHA256 Hex, X-BAPI-* Headers), bybit_get/bybit_post mit
@@ -3099,13 +3118,27 @@ def get_sl_price(symbol: str, direction: str) -> float:
                         return sl
 
     # Methode 2: Plan-Orders lesen (plan-basierter SL via place-tpsl-order)
+    # FIX v4.58: pos_loss-Orders robust lesen:
+    # (a) holdSide case-insensitiv vergleichen (Bitget liefert manchmal "Long"/"Short")
+    # (b) pos_loss ohne holdSide akzeptieren (position-level SL gilt für ganze Position)
+    # (c) Mehrere Preis-Felder prüfen
     orders = _get_plan_orders(symbol)
     SL_TYPES = {"loss_plan", "pos_loss", "moving_plan"}
+    PRICE_FIELDS = ("triggerPrice", "stopLossTriggerPrice", "executePrice",
+                    "triggerPriceType", "price")
     for o in orders:
-        if o.get("planType") in SL_TYPES and o.get("holdSide") == direction:
-            price = float(o.get("triggerPrice", 0) or 0)
-            if price > 0:
-                log(f"  SL aus plan-orders: {o.get('planType')} @ {price}")
+        plan_type = o.get("planType", "")
+        if plan_type not in SL_TYPES:
+            continue
+        hold_side = (o.get("holdSide") or "").lower()
+        # pos_loss ist position-level → gilt unabhängig von holdSide
+        # loss_plan hat holdSide → nur wenn passend
+        if hold_side and hold_side != direction.lower() and plan_type != "pos_loss":
+            continue
+        for pf in PRICE_FIELDS:
+            price = float(o.get(pf, 0) or 0)
+            if price > 0 and price != float("inf"):
+                log(f"  SL aus plan-orders [{plan_type}].{pf}: {price}")
                 return price
 
     return 0.0
@@ -5311,6 +5344,14 @@ def setup_new_trade(pos: dict):
     elif direction == "short" and sl_price <= entry:
         log(f"  ✗ SL ({sl_price}) liegt unter Entry ({entry}) bei Short!")
 
+    # ── 3a. Loop-Guard FRÜH setzen (FIX v4.58) ──────────────
+    # last_known_size + new_trade_done werden VOR DCA/TP-Placement gesetzt,
+    # damit der Poll-Loop diesen Trade NICHT als neuen Trade erkennt,
+    # selbst wenn DCA/TP-Placement fehlschlägt oder eine Exception wirft.
+    last_known_avg[symbol]  = entry
+    last_known_size[symbol] = size
+    new_trade_done[symbol]  = True
+
     # ── 3. DCA Limit-Orders setzen ──────────────────────────
     log(f"  Setze DCA-Orders...")
     dca_results = place_dca_orders(
@@ -5329,11 +5370,7 @@ def setup_new_trade(pos: dict):
     )
 
     # ── 5. Status speichern ─────────────────────────────────
-    last_known_avg[symbol]  = entry
-    last_known_size[symbol] = size
-    # new_trade_done IMMER setzen damit der Loop diesen Trade nicht nochmals
-    # als Neu-Trade behandelt. Bei DCA-Fehler: Telegram-Warnung + /refresh empfehlen.
-    new_trade_done[symbol] = True
+    # (last_known_size / new_trade_done bereits in 3a gesetzt)
     # v4.20: Queue-Log Outcome-Bindung — matched die jüngste passende
     # Queue-Zeile mit taken=1 + Open-Preisen. Wenn kein Queue-Eintrag
     # vorhanden (manueller Trade ohne vorheriges Signal), ist das okay —
@@ -5410,6 +5447,9 @@ def setup_new_trade(pos: dict):
     status = "✓ Alle 4" if count == 4 else f"⚠ {count}/4"
     log(f"  {status} TPs gesetzt | "
         f"{len(dca_results)}/2 DCA-Orders gesetzt")
+    # FIX v4.58: State persistieren damit new_trade_done auch nach
+    # einem Railway-Neustart korrekt geladen wird.
+    save_state()
 
 
 def get_existing_tps(symbol: str) -> list:
@@ -12229,7 +12269,7 @@ def main():
         log("In Railway → Variables eintragen.")
         return
 
-    log("DOMINUS Trade-Automatisierung v4.57 gestartet — Bybit-Integration + Quarter-Kelly + Circuit-Breaker")
+    log("DOMINUS Trade-Automatisierung v4.58 gestartet — Bybit-Integration + Quarter-Kelly + Circuit-Breaker")
     log(f"Intervall: {POLL_INTERVAL}s")
     log("Warte auf neue Trades...")
     log("─" * 55)
