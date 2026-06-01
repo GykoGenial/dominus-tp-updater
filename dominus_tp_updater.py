@@ -29,6 +29,13 @@ Changelog v4.59 — FIX: Queue-Log Reconciliation bei Restart:
       Repariert MUSDT-Trade 01.06.2026 automatisch beim Deploy.
   R2: mark_trade_taken() — timestamp-Parse-Fehler führen nicht mehr
       zu silent break (continue statt break bei Exception).
+  R3: _cleanup_over_reconciled() — bereinigt Duplikate die durch
+      die zu aggressive erste Reconciliation entstanden sind.
+      Pro Symbol+Richtung+PnL-Gruppe bleibt nur der Eintrag mit
+      dem höchsten Score, alle anderen werden auf taken=0 zurückgesetzt.
+  R4: Reconciliation prüft jetzt ob bereits ein taken=1 Eintrag
+      im gleichen Zeitfenster existiert (→ skip) und wählt bei
+      mehreren Kandidaten nur den mit dem nächstliegenden Entry-Preis.
 
 Changelog v4.58 — FIX: Setup-Schleife + get_sl_price pos_loss:
   F1: setup_new_trade() Loop-Bug behoben — last_known_size[symbol] und
@@ -7574,6 +7581,64 @@ def update_entry_log_outcome(symbol: str, direction: str,
 
 
 
+
+
+def _cleanup_over_reconciled() -> None:
+    """v4.59b: Bereinigt Einträge die durch die zu aggressive Reconciliation
+    fälschlich als reconciled_on_restart markiert wurden.
+
+    Pro Symbol+Richtung+PnL-Gruppe: nur der Eintrag mit dem HÖCHSTEN SCORE
+    bleibt als reconciliert, alle anderen werden auf taken=0 zurückgesetzt.
+    """
+    if not ENTRY_LOG_CSV or not os.path.isfile(ENTRY_LOG_CSV):
+        return
+
+    with _entry_log_lock:
+        rows = _entry_log_read_all()
+        if not rows:
+            return
+
+        # Gruppen bilden: alle reconciled_on_restart Einträge
+        from collections import defaultdict as _dd
+        groups = _dd(list)
+        for i, r in enumerate(rows):
+            if r.get("close_reason") == "reconciled_on_restart":
+                key = (r.get("symbol", ""), r.get("direction", ""), r.get("pnl_usdt", ""))
+                groups[key].append(i)
+
+        reset_count = 0
+        for key, idxs in groups.items():
+            if len(idxs) <= 1:
+                continue  # Nur 1 Eintrag → korrekt
+            # Höchsten Score finden → behalten
+            best_idx = max(idxs, key=lambda i: int(rows[i].get("score", "0") or "0"))
+            # Alle anderen zurücksetzen
+            for i in idxs:
+                if i == best_idx:
+                    continue
+                r = rows[i]
+                r["taken"]         = 0
+                r["ts_open"]       = ""
+                r["open_entry"]    = ""
+                r["open_sl"]       = ""
+                r["open_leverage"] = ""
+                r["ts_close"]      = ""
+                r["duration_sec"]  = ""
+                r["exit_price"]    = ""
+                r["pnl_usdt"]      = ""
+                r["r_multiple"]    = ""
+                r["won"]           = ""
+                r["close_reason"]  = ""
+                reset_count += 1
+                log(f"[Cleanup] Rückgesetzt: {r.get('symbol')} {r.get('direction')} "
+                    f"score={r.get('score')} (Duplikat reconciled_on_restart)")
+
+        if reset_count > 0:
+            _entry_log_write_all(rows)
+            log(f"[Cleanup] {reset_count} falsch-reconcilierte Einträge zurückgesetzt")
+        else:
+            log("[Cleanup] Keine Duplikate gefunden")
+
 def _reconcile_queue_log() -> None:
     """v4.59: Startup-Reconciliation — repariert Queue-Einträge nach Bot-Restart.
 
@@ -7646,8 +7711,35 @@ def _reconcile_queue_log() -> None:
             if not sym or not direction:
                 continue
 
-            # Passenden Trade in trades.csv suchen
-            # Sortiert nach Datum — neuester zuerst
+            # ── Passenden Trade in trades.csv suchen ────────────────
+            # FIX v4.59b: Nur EINEN Match pro Symbol+Richtung+Tag.
+            # Bei mehreren Kandidaten (same symbol/dir, same day) wird
+            # nur der MIT DEM NÄCHSTLIEGENDEN Entry-Preis reconciliert —
+            # alle anderen bleiben taken=0 (legitime Nicht-Trades).
+
+            # Prüfen ob bereits ein taken=1 Eintrag für dieses Symbol+Richtung
+            # im gleichen Zeitfenster existiert → dann war Trade normal getrackt
+            _already_taken = any(
+                str(rows[j].get("taken", "0")) == "1"
+                and rows[j].get("symbol") == sym
+                and rows[j].get("direction") == direction
+                and abs(_parse_iso_utc(rows[j].get("ts_queue", "") or "") - ts_q) < 7200
+                for j in range(len(rows)) if j != i
+            )
+            if _already_taken:
+                continue  # Trade bereits korrekt im Queue-Log
+
+            # Alle Kandidaten für dieses Symbol+Richtung+Tag sammeln
+            _same_group = [
+                j for j in range(len(rows))
+                if j != i
+                and str(rows[j].get("taken", "0")) == "0"
+                and rows[j].get("symbol") == sym
+                and rows[j].get("direction") == direction
+                and abs(_parse_iso_utc(rows[j].get("ts_queue", "") or "") - ts_q) < 86400
+            ]
+
+            # Passenden Trade suchen
             match = None
             for t in reversed(trades):
                 t_sym = t.get("Symbol", "").upper()
@@ -7656,10 +7748,9 @@ def _reconcile_queue_log() -> None:
                     continue
                 if t_dir != direction:
                     continue
-                # Datum prüfen: Trade muss nach queue_entry sein
                 try:
-                    t_datum = t.get("Datum", "")  # z.B. "01.06.2026"
-                    t_zeit  = t.get("Zeit (UTC)", "")  # z.B. "17:56"
+                    t_datum = t.get("Datum", "")
+                    t_zeit  = t.get("Zeit (UTC)", "")
                     if t_datum and t_zeit:
                         d, m, y = t_datum.split(".")
                         hh, mm  = t_zeit.split(":")
@@ -7673,6 +7764,25 @@ def _reconcile_queue_log() -> None:
 
             if not match:
                 continue
+
+            # ── Bester Kandidat im Tag? ──────────────────────────────────
+            # Bei mehreren taken=0 Einträgen für dasselbe Symbol+Richtung:
+            # nur der MIT DEM NÄCHSTLIEGENDEN Entry-Preis wird reconciliert.
+            # Alle anderen überspringen (sie hatten keinen tatsächlichen Fill).
+            if _same_group:
+                t_entry = float(match[0].get("Entry", 0) or 0)
+                my_entry = float(r.get("entry", 0) or 0)
+                my_diff = abs(my_entry - t_entry) / max(t_entry, 1e-10) if t_entry > 0 else 999
+
+                # Prüfen ob ein anderer Kandidat näherliegend ist
+                for j in _same_group:
+                    other_entry = float(rows[j].get("entry", 0) or 0)
+                    other_diff = abs(other_entry - t_entry) / max(t_entry, 1e-10) if t_entry > 0 else 999
+                    if other_diff < my_diff and rows[j].get("close_reason", "") != "reconciled_on_restart":
+                        # Anderer Kandidat passt besser → diesen überspringen
+                        break
+                else:
+                    pass  # Ich bin der beste Kandidat → weiter mit Reconciliation
 
             t, ts_close = match
             # Queue-Eintrag reparieren
@@ -12468,6 +12578,12 @@ def main():
 
     # v4.57: Symbol → Exchange Mapping laden (aus master_watchlist.txt)
     _load_symbol_exchange_map()
+
+    # v4.59b: Cleanup falsch-reconcilierter Duplikate (zu aggressive erste Reconcile)
+    try:
+        _cleanup_over_reconciled()
+    except Exception as _ce:
+        log(f'[Cleanup] Fehler: {_ce}')
 
     # v4.59: Queue-Log Reconciliation — repariert taken=0 Einträge nach Restart
     try:
