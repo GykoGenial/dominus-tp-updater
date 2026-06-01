@@ -7689,7 +7689,9 @@ def _reconcile_queue_log() -> None:
             return
 
         now = time.time()
-        cutoff = now - 3600  # Einträge älter als 1h
+        cutoff      = now - 3600        # Einträge älter als 1h
+        max_age     = now - 7 * 86400   # v4.59b: max. 7 Tage zurück reconcilieren
+        # Ältere Einträge bleiben unberührt (waren legitime taken=0 Signale)
         repaired = 0
 
         for i, r in enumerate(rows):
@@ -7703,6 +7705,8 @@ def _reconcile_queue_log() -> None:
                 ts_q = _parse_iso_utc(r.get("ts_queue", ""))
                 if ts_q <= 0 or ts_q > cutoff:
                     continue
+                if ts_q < max_age:
+                    continue  # v4.59b: Einträge älter als 7 Tage nicht anfassen
             except Exception:
                 continue
 
