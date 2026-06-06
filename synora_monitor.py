@@ -36,6 +36,9 @@ Railway-Variablen (NEU — separate Synora-Konfiguration):
   SYNORA_BUDGET_CAP_USDT  → Maximales Budget in USDT (Default: 0 = kein Cap, nutze vollen Balance)
                             Beispiel: 500 → nutzt min(Bybit-Balance, 500 USDT)
   SYNORA_STATE_FILE       → Pfad zur State-JSON (Default: /app/data/synora_state.json)
+  SYNORA_TRADES_CSV       → Pfad zum Trade-Archiv (Default: /app/data/synora_trades.csv)
+  SYNORA_DASHBOARD_SECRET → Secret für /dashboard URL (leer = kein Schutz)
+  SYNORA_DASHBOARD_PORT   → Port für Flask-Dashboard (Default: 8080)
   SYNORA_MAX_GAIN_MODE    → "roi" (Default) oder "price":
                             "roi"   = Maximaler Gewinn % bezieht sich auf Margin-ROI
                                       → TP-Preis = entry ± (gain%/leverage)%
@@ -63,7 +66,9 @@ import asyncio
 import logging
 import requests
 import math
-from datetime import datetime
+import threading
+import csv as csv_module
+from datetime import datetime, timezone
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
@@ -71,6 +76,9 @@ from cryptography.hazmat.primitives.asymmetric import padding
 # ── Telethon ────────────────────────────────────────────────────
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
+
+# ── Flask (Dashboard) ───────────────────────────────────────────
+from flask import Flask, request, Response
 
 # ═══════════════════════════════════════════════════════════════
 # KONFIGURATION
@@ -98,6 +106,11 @@ def _env_float(name: str, default: float) -> float:
 SYNORA_BUDGET_CAP_USDT = _env_float("SYNORA_BUDGET_CAP_USDT", 0.0)
 # 0 = kein Cap (volles Balance); >0 = maximales Budget in USDT
 # Beispiel: SYNORA_BUDGET_CAP_USDT=500 → nutzt min(Balance, 500 USDT)
+
+SYNORA_TRADES_CSV        = os.environ.get("SYNORA_TRADES_CSV", "/app/data/synora_trades.csv")
+SYNORA_DASHBOARD_SECRET  = os.environ.get("SYNORA_DASHBOARD_SECRET", "")
+SYNORA_DASHBOARD_PORT    = int(os.environ.get("SYNORA_DASHBOARD_PORT", "8080"))
+POSITION_POLL_INTERVAL   = 60   # Sekunden zwischen Bybit-Position-Checks
 
 # Bybit Sub-Account (RSA-Auth für AI Subaccount)
 BYBIT_SYNORA_API_KEY     = os.environ.get("BYBIT_SYNORA_API_KEY", "")
@@ -151,6 +164,46 @@ def save_state() -> None:
             json.dump(_state, f, indent=2, ensure_ascii=False)
     except Exception as e:
         log.error(f"State-Speicherfehler: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════
+# TRADE-ARCHIV (CSV)
+# ═══════════════════════════════════════════════════════════════
+
+CSV_HEADERS = [
+    "opened_at", "closed_at", "symbol", "side", "lev",
+    "entry", "sl", "tp", "budget_usdt",
+    "close_price", "pnl_usdt", "outcome",
+]
+
+def csv_log_synora_trade(record: dict) -> None:
+    """Schreibt einen abgeschlossenen Trade in synora_trades.csv (thread-safe)."""
+    try:
+        os.makedirs(os.path.dirname(SYNORA_TRADES_CSV), exist_ok=True)
+        file_exists = os.path.isfile(SYNORA_TRADES_CSV)
+        with open(SYNORA_TRADES_CSV, "a", newline="", encoding="utf-8") as f:
+            writer = csv_module.DictWriter(f, fieldnames=CSV_HEADERS)
+            if not file_exists:
+                writer.writeheader()
+            row = {k: record.get(k, "") for k in CSV_HEADERS}
+            writer.writerow(row)
+        log.info(f"CSV: {record.get('symbol')} {record.get('outcome')} geloggt")
+    except Exception as e:
+        log.error(f"CSV-Log Fehler: {e}")
+
+def read_trades_csv() -> list:
+    """Liest alle archivierten Trades aus der CSV."""
+    trades = []
+    try:
+        if not os.path.isfile(SYNORA_TRADES_CSV):
+            return []
+        with open(SYNORA_TRADES_CSV, newline="", encoding="utf-8") as f:
+            reader = csv_module.DictReader(f)
+            for row in reader:
+                trades.append(dict(row))
+    except Exception as e:
+        log.error(f"CSV-Lese-Fehler: {e}")
+    return trades
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -760,13 +813,371 @@ async def handle_close(symbol: str, reason: str = "CANCEL") -> None:
     res = close_position_market(symbol, trade["side"], total_qty)
 
     if bybit_ok(res):
+        await asyncio.sleep(2)  # kurz warten bis Bybit P&L verfügbar
+        # Closed P&L von Bybit holen
+        pnl_res = bybit_get("/v5/position/closed-pnl", {
+            "category": BYBIT_CATEGORY, "symbol": symbol, "limit": "1",
+        })
+        pnl_items = (pnl_res.get("result") or {}).get("list") or []
+        closed_pnl  = 0.0
+        close_price = 0.0
+        if pnl_items:
+            p = pnl_items[0]
+            closed_pnl  = float(p.get("closedPnl",    0) or 0)
+            close_price = float(p.get("avgExitPrice", 0) or 0)
+
+        csv_log_synora_trade({
+            "opened_at":   trade.get("opened_at", ""),
+            "closed_at":   datetime.now(timezone.utc).isoformat(),
+            "symbol":      symbol,
+            "side":        trade.get("side", ""),
+            "lev":         trade.get("lev", ""),
+            "entry":       trade.get("entry", ""),
+            "sl":          trade.get("sl", ""),
+            "tp":          trade.get("tp", ""),
+            "budget_usdt": trade.get("budget_usdt", ""),
+            "close_price": round(close_price, 6),
+            "pnl_usdt":    round(closed_pnl, 4),
+            "outcome":     reason,
+        })
         del _state["trades"][symbol]
         save_state()
-        tg(f"🔴 <b>SYNORA Position geschlossen</b>\n{symbol} ({reason})")
+        pnl_str = f"+{closed_pnl:.2f}" if closed_pnl >= 0 else f"{closed_pnl:.2f}"
+        tg(f"🔴 <b>SYNORA Position geschlossen</b>\n{symbol} ({reason})\nP&L: {pnl_str} USDT")
     else:
         err = res.get("retMsg", "unbekannt")
         tg(f"⚠️ SYNORA: Close-Fehler {symbol}: {err}")
         log.warning(f"Close-Fehler: {res}")
+
+
+# ═══════════════════════════════════════════════════════════════
+# BYBIT POSITION-POLLING  (erkennt TP/SL-Hits automatisch)
+# ═══════════════════════════════════════════════════════════════
+
+def _determine_outcome(trade: dict, close_price: float) -> str:
+    """Ermittelt ob Trade via TP, SL oder manuell geschlossen wurde."""
+    tp  = trade.get("tp")
+    sl  = trade.get("sl")
+    side = trade.get("side", "LONG")
+    if not tp or not sl or not close_price:
+        return "closed"
+    tp_f  = float(tp)
+    sl_f  = float(sl)
+    cp    = float(close_price)
+    tol   = 0.005   # 0.5% Toleranz
+    if side == "LONG":
+        if cp >= tp_f * (1 - tol):
+            return "TP"
+        elif cp <= sl_f * (1 + tol):
+            return "SL"
+    else:   # SHORT
+        if cp <= tp_f * (1 + tol):
+            return "TP"
+        elif cp >= sl_f * (1 - tol):
+            return "SL"
+    return "manual"
+
+async def check_closed_positions() -> None:
+    """Periodischer Loop: prüft ob Synora-Positionen auf Bybit geschlossen wurden."""
+    log.info("Position-Polling gestartet (Intervall: %ds)", POSITION_POLL_INTERVAL)
+    while True:
+        await asyncio.sleep(POSITION_POLL_INTERVAL)
+        trades_snapshot = dict(_state.get("trades", {}))
+        if not trades_snapshot:
+            continue
+
+        for symbol, trade in trades_snapshot.items():
+            try:
+                # Aktuelle Position auf Bybit abfragen
+                res = bybit_get("/v5/position/list", {
+                    "category": BYBIT_CATEGORY,
+                    "symbol":   symbol,
+                })
+                items = (res.get("result") or {}).get("list") or []
+                pos_size = 0.0
+                for item in items:
+                    if item.get("symbol") == symbol:
+                        pos_size = float(item.get("size", "0") or "0")
+                        break
+
+                if pos_size > 0:
+                    continue   # Position noch offen
+
+                # Position ist zu — Closed-P&L von Bybit holen
+                pnl_res = bybit_get("/v5/position/closed-pnl", {
+                    "category": BYBIT_CATEGORY,
+                    "symbol":   symbol,
+                    "limit":    "1",
+                })
+                pnl_items = (pnl_res.get("result") or {}).get("list") or []
+                closed_pnl  = 0.0
+                close_price = 0.0
+                if pnl_items:
+                    p = pnl_items[0]
+                    closed_pnl  = float(p.get("closedPnl",    0) or 0)
+                    close_price = float(p.get("avgExitPrice", 0) or 0)
+
+                outcome = _determine_outcome(trade, close_price)
+
+                record = {
+                    "opened_at":   trade.get("opened_at", ""),
+                    "closed_at":   datetime.now(timezone.utc).isoformat(),
+                    "symbol":      symbol,
+                    "side":        trade.get("side", ""),
+                    "lev":         trade.get("lev", ""),
+                    "entry":       trade.get("entry", ""),
+                    "sl":          trade.get("sl", ""),
+                    "tp":          trade.get("tp", ""),
+                    "budget_usdt": trade.get("budget_usdt", ""),
+                    "close_price": round(close_price, 6),
+                    "pnl_usdt":    round(closed_pnl, 4),
+                    "outcome":     outcome,
+                }
+                csv_log_synora_trade(record)
+
+                # Aus State entfernen
+                _state["trades"].pop(symbol, None)
+                save_state()
+
+                emoji    = "✅" if closed_pnl >= 0 else "❌"
+                pnl_str  = f"+{closed_pnl:.2f}" if closed_pnl >= 0 else f"{closed_pnl:.2f}"
+                tg(
+                    f"{emoji} <b>SYNORA Trade geschlossen</b>\n"
+                    f"Symbol: <b>{symbol}</b> | {outcome}\n"
+                    f"Close: {close_price} | P&L: <b>{pnl_str} USDT</b>"
+                )
+                log.info(f"Trade {symbol} geschlossen: {outcome} | P&L {pnl_str}")
+
+            except Exception as e:
+                log.error(f"Position-Polling Fehler ({symbol}): {e}")
+
+
+# ═══════════════════════════════════════════════════════════════
+# FLASK DASHBOARD
+# ═══════════════════════════════════════════════════════════════
+
+flask_app = Flask(__name__)
+
+def _compute_stats(trades: list) -> dict:
+    total = len(trades)
+    if total == 0:
+        return dict(total=0, wins=0, losses=0, winrate=0,
+                    net_pnl=0, avg_win=0, avg_loss=0)
+    pnls  = [float(t.get("pnl_usdt", 0) or 0) for t in trades]
+    wins  = [p for p in pnls if p > 0]
+    losses= [p for p in pnls if p <= 0]
+    return dict(
+        total   = total,
+        wins    = len(wins),
+        losses  = len(losses),
+        winrate = len(wins) / total * 100,
+        net_pnl = sum(pnls),
+        avg_win = sum(wins) / len(wins) if wins else 0,
+        avg_loss= sum(losses) / len(losses) if losses else 0,
+    )
+
+def _equity_series(trades: list) -> list:
+    running = 0.0
+    series  = []
+    for t in trades:
+        running += float(t.get("pnl_usdt", 0) or 0)
+        label    = (t.get("closed_at") or "")[:10]
+        series.append({"x": label, "y": round(running, 2)})
+    return series
+
+def _outcome_counts(trades: list) -> dict:
+    counts = {}
+    for t in trades:
+        o = t.get("outcome", "?")
+        counts[o] = counts.get(o, 0) + 1
+    return counts
+
+@flask_app.route("/dashboard")
+def dashboard():
+    secret = request.args.get("secret", "")
+    if SYNORA_DASHBOARD_SECRET and secret != SYNORA_DASHBOARD_SECRET:
+        return Response("403 Forbidden", status=403)
+
+    trades     = read_trades_csv()
+    stats      = _compute_stats(trades)
+    equity     = _equity_series(trades)
+    outcomes   = _outcome_counts(trades)
+    open_pos   = _state.get("trades", {})
+    recent     = list(reversed(trades[-50:]))   # neueste zuerst
+
+    eq_labels  = json.dumps([p["x"] for p in equity])
+    eq_values  = json.dumps([p["y"] for p in equity])
+    oc_labels  = json.dumps(list(outcomes.keys()))
+    oc_values  = json.dumps(list(outcomes.values()))
+
+    pnl_color  = "#22c55e" if stats["net_pnl"] >= 0 else "#ef4444"
+    wr_color   = "#22c55e" if stats["winrate"] >= 50 else "#ef4444"
+
+    open_rows = ""
+    for sym, tr in open_pos.items():
+        tp_str = f"{tr['tp']:.4f}" if tr.get("tp") else "—"
+        open_rows += (
+            f"<tr>"
+            f"<td>{sym}</td>"
+            f"<td class='{'long' if tr['side']=='LONG' else 'short'}'>{tr['side']}</td>"
+            f"<td>{tr['lev']}x</td>"
+            f"<td>{tr['entry']}</td>"
+            f"<td>{tr['sl']}</td>"
+            f"<td>{tp_str}</td>"
+            f"<td>{(tr.get('opened_at','')[:16]).replace('T',' ')}</td>"
+            f"</tr>"
+        )
+
+    trade_rows = ""
+    for t in recent:
+        pnl   = float(t.get("pnl_usdt", 0) or 0)
+        pclass = "pos" if pnl >= 0 else "neg"
+        tp_str = (t.get("tp") or "—")
+        side_class = "long" if t.get("side","") == "LONG" else "short"
+        trade_rows += (
+            f"<tr>"
+            f"<td>{(t.get('closed_at','')[:16]).replace('T',' ')}</td>"
+            f"<td>{t.get('symbol','')}</td>"
+            f"<td class='{side_class}'>{t.get('side','')}</td>"
+            f"<td>{t.get('lev','')}x</td>"
+            f"<td>{t.get('entry','')}</td>"
+            f"<td>{t.get('close_price','')}</td>"
+            f"<td>{t.get('outcome','')}</td>"
+            f"<td class='{pclass}'>{'+' if pnl>0 else ''}{pnl:.2f}</td>"
+            f"</tr>"
+        )
+
+    html = f"""<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SYNORA Dashboard</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
+<style>
+  *{{box-sizing:border-box;margin:0;padding:0}}
+  body{{background:#0f1117;color:#e2e8f0;font-family:'Segoe UI',system-ui,sans-serif;padding:20px}}
+  h1{{font-size:1.6rem;margin-bottom:4px;color:#a78bfa}}
+  .subtitle{{color:#64748b;font-size:.85rem;margin-bottom:24px}}
+  .grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:14px;margin-bottom:28px}}
+  .card{{background:#1e2330;border-radius:10px;padding:18px;border:1px solid #2d3748}}
+  .card label{{font-size:.72rem;color:#94a3b8;text-transform:uppercase;letter-spacing:.05em;display:block;margin-bottom:6px}}
+  .card .val{{font-size:1.7rem;font-weight:700}}
+  .pos{{color:#22c55e}} .neg{{color:#ef4444}}
+  .long{{color:#22c55e}} .short{{color:#ef4444}}
+  .chart-wrap{{background:#1e2330;border-radius:10px;padding:20px;margin-bottom:24px;border:1px solid #2d3748}}
+  .chart-wrap h3{{color:#94a3b8;font-size:.85rem;text-transform:uppercase;letter-spacing:.05em;margin-bottom:14px}}
+  .two-col{{display:grid;grid-template-columns:2fr 1fr;gap:16px;margin-bottom:24px}}
+  @media(max-width:700px){{.two-col{{grid-template-columns:1fr}}}}
+  table{{width:100%;border-collapse:collapse;font-size:.82rem}}
+  th{{color:#64748b;text-align:left;padding:6px 10px;border-bottom:1px solid #2d3748;font-weight:500}}
+  td{{padding:7px 10px;border-bottom:1px solid #1a2030}}
+  tr:hover td{{background:#252d3d}}
+  .section{{background:#1e2330;border-radius:10px;padding:20px;margin-bottom:24px;border:1px solid #2d3748}}
+  .section h3{{color:#94a3b8;font-size:.85rem;text-transform:uppercase;letter-spacing:.05em;margin-bottom:14px}}
+  .open-badge{{display:inline-block;background:#7c3aed22;color:#a78bfa;border:1px solid #7c3aed55;border-radius:6px;padding:2px 10px;font-size:.78rem;margin-left:8px}}
+  .ts{{color:#64748b;font-size:.78rem;margin-bottom:24px}}
+</style>
+</head>
+<body>
+<h1>🟣 SYNORA Performance Dashboard</h1>
+<p class="ts">Stand: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC &nbsp;·&nbsp; {stats['total']} Trades archiviert</p>
+
+<div class="grid">
+  <div class="card"><label>Trades gesamt</label><div class="val">{stats['total']}</div></div>
+  <div class="card"><label>Wins / Losses</label><div class="val"><span class="pos">{stats['wins']}</span> / <span class="neg">{stats['losses']}</span></div></div>
+  <div class="card"><label>Win Rate</label><div class="val" style="color:{wr_color}">{stats['winrate']:.1f}%</div></div>
+  <div class="card"><label>Net P&amp;L (USDT)</label><div class="val" style="color:{pnl_color}">{'+' if stats['net_pnl']>=0 else ''}{stats['net_pnl']:.2f}</div></div>
+  <div class="card"><label>Ø Gewinn</label><div class="val pos">{stats['avg_win']:.2f}</div></div>
+  <div class="card"><label>Ø Verlust</label><div class="val neg">{stats['avg_loss']:.2f}</div></div>
+</div>
+
+<div class="two-col">
+  <div class="chart-wrap">
+    <h3>Equity-Kurve</h3>
+    <canvas id="equity" height="120"></canvas>
+  </div>
+  <div class="chart-wrap">
+    <h3>Exit-Ursachen</h3>
+    <canvas id="outcomes" height="120"></canvas>
+  </div>
+</div>
+
+{"" if not open_pos else f'''
+<div class="section">
+  <h3>Offene Positionen <span class="open-badge">{len(open_pos)} aktiv</span></h3>
+  <table>
+    <tr><th>Symbol</th><th>Side</th><th>Hb</th><th>Entry</th><th>SL</th><th>TP</th><th>Eröffnet</th></tr>
+    {open_rows}
+  </table>
+</div>'''}
+
+<div class="section">
+  <h3>Letzte Trades (max. 50)</h3>
+  <table>
+    <tr><th>Geschlossen</th><th>Symbol</th><th>Side</th><th>Hb</th><th>Entry</th><th>Close</th><th>Outcome</th><th>P&amp;L</th></tr>
+    {"<tr><td colspan='8' style='color:#64748b;text-align:center;padding:20px'>Noch keine Trades</td></tr>" if not recent else trade_rows}
+  </table>
+</div>
+
+<script>
+const EQ_LABELS = {eq_labels};
+const EQ_VALUES = {eq_values};
+const OC_LABELS = {oc_labels};
+const OC_VALUES = {oc_values};
+const GRID_COLOR = 'rgba(255,255,255,0.05)';
+Chart.defaults.color = '#64748b';
+
+if(EQ_LABELS.length > 0){{
+  new Chart(document.getElementById('equity'), {{
+    type: 'line',
+    data: {{
+      labels: EQ_LABELS,
+      datasets: [{{
+        label: 'Equity (USDT)',
+        data: EQ_VALUES,
+        borderColor: '#a78bfa',
+        backgroundColor: 'rgba(167,139,250,0.12)',
+        fill: true,
+        tension: 0.3,
+        pointRadius: EQ_LABELS.length < 30 ? 3 : 0,
+        borderWidth: 2,
+      }}]
+    }},
+    options: {{
+      responsive: true,
+      plugins: {{ legend: {{ display: false }} }},
+      scales: {{
+        x: {{ grid: {{ color: GRID_COLOR }}, ticks: {{ maxTicksLimit: 8 }} }},
+        y: {{ grid: {{ color: GRID_COLOR }}, ticks: {{ callback: v => v.toFixed(2) + ' $' }} }}
+      }}
+    }}
+  }});
+}}
+
+if(OC_LABELS.length > 0){{
+  const COLORS = ['#22c55e','#ef4444','#f59e0b','#60a5fa','#a78bfa'];
+  new Chart(document.getElementById('outcomes'), {{
+    type: 'doughnut',
+    data: {{
+      labels: OC_LABELS,
+      datasets: [{{ data: OC_VALUES, backgroundColor: COLORS, borderWidth: 0 }}]
+    }},
+    options: {{
+      responsive: true,
+      plugins: {{ legend: {{ position: 'bottom', labels: {{ padding: 12, font: {{ size: 11 }} }} }} }}
+    }}
+  }});
+}}
+</script>
+</body>
+</html>"""
+    return Response(html, content_type="text/html; charset=utf-8")
+
+
+def run_flask() -> None:
+    """Startet Flask in einem Daemon-Thread."""
+    flask_app.run(host="0.0.0.0", port=SYNORA_DASHBOARD_PORT, debug=False, use_reloader=False)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -786,6 +1197,11 @@ async def main() -> None:
         log.error("BYBIT_SYNORA_API_KEY / BYBIT_SYNORA_PRIVATE_KEY fehlen!")
         return
 
+    # ── Flask-Dashboard in Daemon-Thread starten ─────────────
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    log.info(f"Dashboard läuft auf Port {SYNORA_DASHBOARD_PORT} ✓")
+
     cap_info = f" | Cap: {SYNORA_BUDGET_CAP_USDT:.0f} USDT" if SYNORA_BUDGET_CAP_USDT > 0 else " | kein Cap"
     log.info(f"Starte Synora Monitor | Budget: live vom Sub-Account{cap_info} | Source: {SYNORA_CHANNEL}")
     cap_str = f"{SYNORA_BUDGET_CAP_USDT:.0f} USDT Cap" if SYNORA_BUDGET_CAP_USDT > 0 else "kein Cap"
@@ -793,6 +1209,9 @@ async def main() -> None:
 
     client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
     await client.start()
+
+    # ── Position-Polling starten ─────────────────────────────
+    asyncio.ensure_future(check_closed_positions())
 
     # Source resolven — funktioniert für Bot-Chats (int user_id) UND Kanäle (int/-100... oder Link)
     try:
