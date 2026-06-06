@@ -355,8 +355,19 @@ def get_available_balance() -> float:
         res_fund = bybit_get("/v5/asset/transfer/query-account-coin-balance", {
             "accountType": "FUND", "coin": "USDT"
         })
+        if not res_fund or res_fund.get("retCode") != 0:
+            log.warning(f"FUND-Wallet: retCode={res_fund.get('retCode') if res_fund else 'N/A'} "
+                        f"msg={res_fund.get('retMsg','?') if res_fund else 'no response'}")
+            # API-Permissions prüfen
+            perm_res = bybit_get("/v5/user/query-api", {})
+            if perm_res and perm_res.get("retCode") == 0:
+                perms = (perm_res.get("result") or {}).get("permissions", {})
+                log.info(f"API-Key Permissions: {json.dumps(perms)}")
+            else:
+                log.warning(f"Permissions-Abruf fehlgeschlagen: {perm_res}")
         if res_fund and res_fund.get("retCode") == 0:
             bal_info = (res_fund.get("result") or {}).get("balance") or {}
+            log.info(f"FUND raw response: {json.dumps(res_fund.get('result', {}))}")
             # Kann auch eine Liste sein
             if isinstance(bal_info, list):
                 bal_info = next((b for b in bal_info if b.get("coin") == "USDT"), {})
