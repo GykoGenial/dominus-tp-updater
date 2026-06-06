@@ -318,97 +318,45 @@ def bybit_ok(res: dict) -> bool:
     return int(res.get("retCode", -1)) == 0
 
 
+_balance_cache: dict = {"value": 0.0, "ts": 0.0}
+BALANCE_CACHE_TTL = 30   # Sekunden
+
 def get_available_balance() -> float:
     """
-    Liest den verfügbaren USDT-Balance vom Bybit Sub-Account.
-    Probiert UNIFIED → CONTRACT → SPOT der Reihe nach (AI Subaccounts haben oft kein UTA).
+    Liest den verfügbaren USDT-Balance vom Bybit UNIFIED-Wallet.
+    Ergebnis wird 30s gecacht damit Dashboard-Refreshes kein API-Spam erzeugen.
     Wendet SYNORA_BUDGET_CAP_USDT als optionale Obergrenze an.
     """
-    # 1. Trading Wallets prüfen (UNIFIED → CONTRACT → SPOT)
-    for account_type in ("UNIFIED", "CONTRACT", "SPOT"):
-        res = bybit_get("/v5/account/wallet-balance", {"accountType": account_type})
-        rc = res.get("retCode", -1) if res else -1
-        if not res or rc != 0:
-            log.info(f"Balance ({account_type}): retCode={rc} msg={res.get('retMsg','?') if res else 'no response'}")
-            continue
-        try:
-            accounts = (res.get("result") or {}).get("list") or []
-            for account in accounts:
-                for coin in (account.get("coin") or []):
-                    if coin.get("coin") == "USDT":
-                        balance = float(
-                            coin.get("availableToWithdraw") or
-                            coin.get("availableBalance") or
-                            coin.get("walletBalance") or 0
-                        )
-                        if balance > 0:
-                            if SYNORA_BUDGET_CAP_USDT > 0:
-                                balance = min(balance, SYNORA_BUDGET_CAP_USDT)
-                            log.info(f"Bybit Balance ({account_type}): {balance:.2f} USDT")
-                            return balance
-                        log.info(f"Balance ({account_type}): USDT={balance} (Trading Wallet leer?)")
-        except Exception as e:
-            log.error(f"Balance-Abruf Fehler ({account_type}): {e}")
+    now = time.time()
+    if now - _balance_cache["ts"] < BALANCE_CACHE_TTL:
+        return _balance_cache["value"]
 
-    # 2. Funding Wallet prüfen (korrekter V5 Endpoint)
+    res = bybit_get("/v5/account/wallet-balance", {"accountType": "UNIFIED"})
+    rc = res.get("retCode", -1) if res else -1
+    if not res or rc != 0:
+        log.warning(f"Balance UNIFIED: retCode={rc} msg={res.get('retMsg','?') if res else 'no response'}")
+        return _balance_cache["value"]   # letzten bekannten Wert zurückgeben
+
     try:
-        res_fund = bybit_get("/v5/asset/transfer/query-account-coin-balance", {
-            "accountType": "FUND", "coin": "USDT"
-        })
-        if not res_fund or res_fund.get("retCode") != 0:
-            log.warning(f"FUND-Wallet: retCode={res_fund.get('retCode') if res_fund else 'N/A'} "
-                        f"msg={res_fund.get('retMsg','?') if res_fund else 'no response'}")
-            # API-Permissions prüfen
-            perm_res = bybit_get("/v5/user/query-api", {})
-            if perm_res and perm_res.get("retCode") == 0:
-                perms = (perm_res.get("result") or {}).get("permissions", {})
-                log.info(f"API-Key Permissions: {json.dumps(perms)}")
-            else:
-                log.warning(f"Permissions-Abruf fehlgeschlagen: {perm_res}")
-        if res_fund and res_fund.get("retCode") == 0:
-            bal_info = (res_fund.get("result") or {}).get("balance") or {}
-            log.info(f"FUND raw response: {json.dumps(res_fund.get('result', {}))}")
-            # Kann auch eine Liste sein
-            if isinstance(bal_info, list):
-                bal_info = next((b for b in bal_info if b.get("coin") == "USDT"), {})
-            for item in [bal_info]:
-                if item.get("coin") == "USDT" or True:  # immer prüfen
-                    fund_bal = float(item.get("transferBalance") or item.get("walletBalance") or 0)
-                    log.info(f"Funding Wallet: {fund_bal:.2f} USDT")
-                    if fund_bal > 0:
-                        # Auto-Transfer: Funding → UNIFIED (Trading)
-                        transfer_amt = min(fund_bal, SYNORA_BUDGET_CAP_USDT) if SYNORA_BUDGET_CAP_USDT > 0 else fund_bal
-                        log.info(f"Versuche Transfer {transfer_amt:.2f} USDT: FUND → UNIFIED")
-                        tr_res = bybit_post("/v5/asset/transfer/inter-transfer", {
-                            "transferId":  f"synora-{int(time.time())}",
-                            "coin":        "USDT",
-                            "amount":      f"{transfer_amt:.2f}",
-                            "fromAccountType": "FUND",
-                            "toAccountType":   "UNIFIED",
-                        })
-                        if tr_res.get("retCode") == 0:
-                            log.info(f"Transfer OK: {transfer_amt:.2f} USDT → UNIFIED")
-                            time.sleep(1)
-                            # Nochmal Trading-Balance abfragen
-                            res2 = bybit_get("/v5/account/wallet-balance", {"accountType": "UNIFIED"})
-                            if res2 and res2.get("retCode") == 0:
-                                for acc in (res2.get("result") or {}).get("list") or []:
-                                    for c in (acc.get("coin") or []):
-                                        if c.get("coin") == "USDT":
-                                            bal2 = float(c.get("availableToWithdraw") or c.get("walletBalance") or 0)
-                                            if SYNORA_BUDGET_CAP_USDT > 0:
-                                                bal2 = min(bal2, SYNORA_BUDGET_CAP_USDT)
-                                            log.info(f"Balance nach Transfer: {bal2:.2f} USDT")
-                                            return bal2
-                        else:
-                            log.warning(f"Transfer fehlgeschlagen: {tr_res.get('retMsg')} — nutze Funding-Balance direkt")
-                            if SYNORA_BUDGET_CAP_USDT > 0:
-                                fund_bal = min(fund_bal, SYNORA_BUDGET_CAP_USDT)
-                            return fund_bal
+        accounts = (res.get("result") or {}).get("list") or []
+        for account in accounts:
+            for coin in (account.get("coin") or []):
+                if coin.get("coin") == "USDT":
+                    balance = float(
+                        coin.get("availableToWithdraw") or
+                        coin.get("availableBalance") or
+                        coin.get("walletBalance") or 0
+                    )
+                    if SYNORA_BUDGET_CAP_USDT > 0:
+                        balance = min(balance, SYNORA_BUDGET_CAP_USDT)
+                    log.info(f"Bybit Balance (UNIFIED): {balance:.2f} USDT")
+                    _balance_cache["value"] = balance
+                    _balance_cache["ts"]    = now
+                    return balance
     except Exception as e:
-        log.error(f"Funding-Wallet Fehler: {e}")
+        log.error(f"Balance-Abruf Fehler: {e}")
 
-    log.warning("Balance-Abruf: kein USDT-Saldo gefunden (UNIFIED/CONTRACT/SPOT/FUND) → 0.0")
+    log.warning("Balance-Abruf: kein USDT in UNIFIED gefunden → 0.0")
     return 0.0
 
 
@@ -881,9 +829,27 @@ async def handle_close(symbol: str, reason: str = "CANCEL") -> None:
     cancel_open_orders(symbol)
     await asyncio.sleep(1)
 
-    # Position per Market schließen
-    total_qty = trade["qty_entry"] + trade["qty_dca1"] + trade["qty_dca2"]
-    res = close_position_market(symbol, trade["side"], total_qty)
+    # Echte Position-Grösse von Bybit holen (nicht theoretische Summe verwenden,
+    # da DCAs evtl. nicht gefüllt wurden → falsche Qty → Bybit-Fehler)
+    actual_qty = 0.0
+    try:
+        res_pos = bybit_get("/v5/position/list", {"category": BYBIT_CATEGORY, "symbol": symbol})
+        for item in (res_pos.get("result") or {}).get("list") or []:
+            if item.get("symbol") == symbol:
+                actual_qty = float(item.get("size", "0") or "0")
+                break
+    except Exception as e:
+        log.error(f"Position-Abfrage für Close fehlgeschlagen ({symbol}): {e}")
+
+    if actual_qty <= 0:
+        log.info(f"CLOSE {symbol}: Position bereits geschlossen (size=0)")
+        del _state["trades"][symbol]
+        save_state()
+        tg(f"ℹ️ SYNORA: {symbol} war bereits geschlossen ({reason})")
+        return
+
+    log.info(f"CLOSE {symbol}: schliesse {actual_qty} Kontrakte (Bybit live)")
+    res = close_position_market(symbol, trade["side"], actual_qty)
 
     if bybit_ok(res):
         await asyncio.sleep(2)  # kurz warten bis Bybit P&L verfügbar
@@ -976,7 +942,11 @@ async def check_closed_positions() -> None:
                 if pos_size > 0:
                     continue   # Position noch offen
 
-                # Position ist zu — Closed-P&L von Bybit holen
+                # Position ist zu — offene DCA-Limit-Orders stornieren
+                # (SL/TP schliesst nur die Position, Limit-Orders bleiben sonst aktiv)
+                cancel_open_orders(symbol)
+
+                # Closed-P&L von Bybit holen
                 pnl_res = bybit_get("/v5/position/closed-pnl", {
                     "category": BYBIT_CATEGORY,
                     "symbol":   symbol,
