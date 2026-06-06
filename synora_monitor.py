@@ -326,24 +326,30 @@ def get_available_balance() -> float:
     """
     for account_type in ("UNIFIED", "CONTRACT", "SPOT"):
         res = bybit_get("/v5/account/wallet-balance", {"accountType": account_type})
-        if not res or res.get("retCode", -1) != 0:
+        rc = res.get("retCode", -1) if res else -1
+        if not res or rc != 0:
+            log.info(f"Balance ({account_type}): retCode={rc} msg={res.get('retMsg','?') if res else 'no response'}")
             continue
         try:
             accounts = (res.get("result") or {}).get("list") or []
             for account in accounts:
-                for coin in account.get("coin") or []:
+                coins = account.get("coin") or []
+                # Debug: alle Coins + Felder loggen
+                for coin in coins:
                     if coin.get("coin") == "USDT":
+                        log.info(f"USDT Felder ({account_type}): {json.dumps(coin)}")
                         balance = float(
                             coin.get("availableToWithdraw") or
                             coin.get("availableBalance") or
                             coin.get("walletBalance") or 0
                         )
-                        if balance > 0:
-                            if SYNORA_BUDGET_CAP_USDT > 0:
-                                balance = min(balance, SYNORA_BUDGET_CAP_USDT)
-                            log.info(f"Bybit Balance ({account_type}): {balance:.2f} USDT"
-                                     + (f" (Cap: {SYNORA_BUDGET_CAP_USDT:.0f})" if SYNORA_BUDGET_CAP_USDT > 0 else ""))
-                            return balance
+                        if SYNORA_BUDGET_CAP_USDT > 0:
+                            balance = min(balance, SYNORA_BUDGET_CAP_USDT)
+                        log.info(f"Bybit Balance ({account_type}): {balance:.2f} USDT"
+                                 + (f" (Cap: {SYNORA_BUDGET_CAP_USDT:.0f})" if SYNORA_BUDGET_CAP_USDT > 0 else ""))
+                        return balance
+                if not coins:
+                    log.info(f"Balance ({account_type}): leere coin-Liste — kein Geld auf Sub-Account?")
         except Exception as e:
             log.error(f"Balance-Abruf Fehler ({account_type}): {e}")
 
