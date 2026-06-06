@@ -87,7 +87,7 @@ from flask import Flask, request, Response
 # Telegram / Telethon
 API_ID            = int(os.environ.get("TELEGRAM_API_ID", "0"))
 API_HASH          = os.environ.get("TELEGRAM_API_HASH", "")
-SESSION_STRING    = os.environ.get("DOMINUS_SESSION_STRING", "")
+SESSION_STRING    = os.environ.get("SYNORA_SESSION_STRING") or os.environ.get("DOMINUS_SESSION_STRING", "")
 TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID  = os.environ.get("TELEGRAM_CHAT_ID", "")
 
