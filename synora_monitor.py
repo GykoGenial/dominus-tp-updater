@@ -324,6 +324,7 @@ def get_available_balance() -> float:
     Probiert UNIFIED → CONTRACT → SPOT der Reihe nach (AI Subaccounts haben oft kein UTA).
     Wendet SYNORA_BUDGET_CAP_USDT als optionale Obergrenze an.
     """
+    # 1. Trading Wallets prüfen (UNIFIED → CONTRACT → SPOT)
     for account_type in ("UNIFIED", "CONTRACT", "SPOT"):
         res = bybit_get("/v5/account/wallet-balance", {"accountType": account_type})
         rc = res.get("retCode", -1) if res else -1
@@ -333,27 +334,64 @@ def get_available_balance() -> float:
         try:
             accounts = (res.get("result") or {}).get("list") or []
             for account in accounts:
-                coins = account.get("coin") or []
-                # Debug: alle Coins + Felder loggen
-                for coin in coins:
+                for coin in (account.get("coin") or []):
                     if coin.get("coin") == "USDT":
-                        log.info(f"USDT Felder ({account_type}): {json.dumps(coin)}")
                         balance = float(
                             coin.get("availableToWithdraw") or
                             coin.get("availableBalance") or
                             coin.get("walletBalance") or 0
                         )
-                        if SYNORA_BUDGET_CAP_USDT > 0:
-                            balance = min(balance, SYNORA_BUDGET_CAP_USDT)
-                        log.info(f"Bybit Balance ({account_type}): {balance:.2f} USDT"
-                                 + (f" (Cap: {SYNORA_BUDGET_CAP_USDT:.0f})" if SYNORA_BUDGET_CAP_USDT > 0 else ""))
-                        return balance
-                if not coins:
-                    log.info(f"Balance ({account_type}): leere coin-Liste — kein Geld auf Sub-Account?")
+                        if balance > 0:
+                            if SYNORA_BUDGET_CAP_USDT > 0:
+                                balance = min(balance, SYNORA_BUDGET_CAP_USDT)
+                            log.info(f"Bybit Balance ({account_type}): {balance:.2f} USDT")
+                            return balance
+                        log.info(f"Balance ({account_type}): USDT={balance} (Trading Wallet leer?)")
         except Exception as e:
             log.error(f"Balance-Abruf Fehler ({account_type}): {e}")
 
-    log.warning("Balance-Abruf: kein USDT-Saldo in UNIFIED/CONTRACT/SPOT gefunden → 0.0")
+    # 2. Funding Wallet prüfen (anderer Endpoint)
+    try:
+        res_fund = bybit_get("/v5/asset/wallet/balance", {"accountType": "FUND", "coin": "USDT"})
+        if res_fund and res_fund.get("retCode") == 0:
+            for item in (res_fund.get("result") or {}).get("balance") or []:
+                if item.get("coin") == "USDT":
+                    fund_bal = float(item.get("transferBalance") or item.get("walletBalance") or 0)
+                    log.info(f"Funding Wallet: {fund_bal:.2f} USDT")
+                    if fund_bal > 0:
+                        # Auto-Transfer: Funding → UNIFIED (Trading)
+                        transfer_amt = min(fund_bal, SYNORA_BUDGET_CAP_USDT) if SYNORA_BUDGET_CAP_USDT > 0 else fund_bal
+                        log.info(f"Versuche Transfer {transfer_amt:.2f} USDT: FUND → UNIFIED")
+                        tr_res = bybit_post("/v5/asset/transfer/inter-transfer", {
+                            "transferId":  f"synora-{int(time.time())}",
+                            "coin":        "USDT",
+                            "amount":      f"{transfer_amt:.2f}",
+                            "fromAccountType": "FUND",
+                            "toAccountType":   "UNIFIED",
+                        })
+                        if tr_res.get("retCode") == 0:
+                            log.info(f"Transfer OK: {transfer_amt:.2f} USDT → UNIFIED")
+                            time.sleep(1)
+                            # Nochmal Trading-Balance abfragen
+                            res2 = bybit_get("/v5/account/wallet-balance", {"accountType": "UNIFIED"})
+                            if res2 and res2.get("retCode") == 0:
+                                for acc in (res2.get("result") or {}).get("list") or []:
+                                    for c in (acc.get("coin") or []):
+                                        if c.get("coin") == "USDT":
+                                            bal2 = float(c.get("availableToWithdraw") or c.get("walletBalance") or 0)
+                                            if SYNORA_BUDGET_CAP_USDT > 0:
+                                                bal2 = min(bal2, SYNORA_BUDGET_CAP_USDT)
+                                            log.info(f"Balance nach Transfer: {bal2:.2f} USDT")
+                                            return bal2
+                        else:
+                            log.warning(f"Transfer fehlgeschlagen: {tr_res.get('retMsg')} — nutze Funding-Balance direkt")
+                            if SYNORA_BUDGET_CAP_USDT > 0:
+                                fund_bal = min(fund_bal, SYNORA_BUDGET_CAP_USDT)
+                            return fund_bal
+    except Exception as e:
+        log.error(f"Funding-Wallet Fehler: {e}")
+
+    log.warning("Balance-Abruf: kein USDT-Saldo gefunden (UNIFIED/CONTRACT/SPOT/FUND) → 0.0")
     return 0.0
 
 
