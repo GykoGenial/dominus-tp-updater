@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SYNORA Monitor  v1.0  (2026-06-05)
+SYNORA Monitor  v1.1  (2026-06-06)
 ════════════════════════════════════════════════════════════════
 Vollautomatischer SYNORA-Signal-Executor auf Bybit (Sub-Account).
 
@@ -28,8 +28,9 @@ Signal-Format (aus Schulungsfilm):
   Maximaler Gewinn: 25 %
 
 Railway-Variablen (NEU — separate Synora-Konfiguration):
-  BYBIT_SYNORA_API_KEY    → Bybit Sub-Account API Key
-  BYBIT_SYNORA_SECRET     → Bybit Sub-Account Secret
+  BYBIT_SYNORA_API_KEY     → Bybit Sub-Account API Key (aus Bybit API-Verwaltung)
+  BYBIT_SYNORA_PRIVATE_KEY → RSA Private Key (PEM-Inhalt, \n durch \\n ersetzen für Railway)
+                             Generieren: openssl genrsa -out synora_private.pem 2048
   SYNORA_CHANNEL_ID       → Telegram-Kanal-ID (int, z.B. -1001234567890)
                             Alternativ: Einladungslink t.me/+...
   SYNORA_BUDGET_CAP_USDT  → Maximales Budget in USDT (Default: 0 = kein Cap, nutze vollen Balance)
@@ -57,13 +58,15 @@ import os
 import re
 import json
 import time
-import hmac
-import hashlib
+import base64
 import asyncio
 import logging
 import requests
 import math
 from datetime import datetime
+
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding
 
 # ── Telethon ────────────────────────────────────────────────────
 from telethon import TelegramClient, events
@@ -96,12 +99,14 @@ SYNORA_BUDGET_CAP_USDT = _env_float("SYNORA_BUDGET_CAP_USDT", 0.0)
 # 0 = kein Cap (volles Balance); >0 = maximales Budget in USDT
 # Beispiel: SYNORA_BUDGET_CAP_USDT=500 → nutzt min(Balance, 500 USDT)
 
-# Bybit Sub-Account
-BYBIT_SYNORA_API_KEY = os.environ.get("BYBIT_SYNORA_API_KEY", "")
-BYBIT_SYNORA_SECRET  = os.environ.get("BYBIT_SYNORA_SECRET", "")
-BYBIT_BASE_URL       = "https://api.bybit.com"
-BYBIT_RECV_WINDOW    = "5000"
-BYBIT_CATEGORY       = "linear"   # USDT Perpetual
+# Bybit Sub-Account (RSA-Auth für AI Subaccount)
+BYBIT_SYNORA_API_KEY     = os.environ.get("BYBIT_SYNORA_API_KEY", "")
+BYBIT_SYNORA_PRIVATE_KEY = os.environ.get("BYBIT_SYNORA_PRIVATE_KEY", "")
+# PEM-Inhalt als Railway-Variable. Railway ersetzt \n automatisch durch echte Zeilenumbrüche.
+# Falls nicht: manuell \\n → \n konvertieren (wird unten gemacht).
+BYBIT_BASE_URL           = "https://api.bybit.com"
+BYBIT_RECV_WINDOW        = "5000"
+BYBIT_CATEGORY           = "linear"   # USDT Perpetual
 
 # Capital-Split (wie in Synora-Doku: 10% / 25% / 65%)
 SPLIT_ENTRY = 0.10
@@ -173,18 +178,41 @@ def tg(msg: str, parse_mode: str = "HTML") -> None:
 
 
 # ═══════════════════════════════════════════════════════════════
-# BYBIT SUB-ACCOUNT API
+# BYBIT SUB-ACCOUNT API  (RSA-Signierung für AI Subaccount)
 # ═══════════════════════════════════════════════════════════════
 
-def _sign_bybit(ts: str, body_or_query: str) -> str:
-    msg = ts + BYBIT_SYNORA_API_KEY + BYBIT_RECV_WINDOW + body_or_query
-    return hmac.new(BYBIT_SYNORA_SECRET.encode(), msg.encode(), hashlib.sha256).hexdigest()
+_rsa_private_key = None
+
+def _load_rsa_key():
+    """Lädt den RSA Private Key aus der Env-Variable (lazy, gecacht)."""
+    global _rsa_private_key
+    if _rsa_private_key is not None:
+        return _rsa_private_key
+    pem = BYBIT_SYNORA_PRIVATE_KEY
+    if not pem:
+        raise ValueError("BYBIT_SYNORA_PRIVATE_KEY ist leer")
+    # Railway kann \n als Literal-String speichern → normalisieren
+    pem = pem.replace("\\n", "\n")
+    if not pem.strip().startswith("-----"):
+        raise ValueError("BYBIT_SYNORA_PRIVATE_KEY sieht nicht wie PEM aus")
+    _rsa_private_key = serialization.load_pem_private_key(
+        pem.encode(), password=None
+    )
+    log.info("RSA Private Key geladen ✓")
+    return _rsa_private_key
+
+def _sign_bybit_rsa(message: str) -> str:
+    """Signiert eine Nachricht mit RSA-SHA256, gibt Base64-String zurück."""
+    key = _load_rsa_key()
+    sig = key.sign(message.encode(), padding.PKCS1v15(), hashes.SHA256())
+    return base64.b64encode(sig).decode()
 
 def _headers_bybit(body_or_query: str = "") -> dict:
     ts = str(int(time.time() * 1000))
+    message = ts + BYBIT_SYNORA_API_KEY + BYBIT_RECV_WINDOW + body_or_query
     return {
         "X-BAPI-API-KEY":     BYBIT_SYNORA_API_KEY,
-        "X-BAPI-SIGN":        _sign_bybit(ts, body_or_query),
+        "X-BAPI-SIGN":        _sign_bybit_rsa(message),
         "X-BAPI-TIMESTAMP":   ts,
         "X-BAPI-RECV-WINDOW": BYBIT_RECV_WINDOW,
         "Content-Type":       "application/json",
@@ -754,8 +782,8 @@ async def main() -> None:
     if not SYNORA_CHANNEL:
         log.error("SYNORA_CHANNEL_ID fehlt!")
         return
-    if not BYBIT_SYNORA_API_KEY or not BYBIT_SYNORA_SECRET:
-        log.error("BYBIT_SYNORA_API_KEY / BYBIT_SYNORA_SECRET fehlen!")
+    if not BYBIT_SYNORA_API_KEY or not BYBIT_SYNORA_PRIVATE_KEY:
+        log.error("BYBIT_SYNORA_API_KEY / BYBIT_SYNORA_PRIVATE_KEY fehlen!")
         return
 
     # Kanal-ID: int wenn möglich, sonst String (Einladungslink)
