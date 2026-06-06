@@ -794,7 +794,8 @@ async def main() -> None:
 
     cap_info = f" | Cap: {SYNORA_BUDGET_CAP_USDT:.0f} USDT" if SYNORA_BUDGET_CAP_USDT > 0 else " | kein Cap"
     log.info(f"Starte Synora Monitor | Budget: live vom Sub-Account{cap_info} | Kanal: {channel_id}")
-    tg(f"🟣 <b>SYNORA Monitor gestartet</b>\nBudget: {SYNORA_BUDGET_USDT:.0f} USDT | Bybit Sub-Account")
+    cap_str = f"{SYNORA_BUDGET_CAP_USDT:.0f} USDT Cap" if SYNORA_BUDGET_CAP_USDT > 0 else "kein Cap"
+    tg(f"🟣 <b>SYNORA Monitor gestartet</b>\nBudget: live vom Sub-Account ({cap_str}) | Bybit Sub-Account")
 
     client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
     await client.start()
