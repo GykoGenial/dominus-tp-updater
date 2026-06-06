@@ -350,12 +350,18 @@ def get_available_balance() -> float:
         except Exception as e:
             log.error(f"Balance-Abruf Fehler ({account_type}): {e}")
 
-    # 2. Funding Wallet prüfen (anderer Endpoint)
+    # 2. Funding Wallet prüfen (korrekter V5 Endpoint)
     try:
-        res_fund = bybit_get("/v5/asset/wallet/balance", {"accountType": "FUND", "coin": "USDT"})
+        res_fund = bybit_get("/v5/asset/transfer/query-account-coin-balance", {
+            "accountType": "FUND", "coin": "USDT"
+        })
         if res_fund and res_fund.get("retCode") == 0:
-            for item in (res_fund.get("result") or {}).get("balance") or []:
-                if item.get("coin") == "USDT":
+            bal_info = (res_fund.get("result") or {}).get("balance") or {}
+            # Kann auch eine Liste sein
+            if isinstance(bal_info, list):
+                bal_info = next((b for b in bal_info if b.get("coin") == "USDT"), {})
+            for item in [bal_info]:
+                if item.get("coin") == "USDT" or True:  # immer prüfen
                     fund_bal = float(item.get("transferBalance") or item.get("walletBalance") or 0)
                     log.info(f"Funding Wallet: {fund_bal:.2f} USDT")
                     if fund_bal > 0:
