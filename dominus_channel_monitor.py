@@ -119,7 +119,7 @@ log = logging.getLogger("dominus_monitor")
 # ── Konfiguration ────────────────────────────────────────────────
 API_ID         = int(os.environ["TELEGRAM_API_ID"])
 API_HASH       = os.environ["TELEGRAM_API_HASH"]
-SESSION_STRING = os.environ["DOMINUS_SESSION_STRING"]
+SESSION_STRING = os.environ.get("MONITOR_SESSION_STRING") or os.environ["DOMINUS_SESSION_STRING"]
 CHANNEL_LINK   = os.environ["DOMINUS_CHANNEL_LINK"]
 BOT_TOKEN      = os.environ["TELEGRAM_TOKEN"]
 CHAT_ID        = os.environ["TELEGRAM_CHAT_ID"]
