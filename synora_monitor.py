@@ -770,7 +770,7 @@ async def handle_close(symbol: str, reason: str = "CANCEL") -> None:
 
 
 # ═══════════════════════════════════════════════════════════════
-# TELETHON — KANAL-LISTENER
+# TELETHON — BOT/KANAL-LISTENER
 # ═══════════════════════════════════════════════════════════════
 
 async def main() -> None:
@@ -786,30 +786,30 @@ async def main() -> None:
         log.error("BYBIT_SYNORA_API_KEY / BYBIT_SYNORA_PRIVATE_KEY fehlen!")
         return
 
-    # Kanal-ID: int wenn möglich, sonst String (Einladungslink)
-    try:
-        channel_id = int(SYNORA_CHANNEL)
-    except ValueError:
-        channel_id = SYNORA_CHANNEL  # Einladungslink wie "t.me/+..."
-
     cap_info = f" | Cap: {SYNORA_BUDGET_CAP_USDT:.0f} USDT" if SYNORA_BUDGET_CAP_USDT > 0 else " | kein Cap"
-    log.info(f"Starte Synora Monitor | Budget: live vom Sub-Account{cap_info} | Kanal: {channel_id}")
+    log.info(f"Starte Synora Monitor | Budget: live vom Sub-Account{cap_info} | Source: {SYNORA_CHANNEL}")
     cap_str = f"{SYNORA_BUDGET_CAP_USDT:.0f} USDT Cap" if SYNORA_BUDGET_CAP_USDT > 0 else "kein Cap"
     tg(f"🟣 <b>SYNORA Monitor gestartet</b>\nBudget: live vom Sub-Account ({cap_str}) | Bybit Sub-Account")
 
     client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
     await client.start()
 
-    # Kanal resolven
+    # Source resolven — funktioniert für Bot-Chats (int user_id) UND Kanäle (int/-100... oder Link)
     try:
-        channel = await client.get_entity(channel_id)
-        log.info(f"Kanal verbunden: {getattr(channel, 'title', channel_id)}")
-    except Exception as e:
-        log.error(f"Kanal nicht gefunden ({channel_id}): {e}")
-        tg(f"❌ SYNORA: Kanal nicht gefunden — {e}")
-        return
+        channel_id_raw = int(SYNORA_CHANNEL)
+    except ValueError:
+        channel_id_raw = SYNORA_CHANNEL  # Einladungslink
 
-    @client.on(events.NewMessage(chats=channel))
+    try:
+        source = await client.get_entity(channel_id_raw)
+        label = getattr(source, 'title', None) or getattr(source, 'username', None) or str(channel_id_raw)
+        log.info(f"Source verbunden: {label}")
+    except Exception:
+        # Fallback: direkt mit der rohen ID registrieren (klappt wenn Entity bereits im Session-Cache)
+        log.warning(f"get_entity fehlgeschlagen — nutze ID direkt: {channel_id_raw}")
+        source = channel_id_raw
+
+    @client.on(events.NewMessage(chats=source))
     async def on_message(event):
         text = event.message.message or ""
         log.info(f"Neue Nachricht ({len(text)} Zeichen):\n{text[:200]}")
