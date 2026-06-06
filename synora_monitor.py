@@ -1004,6 +1004,7 @@ def dashboard():
     outcomes   = _outcome_counts(trades)
     open_pos   = _state.get("trades", {})
     recent     = list(reversed(trades[-50:]))   # neueste zuerst
+    live_bal   = get_available_balance()         # live vom Bybit Sub-Account
 
     eq_labels  = json.dumps([p["x"] for p in equity])
     eq_values  = json.dumps([p["y"] for p in equity])
@@ -1084,6 +1085,7 @@ def dashboard():
 <p class="ts">Stand: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC &nbsp;·&nbsp; {stats['total']} Trades archiviert</p>
 
 <div class="grid">
+  <div class="card"><label>💰 Balance (live)</label><div class="val" style="color:#a78bfa">{live_bal:.2f} <span style="font-size:1rem;color:#64748b">USDT</span></div></div>
   <div class="card"><label>Trades gesamt</label><div class="val">{stats['total']}</div></div>
   <div class="card"><label>Wins / Losses</label><div class="val"><span class="pos">{stats['wins']}</span> / <span class="neg">{stats['losses']}</span></div></div>
   <div class="card"><label>Win Rate</label><div class="val" style="color:{wr_color}">{stats['winrate']:.1f}%</div></div>
