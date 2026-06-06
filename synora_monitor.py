@@ -277,10 +277,14 @@ def bybit_get(path: str, params: dict = None) -> dict:
     for attempt in range(3):
         try:
             r = requests.get(url, headers=_headers_bybit(query_str), timeout=10)
-            data = r.json()
             if r.status_code >= 500 and attempt < 2:
                 time.sleep(1.5 ** attempt)
                 continue
+            try:
+                data = r.json()
+            except Exception as json_err:
+                log.error(f"Bybit JSON-Fehler ({path}): {json_err} | HTTP {r.status_code} | Body: {r.text[:300]}")
+                return {}
             return data
         except Exception as e:
             if attempt < 2:
@@ -316,26 +320,34 @@ def bybit_ok(res: dict) -> bool:
 
 def get_available_balance() -> float:
     """
-    Liest den verfügbaren USDT-Balance vom Bybit Sub-Account (Unified Trading Account).
+    Liest den verfügbaren USDT-Balance vom Bybit Sub-Account.
+    Probiert UNIFIED → CONTRACT → SPOT der Reihe nach (AI Subaccounts haben oft kein UTA).
     Wendet SYNORA_BUDGET_CAP_USDT als optionale Obergrenze an.
-    Gibt 0.0 zurück wenn der Abruf fehlschlägt.
     """
-    res = bybit_get("/v5/account/wallet-balance", {"accountType": "UNIFIED"})
-    try:
-        accounts = (res.get("result") or {}).get("list") or []
-        for account in accounts:
-            for coin in account.get("coin") or []:
-                if coin.get("coin") == "USDT":
-                    # availableToWithdraw = frei verfügbar (nicht als Margin gebunden)
-                    balance = float(coin.get("availableToWithdraw") or
-                                    coin.get("walletBalance") or 0)
-                    if SYNORA_BUDGET_CAP_USDT > 0:
-                        balance = min(balance, SYNORA_BUDGET_CAP_USDT)
-                    log.info(f"Bybit Balance: {balance:.2f} USDT"
-                             + (f" (Cap: {SYNORA_BUDGET_CAP_USDT:.0f})" if SYNORA_BUDGET_CAP_USDT > 0 else ""))
-                    return balance
-    except Exception as e:
-        log.error(f"Balance-Abruf Fehler: {e}")
+    for account_type in ("UNIFIED", "CONTRACT", "SPOT"):
+        res = bybit_get("/v5/account/wallet-balance", {"accountType": account_type})
+        if not res or res.get("retCode", -1) != 0:
+            continue
+        try:
+            accounts = (res.get("result") or {}).get("list") or []
+            for account in accounts:
+                for coin in account.get("coin") or []:
+                    if coin.get("coin") == "USDT":
+                        balance = float(
+                            coin.get("availableToWithdraw") or
+                            coin.get("availableBalance") or
+                            coin.get("walletBalance") or 0
+                        )
+                        if balance > 0:
+                            if SYNORA_BUDGET_CAP_USDT > 0:
+                                balance = min(balance, SYNORA_BUDGET_CAP_USDT)
+                            log.info(f"Bybit Balance ({account_type}): {balance:.2f} USDT"
+                                     + (f" (Cap: {SYNORA_BUDGET_CAP_USDT:.0f})" if SYNORA_BUDGET_CAP_USDT > 0 else ""))
+                            return balance
+        except Exception as e:
+            log.error(f"Balance-Abruf Fehler ({account_type}): {e}")
+
+    log.warning("Balance-Abruf: kein USDT-Saldo in UNIFIED/CONTRACT/SPOT gefunden → 0.0")
     return 0.0
 
 
