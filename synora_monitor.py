@@ -792,7 +792,8 @@ async def main() -> None:
     except ValueError:
         channel_id = SYNORA_CHANNEL  # Einladungslink wie "t.me/+..."
 
-    log.info(f"Starte Synora Monitor | Budget: {SYNORA_BUDGET_USDT} USDT | Kanal: {channel_id}")
+    cap_info = f" | Cap: {SYNORA_BUDGET_CAP_USDT:.0f} USDT" if SYNORA_BUDGET_CAP_USDT > 0 else " | kein Cap"
+    log.info(f"Starte Synora Monitor | Budget: live vom Sub-Account{cap_info} | Kanal: {channel_id}")
     tg(f"🟣 <b>SYNORA Monitor gestartet</b>\nBudget: {SYNORA_BUDGET_USDT:.0f} USDT | Bybit Sub-Account")
 
     client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
