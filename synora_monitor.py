@@ -319,6 +319,7 @@ def bybit_ok(res: dict) -> bool:
 
 
 _balance_cache: dict = {"value": 0.0, "ts": 0.0}
+_main_loop = None   # wird in main() gesetzt, für Flask→Asyncio Bridge
 BALANCE_CACHE_TTL = 30   # Sekunden
 
 def get_available_balance() -> float:
@@ -448,7 +449,7 @@ RE_DCA_PRICES = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 RE_SL_PRICE = re.compile(
-    r"Kurs auf\s+([\d.]+)\s+fällt",
+    r"Kurs auf\s+([\d.]+)",
     re.IGNORECASE,
 )
 
@@ -1220,6 +1221,43 @@ if(OC_LABELS.length > 0){{
     return Response(html, content_type="text/html; charset=utf-8")
 
 
+@flask_app.route("/force_signal")
+def force_signal():
+    """
+    Manuelles Signal auslösen — für verpasste oder Test-Signale.
+    URL: /force_signal?secret=XXX&symbol=BROCCOLIF3BUSDT&side=SHORT&lev=3
+         &entry=0.005710&sl=0.007500&dca1=0.006400&dca2=0.006800
+    """
+    secret = request.args.get("secret", "")
+    if SYNORA_DASHBOARD_SECRET and secret != SYNORA_DASHBOARD_SECRET:
+        return Response("403 Forbidden", status=403)
+
+    try:
+        sig = {
+            "symbol": request.args["symbol"].upper(),
+            "side":   request.args["side"].upper(),
+            "lev":    int(request.args["lev"]),
+            "entry":  float(request.args["entry"]),
+            "sl":     float(request.args["sl"]),
+            "dca1":   float(request.args["dca1"]),
+            "dca2":   float(request.args["dca2"]),
+        }
+    except (KeyError, ValueError) as e:
+        return Response(f"Fehlende/ungültige Parameter: {e}", status=400)
+
+    if _main_loop is None:
+        return Response("Event-Loop noch nicht bereit", status=503)
+
+    log.info(f"[force_signal] Manuelles Signal: {sig}")
+    try:
+        future = asyncio.run_coroutine_threadsafe(execute_signal(sig), _main_loop)
+        future.result(timeout=30)
+        return Response(f"✅ Signal ausgeführt: {sig['side']} {sig['symbol']} {sig['lev']}x", status=200)
+    except Exception as e:
+        log.error(f"[force_signal] Fehler: {e}")
+        return Response(f"❌ Fehler: {e}", status=500)
+
+
 def run_flask() -> None:
     """Startet Flask in einem Daemon-Thread."""
     flask_app.run(host="0.0.0.0", port=SYNORA_DASHBOARD_PORT, debug=False, use_reloader=False)
@@ -1230,6 +1268,8 @@ def run_flask() -> None:
 # ═══════════════════════════════════════════════════════════════
 
 async def main() -> None:
+    global _main_loop
+    _main_loop = asyncio.get_event_loop()
     load_state()
 
     if not all([API_ID, API_HASH, SESSION_STRING]):
