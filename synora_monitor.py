@@ -68,6 +68,8 @@ import requests
 import math
 import threading
 import csv as csv_module
+import hmac
+import hashlib
 from datetime import datetime, timezone
 
 from cryptography.hazmat.primitives import hashes, serialization
@@ -110,7 +112,12 @@ SYNORA_BUDGET_CAP_USDT = _env_float("SYNORA_BUDGET_CAP_USDT", 0.0)
 SYNORA_TRADES_CSV        = os.environ.get("SYNORA_TRADES_CSV", "/app/data/synora_trades.csv")
 SYNORA_DASHBOARD_SECRET  = os.environ.get("SYNORA_DASHBOARD_SECRET", "")
 SYNORA_DASHBOARD_PORT    = int(os.environ.get("SYNORA_DASHBOARD_PORT", "8080"))
-POSITION_POLL_INTERVAL   = 60   # Sekunden zwischen Bybit-Position-Checks
+POSITION_POLL_INTERVAL   = 60   # Sekunden zwischen Position-Checks
+
+# BingX (Fallback wenn Symbol nicht auf Bybit verfügbar)
+BINGX_API_KEY    = os.environ.get("BINGX_API_KEY", "")
+BINGX_SECRET_KEY = os.environ.get("BINGX_SECRET_KEY", "")
+BINGX_BASE_URL   = "https://open-api.bingx.com"
 
 # Bybit Sub-Account (RSA-Auth für AI Subaccount)
 BYBIT_SYNORA_API_KEY     = os.environ.get("BYBIT_SYNORA_API_KEY", "")
@@ -428,6 +435,352 @@ def max_leverage(symbol: str) -> int:
 
 
 # ═══════════════════════════════════════════════════════════════
+# BINGX API  (HMAC-SHA256 — Fallback wenn Symbol nicht auf Bybit)
+# ═══════════════════════════════════════════════════════════════
+
+def to_bingx_symbol(synora_symbol: str) -> str:
+    """
+    Konvertiert Synora-Symbol in BingX-Format.
+    BROCCOLIF3BUSDT → BROCCOLIF3B-USDT
+    SUSHIUSDT → SUSHI-USDT
+    """
+    if synora_symbol.endswith("USDT") and "-" not in synora_symbol:
+        return synora_symbol[:-4] + "-USDT"
+    return synora_symbol
+
+
+def _bingx_sign(query_str: str) -> str:
+    return hmac.new(
+        BINGX_SECRET_KEY.encode("utf-8"),
+        query_str.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _bingx_headers() -> dict:
+    return {"X-BX-APIKEY": BINGX_API_KEY}
+
+
+def _bingx_qs(params: dict) -> str:
+    """Baut Query-String inkl. Timestamp + Signature."""
+    p = dict(params)
+    p["timestamp"] = str(int(time.time() * 1000))
+    qs = "&".join(f"{k}={v}" for k, v in p.items())
+    return qs + "&signature=" + _bingx_sign(qs)
+
+
+def bingx_get(path: str, params: dict = None) -> dict:
+    url = BINGX_BASE_URL + path + "?" + _bingx_qs(params or {})
+    for attempt in range(3):
+        try:
+            r = requests.get(url, headers=_bingx_headers(), timeout=10)
+            data = r.json()
+            if r.status_code >= 500 and attempt < 2:
+                time.sleep(1.5 ** attempt)
+                continue
+            return data
+        except Exception as e:
+            if attempt < 2:
+                time.sleep(1.5 ** attempt)
+                continue
+            log.error(f"BingX GET Fehler ({path}): {e}")
+            return {}
+    return {}
+
+
+def bingx_post(path: str, params: dict = None) -> dict:
+    url = BINGX_BASE_URL + path + "?" + _bingx_qs(params or {})
+    for attempt in range(3):
+        try:
+            r = requests.post(url, headers=_bingx_headers(), timeout=10)
+            data = r.json()
+            if r.status_code >= 500 and attempt < 2:
+                time.sleep(1.5 ** attempt)
+                continue
+            return data
+        except Exception as e:
+            if attempt < 2:
+                time.sleep(1.5 ** attempt)
+                continue
+            log.error(f"BingX POST Fehler ({path}): {e}")
+            return {}
+    return {}
+
+
+def bingx_delete(path: str, params: dict = None) -> dict:
+    url = BINGX_BASE_URL + path + "?" + _bingx_qs(params or {})
+    try:
+        r = requests.delete(url, headers=_bingx_headers(), timeout=10)
+        return r.json()
+    except Exception as e:
+        log.error(f"BingX DELETE Fehler ({path}): {e}")
+        return {}
+
+
+def bingx_ok(res: dict) -> bool:
+    return res.get("code", -1) == 0
+
+
+# ─── BingX Precision-Caches ──────────────────────────────────
+_bingx_price_dec_cache: dict = {}
+_bingx_qty_step_cache:  dict = {}
+_bingx_max_lev_cache:   dict = {}
+
+
+def _load_bingx_instrument_info(symbol: str) -> None:
+    """symbol = BingX-Format z.B. SUSHI-USDT (public endpoint, kein Auth nötig)"""
+    res = requests.get(
+        BINGX_BASE_URL + "/openApi/swap/v2/quote/contracts",
+        timeout=10,
+    ).json()
+    try:
+        data = res.get("data") or []
+        for item in data:
+            if item.get("symbol") != symbol:
+                continue
+            price_prec = int(item.get("pricePrecision", 4))
+            qty_prec   = int(item.get("quantityPrecision", 3))
+            max_lev    = int(item.get("maxLeverage", 25))
+            _bingx_price_dec_cache[symbol] = price_prec
+            _bingx_qty_step_cache[symbol]  = 10 ** (-qty_prec)
+            _bingx_max_lev_cache[symbol]   = max_lev
+            log.info(f"BingX instrument {symbol}: priceDec={price_prec} qtyStep={10**(-qty_prec)} maxLev={max_lev}")
+            return
+        log.warning(f"BingX: Symbol {symbol} nicht in Contracts-Liste")
+    except Exception as e:
+        log.error(f"BingX instrument-info Fehler ({symbol}): {e}")
+
+
+def bingx_price_decimals(symbol: str) -> int:
+    if symbol not in _bingx_price_dec_cache:
+        _load_bingx_instrument_info(symbol)
+    return _bingx_price_dec_cache.get(symbol, 4)
+
+
+def bingx_snap_qty(symbol: str, qty: float) -> float:
+    step = _bingx_qty_step_cache.get(symbol)
+    if step is None:
+        _load_bingx_instrument_info(symbol)
+        step = _bingx_qty_step_cache.get(symbol, 0.001)
+    if not step or step <= 0:
+        step = 0.001
+    return math.floor(qty / step) * step
+
+
+def bingx_fmt_qty(symbol: str, qty: float) -> str:
+    step = _bingx_qty_step_cache.get(symbol, 0.001)
+    if step >= 1:
+        return str(int(bingx_snap_qty(symbol, qty)))
+    decimals = len(f"{step:.10f}".rstrip("0").split(".")[-1]) if "." in f"{step:.10f}".rstrip("0") else 3
+    return f"{bingx_snap_qty(symbol, qty):.{decimals}f}"
+
+
+def bingx_fmt_price(symbol: str, price: float) -> str:
+    return f"{price:.{bingx_price_decimals(symbol)}f}"
+
+
+def bingx_max_leverage(symbol: str) -> int:
+    if symbol not in _bingx_max_lev_cache:
+        _load_bingx_instrument_info(symbol)
+    return _bingx_max_lev_cache.get(symbol, 25)
+
+
+# ─── BingX Balance ───────────────────────────────────────────
+
+_bingx_balance_cache: dict = {"value": 0.0, "ts": 0.0}
+
+
+def get_bingx_balance() -> float:
+    now = time.time()
+    if now - _bingx_balance_cache["ts"] < BALANCE_CACHE_TTL:
+        return _bingx_balance_cache["value"]
+    res = bingx_get("/openApi/swap/v2/user/balance")
+    try:
+        data = res.get("data") or {}
+        balance = float(
+            data.get("availableMargin") or
+            data.get("available") or
+            data.get("balance") or 0
+        )
+        log.info(f"BingX raw balance data: {data}")   # zum Debuggen der Feldnamen
+        if SYNORA_BUDGET_CAP_USDT > 0:
+            balance = min(balance, SYNORA_BUDGET_CAP_USDT)
+        log.info(f"BingX Balance: {balance:.2f} USDT")
+        _bingx_balance_cache["value"] = balance
+        _bingx_balance_cache["ts"]    = now
+        return balance
+    except Exception as e:
+        log.error(f"BingX Balance Fehler: {e}")
+    return _bingx_balance_cache["value"]
+
+
+# ─── BingX Order-Funktionen ──────────────────────────────────
+
+def bingx_set_leverage(symbol: str, side: str, lev: int) -> bool:
+    """Setzt Hebel für LONG und SHORT getrennt (BingX Hedge-Mode)."""
+    max_lev = bingx_max_leverage(symbol)
+    eff_lev = min(lev, max_lev)
+    if lev > max_lev:
+        log.warning(f"BingX: Hebel {lev}x > Max {max_lev}x für {symbol}, nutze {max_lev}x")
+    ok_l = bingx_ok(bingx_post("/openApi/swap/v2/trade/leverage", {
+        "symbol": symbol, "side": "LONG", "leverage": eff_lev,
+    }))
+    ok_s = bingx_ok(bingx_post("/openApi/swap/v2/trade/leverage", {
+        "symbol": symbol, "side": "SHORT", "leverage": eff_lev,
+    }))
+    if not (ok_l or ok_s):
+        log.error(f"BingX set-leverage Fehler für {symbol}")
+    return ok_l or ok_s
+
+
+def bingx_get_mark_price(symbol: str) -> float:
+    res = bingx_get("/openApi/swap/v2/quote/price", {"symbol": symbol})
+    try:
+        data = res.get("data") or {}
+        return float(data.get("price", 0) or 0)
+    except Exception as e:
+        log.error(f"BingX markPrice Fehler ({symbol}): {e}")
+    return 0.0
+
+
+def bingx_calc_qty(symbol: str, usdt_margin: float, lev: int, ref_price: float) -> float:
+    notional = usdt_margin * lev
+    return bingx_snap_qty(symbol, notional / ref_price)
+
+
+def bingx_place_market_order(symbol: str, side: str, qty: float) -> dict:
+    """side = LONG oder SHORT (Positionsseite)"""
+    order_side = "BUY" if side == "LONG" else "SELL"
+    return bingx_post("/openApi/swap/v2/trade/order", {
+        "symbol":       symbol,
+        "side":         order_side,
+        "positionSide": side,
+        "type":         "MARKET",
+        "quantity":     bingx_fmt_qty(symbol, qty),
+    })
+
+
+def bingx_place_limit_order(symbol: str, side: str, qty: float, price: float) -> dict:
+    order_side = "BUY" if side == "LONG" else "SELL"
+    return bingx_post("/openApi/swap/v2/trade/order", {
+        "symbol":       symbol,
+        "side":         order_side,
+        "positionSide": side,
+        "type":         "LIMIT",
+        "quantity":     bingx_fmt_qty(symbol, qty),
+        "price":        bingx_fmt_price(symbol, price),
+        "timeInForce":  "GTC",
+    })
+
+
+def bingx_set_sl(symbol: str, side: str, sl_price: float) -> dict:
+    close_side = "SELL" if side == "LONG" else "BUY"
+    return bingx_post("/openApi/swap/v2/trade/order", {
+        "symbol":       symbol,
+        "side":         close_side,
+        "positionSide": side,
+        "type":         "STOP_MARKET",
+        "stopPrice":    bingx_fmt_price(symbol, sl_price),
+        "closePosition": "true",
+        "workingType":  "MARK_PRICE",
+    })
+
+
+def bingx_set_tp(symbol: str, side: str, tp_price: float) -> dict:
+    close_side = "SELL" if side == "LONG" else "BUY"
+    return bingx_post("/openApi/swap/v2/trade/order", {
+        "symbol":       symbol,
+        "side":         close_side,
+        "positionSide": side,
+        "type":         "TAKE_PROFIT_MARKET",
+        "stopPrice":    bingx_fmt_price(symbol, tp_price),
+        "closePosition": "true",
+        "workingType":  "MARK_PRICE",
+    })
+
+
+def bingx_cancel_open_orders(symbol: str) -> None:
+    bingx_delete("/openApi/swap/v2/trade/allOpenOrders", {"symbol": symbol})
+
+
+def bingx_close_position_market(symbol: str, side: str, qty: float) -> dict:
+    close_side = "SELL" if side == "LONG" else "BUY"
+    return bingx_post("/openApi/swap/v2/trade/order", {
+        "symbol":       symbol,
+        "side":         close_side,
+        "positionSide": side,
+        "type":         "MARKET",
+        "quantity":     bingx_fmt_qty(symbol, qty),
+        "reduceOnly":   "true",
+    })
+
+
+def bingx_get_position_size(symbol: str, side: str) -> float:
+    """Gibt Positions-Grösse für Symbol + Seite zurück (0 = keine Position)."""
+    res = bingx_get("/openApi/swap/v2/user/positions", {"symbol": symbol})
+    try:
+        data = res.get("data") or []
+        for pos in data:
+            if pos.get("symbol") == symbol and pos.get("positionSide") == side:
+                amt = abs(float(pos.get("positionAmt", 0) or 0))
+                log.info(f"BingX Position {symbol} {side}: {amt}")
+                return amt
+    except Exception as e:
+        log.error(f"BingX position Fehler ({symbol}): {e}")
+    return 0.0
+
+
+def bingx_get_closed_pnl(symbol: str) -> tuple:
+    """Gibt (closed_pnl, avg_close_price) des letzten abgeschlossenen Trades zurück."""
+    res = bingx_get("/openApi/swap/v2/trade/marginOrders", {
+        "symbol": symbol, "limit": "5",
+    })
+    try:
+        data = res.get("data") or {}
+        log.info(f"BingX closed-pnl raw: {data}")   # Feldnamen prüfen beim ersten Trade
+        orders = data.get("marginOrderList") or data.get("orders") or []
+        # Suche nach letzter gefüllter Close-Order
+        for o in orders:
+            status = o.get("status", "")
+            reduce = o.get("reduceOnly", False)
+            if status == "FILLED" and reduce:
+                pnl   = float(o.get("profit", 0) or o.get("realizedPnl", 0) or 0)
+                price = float(o.get("avgPrice", 0) or o.get("price", 0) or 0)
+                return (pnl, price)
+    except Exception as e:
+        log.error(f"BingX closed P&L Fehler ({symbol}): {e}")
+    return (0.0, 0.0)
+
+
+# ─── Exchange-Routing ─────────────────────────────────────────
+
+def resolve_exchange(symbol: str) -> tuple:
+    """
+    Prüft ob Symbol auf Bybit handelbar ist.
+    Falls nicht → Fallback auf BingX (symbol in BingX-Format).
+    Returns (exchange, exchange_symbol): ("bybit", "SUSHIUSDT") oder ("bingx", "SUSHI-USDT")
+    """
+    if not BINGX_API_KEY or not BINGX_SECRET_KEY:
+        log.info(f"Exchange-Routing: {symbol} → Bybit (kein BingX konfiguriert)")
+        return ("bybit", symbol)
+
+    # Bybit instruments-info abrufen
+    res = bybit_get("/v5/market/instruments-info", {
+        "category": BYBIT_CATEGORY, "symbol": symbol,
+    })
+    items = (res.get("result") or {}).get("list") or []
+    for item in items:
+        if item.get("symbol") == symbol and item.get("status") == "Trading":
+            log.info(f"Exchange-Routing: {symbol} → Bybit ✓")
+            return ("bybit", symbol)
+
+    # Nicht auf Bybit → BingX
+    bx_sym = to_bingx_symbol(symbol)
+    log.info(f"Exchange-Routing: {symbol} nicht auf Bybit → BingX ({bx_sym})")
+    return ("bingx", bx_sym)
+
+
+# ═══════════════════════════════════════════════════════════════
 # SIGNAL-PARSER
 # ═══════════════════════════════════════════════════════════════
 
@@ -687,134 +1040,188 @@ async def execute_signal(sig: dict) -> None:
         log.warning(f"Trade für {symbol} bereits im State, übersprungen")
         return
 
-    # 1. Hebel setzen
-    if not set_leverage(symbol, lev):
-        tg(f"❌ SYNORA: Hebel-Fehler für {symbol} — Trade abgebrochen")
-        return
-    log.info(f"Hebel {lev}X gesetzt")
+    # 1. Exchange-Routing: Bybit bevorzugt, Fallback BingX
+    exchange, ex_sym = resolve_exchange(symbol)
+    exchange_label   = "Bybit" if exchange == "bybit" else "BingX"
 
-    # 2. Precision laden (wird gecacht)
-    _load_instrument_info(symbol)
+    # 2. Precision laden + Hebel setzen
+    if exchange == "bybit":
+        _load_instrument_info(symbol)
+        if not set_leverage(symbol, lev):
+            tg(f"❌ SYNORA: Hebel-Fehler für {symbol} (Bybit) — Trade abgebrochen")
+            return
+        mark     = get_mark_price(symbol)
+        budget   = get_available_balance()
+    else:
+        _load_bingx_instrument_info(ex_sym)
+        if not bingx_set_leverage(ex_sym, side, lev):
+            tg(f"❌ SYNORA: Hebel-Fehler für {ex_sym} (BingX) — Trade abgebrochen")
+            return
+        mark     = bingx_get_mark_price(ex_sym)
+        budget   = get_bingx_balance()
 
-    # 3. Mark-Preis holen (für Qty-Berechnung)
-    mark = get_mark_price(symbol)
     ref_price = mark if mark > 0 else entry
-    log.info(f"Mark-Preis: {ref_price}")
+    log.info(f"Mark-Preis ({exchange_label}): {ref_price} | Budget: {budget:.2f} USDT")
 
-    # 4. Budget vom Sub-Account lesen (live, inkl. optionalem Cap)
-    budget = get_available_balance()
     if budget < 5.0:
         tg(f"❌ SYNORA: Balance zu gering ({budget:.2f} USDT) — Trade abgebrochen")
-        log.error(f"Balance {budget:.2f} USDT unter Minimum — abgebrochen")
         return
 
-    qty_entry = calc_qty(symbol, budget * SPLIT_ENTRY, lev, ref_price)
-    qty_dca1  = calc_qty(symbol, budget * SPLIT_DCA1,  lev, dca1)
-    qty_dca2  = calc_qty(symbol, budget * SPLIT_DCA2,  lev, dca2)
+    # 3. Qty berechnen
+    if exchange == "bybit":
+        qty_entry = calc_qty(symbol, budget * SPLIT_ENTRY, lev, ref_price)
+        qty_dca1  = calc_qty(symbol, budget * SPLIT_DCA1,  lev, dca1)
+        qty_dca2  = calc_qty(symbol, budget * SPLIT_DCA2,  lev, dca2)
+    else:
+        qty_entry = bingx_calc_qty(ex_sym, budget * SPLIT_ENTRY, lev, ref_price)
+        qty_dca1  = bingx_calc_qty(ex_sym, budget * SPLIT_DCA1,  lev, dca1)
+        qty_dca2  = bingx_calc_qty(ex_sym, budget * SPLIT_DCA2,  lev, dca2)
 
     if qty_entry <= 0:
         tg(f"❌ SYNORA: Qty=0 für {symbol} (Budget zu klein?) — Trade abgebrochen")
         return
 
-    # 5. Market Entry
-    res_entry = place_market_order(symbol, side, qty_entry)
-    if not bybit_ok(res_entry):
-        err = res_entry.get("retMsg", "unbekannt")
-        tg(f"❌ SYNORA: Market Order Fehler {symbol}: {err}")
+    # 4. Market Entry
+    if exchange == "bybit":
+        res_entry = place_market_order(symbol, side, qty_entry)
+        ok_entry  = bybit_ok(res_entry)
+        err_entry = res_entry.get("retMsg", "unbekannt")
+        entry_id  = (res_entry.get("result") or {}).get("orderId", "?")
+    else:
+        res_entry = bingx_place_market_order(ex_sym, side, qty_entry)
+        ok_entry  = bingx_ok(res_entry)
+        err_entry = res_entry.get("msg", "unbekannt")
+        entry_id  = (res_entry.get("data") or {}).get("orderId", "?")
+
+    if not ok_entry:
+        tg(f"❌ SYNORA: Market Order Fehler {symbol} ({exchange_label}): {err_entry}")
         log.error(f"Market Order Fehler: {res_entry}")
         return
-    entry_order_id = (res_entry.get("result") or {}).get("orderId", "?")
-    log.info(f"Market Entry platziert: OrderId={entry_order_id}")
+    log.info(f"Market Entry platziert ({exchange_label}): OrderId={entry_id}")
 
-    # 6. Kurz warten damit Position existiert
+    # 5. Kurz warten damit Position existiert
     await asyncio.sleep(2)
 
-    # 7. Stop-Loss setzen
-    res_sl = set_sl(symbol, side, sl)
-    if not bybit_ok(res_sl):
-        log.warning(f"SL-Fehler (nicht kritisch): {res_sl}")
+    # 6. Stop-Loss setzen
+    if exchange == "bybit":
+        res_sl = set_sl(symbol, side, sl)
+        if not bybit_ok(res_sl):
+            log.warning(f"SL-Fehler (nicht kritisch): {res_sl}")
+    else:
+        res_sl = bingx_set_sl(ex_sym, side, sl)
+        if not bingx_ok(res_sl):
+            log.warning(f"BingX SL-Fehler (nicht kritisch): {res_sl}")
 
-    # 8. DCA Limit Orders
+    # 7. DCA Limit Orders
     dca1_id = dca2_id = None
-    if qty_dca1 > 0:
-        res_dca1 = place_limit_order(symbol, side, qty_dca1, dca1)
-        if bybit_ok(res_dca1):
-            dca1_id = (res_dca1.get("result") or {}).get("orderId")
-            log.info(f"DCA1 Limit {dca1} × {fmt_qty(symbol, qty_dca1)} platziert")
-        else:
-            log.warning(f"DCA1 Fehler: {res_dca1}")
+    if exchange == "bybit":
+        if qty_dca1 > 0:
+            res_dca1 = place_limit_order(symbol, side, qty_dca1, dca1)
+            if bybit_ok(res_dca1):
+                dca1_id = (res_dca1.get("result") or {}).get("orderId")
+                log.info(f"DCA1 Limit {dca1} × {fmt_qty(symbol, qty_dca1)} platziert")
+            else:
+                log.warning(f"DCA1 Fehler: {res_dca1}")
+        if qty_dca2 > 0:
+            res_dca2 = place_limit_order(symbol, side, qty_dca2, dca2)
+            if bybit_ok(res_dca2):
+                dca2_id = (res_dca2.get("result") or {}).get("orderId")
+                log.info(f"DCA2 Limit {dca2} × {fmt_qty(symbol, qty_dca2)} platziert")
+            else:
+                log.warning(f"DCA2 Fehler: {res_dca2}")
+    else:
+        if qty_dca1 > 0:
+            res_dca1 = bingx_place_limit_order(ex_sym, side, qty_dca1, dca1)
+            if bingx_ok(res_dca1):
+                dca1_id = (res_dca1.get("data") or {}).get("orderId")
+                log.info(f"BingX DCA1 Limit {dca1} × {bingx_fmt_qty(ex_sym, qty_dca1)} platziert")
+            else:
+                log.warning(f"BingX DCA1 Fehler: {res_dca1}")
+        if qty_dca2 > 0:
+            res_dca2 = bingx_place_limit_order(ex_sym, side, qty_dca2, dca2)
+            if bingx_ok(res_dca2):
+                dca2_id = (res_dca2.get("data") or {}).get("orderId")
+                log.info(f"BingX DCA2 Limit {dca2} × {bingx_fmt_qty(ex_sym, qty_dca2)} platziert")
+            else:
+                log.warning(f"BingX DCA2 Fehler: {res_dca2}")
 
-    if qty_dca2 > 0:
-        res_dca2 = place_limit_order(symbol, side, qty_dca2, dca2)
-        if bybit_ok(res_dca2):
-            dca2_id = (res_dca2.get("result") or {}).get("orderId")
-            log.info(f"DCA2 Limit {dca2} × {fmt_qty(symbol, qty_dca2)} platziert")
-        else:
-            log.warning(f"DCA2 Fehler: {res_dca2}")
-
-    # 9. State speichern
+    # 8. State speichern (inkl. Exchange-Info für alle Folge-Aktionen)
     _state.setdefault("trades", {})[symbol] = {
-        "side":           side,
-        "lev":            lev,
-        "entry":          entry,
-        "dca1":           dca1,
-        "dca2":           dca2,
-        "sl":             sl,
-        "qty_entry":      qty_entry,
-        "qty_dca1":       qty_dca1,
-        "qty_dca2":       qty_dca2,
-        "dca1_order_id":  dca1_id,
-        "dca2_order_id":  dca2_id,
-        "tp":             None,
-        "opened_at":      datetime.utcnow().isoformat(),
-        "budget_usdt":    budget,
+        "side":             side,
+        "lev":              lev,
+        "entry":            entry,
+        "dca1":             dca1,
+        "dca2":             dca2,
+        "sl":               sl,
+        "qty_entry":        qty_entry,
+        "qty_dca1":         qty_dca1,
+        "qty_dca2":         qty_dca2,
+        "dca1_order_id":    dca1_id,
+        "dca2_order_id":    dca2_id,
+        "tp":               None,
+        "opened_at":        datetime.utcnow().isoformat(),
+        "budget_usdt":      budget,
+        "exchange":         exchange,        # "bybit" oder "bingx"
+        "exchange_symbol":  ex_sym,          # z.B. "SUSHI-USDT" für BingX
     }
     save_state()
 
-    # 10. Telegram-Benachrichtigung
+    # 9. Telegram-Benachrichtigung
     sl_dist_pct = abs(sl - entry) / entry * 100
+    qty_dca1_fmt = fmt_qty(symbol, qty_dca1) if exchange == "bybit" else bingx_fmt_qty(ex_sym, qty_dca1)
+    qty_dca2_fmt = fmt_qty(symbol, qty_dca2) if exchange == "bybit" else bingx_fmt_qty(ex_sym, qty_dca2)
     tg(
-        f"🟣 <b>SYNORA Trade eröffnet</b>\n"
+        f"🟣 <b>SYNORA Trade eröffnet</b> [{exchange_label}]\n"
         f"Symbol: <b>{symbol}</b> {side} {lev}X\n"
         f"Entry (Market): {entry}\n"
         f"SL: {sl} ({sl_dist_pct:.2f}%)\n"
-        f"DCA1: {dca1} × {fmt_qty(symbol, qty_dca1)} ({int(SPLIT_DCA1*100)}%)\n"
-        f"DCA2: {dca2} × {fmt_qty(symbol, qty_dca2)} ({int(SPLIT_DCA2*100)}%)\n"
+        f"DCA1: {dca1} × {qty_dca1_fmt} ({int(SPLIT_DCA1*100)}%)\n"
+        f"DCA2: {dca2} × {qty_dca2_fmt} ({int(SPLIT_DCA2*100)}%)\n"
         f"Budget: {budget:.2f} USDT (live vom Sub-Account)"
     )
 
 
 async def handle_update(upd: dict) -> None:
     """Verarbeitet eine SYNORA UPDATE Nachricht — setzt TP."""
-    symbol      = upd["symbol"]
-    max_gain    = upd["max_gain_pct"]
+    symbol   = upd["symbol"]
+    max_gain = upd["max_gain_pct"]
 
     trade = _state.get("trades", {}).get(symbol)
     if not trade:
         log.info(f"UPDATE für {symbol} — kein offener Trade im State")
         return
 
-    side  = trade["side"]
-    lev   = trade["lev"]
-    entry = trade["entry"]
+    side     = trade["side"]
+    lev      = trade["lev"]
+    entry    = trade["entry"]
+    exchange = trade.get("exchange", "bybit")
+    ex_sym   = trade.get("exchange_symbol", symbol)
 
     tp_price = calc_tp_price(side, entry, max_gain, lev)
+    log.info(f"UPDATE {symbol} ({exchange}): max_gain={max_gain}% → TP={tp_price:.6f}")
 
-    log.info(f"UPDATE {symbol}: max_gain={max_gain}% → TP={tp_price:.6f}")
+    if exchange == "bybit":
+        res = set_tp(symbol, side, tp_price)
+        ok  = bybit_ok(res)
+        err = res.get("retMsg", "unbekannt")
+        tp_str = fmt_price(symbol, tp_price)
+    else:
+        res = bingx_set_tp(ex_sym, side, tp_price)
+        ok  = bingx_ok(res)
+        err = res.get("msg", "unbekannt")
+        tp_str = bingx_fmt_price(ex_sym, tp_price)
 
-    res = set_tp(symbol, side, tp_price)
-    if bybit_ok(res):
+    if ok:
         _state["trades"][symbol]["tp"] = tp_price
         save_state()
         tg(
             f"🎯 <b>SYNORA TP gesetzt</b>\n"
             f"Symbol: <b>{symbol}</b>\n"
             f"Maximaler Gewinn: {max_gain}%\n"
-            f"TP-Preis: {fmt_price(symbol, tp_price)}\n"
+            f"TP-Preis: {tp_str}\n"
             f"(Mode: {SYNORA_MAX_GAIN_MODE})"
         )
     else:
-        err = res.get("retMsg", "unbekannt")
         tg(f"⚠️ SYNORA: TP-Fehler {symbol}: {err}")
         log.warning(f"TP-Fehler: {res}")
 
@@ -826,19 +1233,27 @@ async def handle_close(symbol: str, reason: str = "CANCEL") -> None:
         log.info(f"CLOSE für {symbol} — kein offener Trade")
         return
 
+    exchange = trade.get("exchange", "bybit")
+    ex_sym   = trade.get("exchange_symbol", symbol)
+
     # Offene Limit-Orders stornieren
-    cancel_open_orders(symbol)
+    if exchange == "bybit":
+        cancel_open_orders(symbol)
+    else:
+        bingx_cancel_open_orders(ex_sym)
     await asyncio.sleep(1)
 
-    # Echte Position-Grösse von Bybit holen (nicht theoretische Summe verwenden,
-    # da DCAs evtl. nicht gefüllt wurden → falsche Qty → Bybit-Fehler)
+    # Echte Position-Grösse holen (keine theoretische Summe — DCAs evtl. nicht gefüllt)
     actual_qty = 0.0
     try:
-        res_pos = bybit_get("/v5/position/list", {"category": BYBIT_CATEGORY, "symbol": symbol})
-        for item in (res_pos.get("result") or {}).get("list") or []:
-            if item.get("symbol") == symbol:
-                actual_qty = float(item.get("size", "0") or "0")
-                break
+        if exchange == "bybit":
+            res_pos = bybit_get("/v5/position/list", {"category": BYBIT_CATEGORY, "symbol": symbol})
+            for item in (res_pos.get("result") or {}).get("list") or []:
+                if item.get("symbol") == symbol:
+                    actual_qty = float(item.get("size", "0") or "0")
+                    break
+        else:
+            actual_qty = bingx_get_position_size(ex_sym, trade["side"])
     except Exception as e:
         log.error(f"Position-Abfrage für Close fehlgeschlagen ({symbol}): {e}")
 
@@ -849,22 +1264,31 @@ async def handle_close(symbol: str, reason: str = "CANCEL") -> None:
         tg(f"ℹ️ SYNORA: {symbol} war bereits geschlossen ({reason})")
         return
 
-    log.info(f"CLOSE {symbol}: schliesse {actual_qty} Kontrakte (Bybit live)")
-    res = close_position_market(symbol, trade["side"], actual_qty)
+    log.info(f"CLOSE {symbol} ({exchange}): schliesse {actual_qty} Kontrakte")
 
-    if bybit_ok(res):
-        await asyncio.sleep(2)  # kurz warten bis Bybit P&L verfügbar
-        # Closed P&L von Bybit holen
-        pnl_res = bybit_get("/v5/position/closed-pnl", {
-            "category": BYBIT_CATEGORY, "symbol": symbol, "limit": "1",
-        })
-        pnl_items = (pnl_res.get("result") or {}).get("list") or []
-        closed_pnl  = 0.0
-        close_price = 0.0
-        if pnl_items:
-            p = pnl_items[0]
-            closed_pnl  = float(p.get("closedPnl",    0) or 0)
-            close_price = float(p.get("avgExitPrice", 0) or 0)
+    if exchange == "bybit":
+        res = close_position_market(symbol, trade["side"], actual_qty)
+        ok  = bybit_ok(res)
+        err = res.get("retMsg", "unbekannt")
+    else:
+        res = bingx_close_position_market(ex_sym, trade["side"], actual_qty)
+        ok  = bingx_ok(res)
+        err = res.get("msg", "unbekannt")
+
+    if ok:
+        await asyncio.sleep(2)
+        if exchange == "bybit":
+            pnl_res   = bybit_get("/v5/position/closed-pnl", {
+                "category": BYBIT_CATEGORY, "symbol": symbol, "limit": "1",
+            })
+            pnl_items = (pnl_res.get("result") or {}).get("list") or []
+            closed_pnl = close_price = 0.0
+            if pnl_items:
+                p = pnl_items[0]
+                closed_pnl  = float(p.get("closedPnl",    0) or 0)
+                close_price = float(p.get("avgExitPrice", 0) or 0)
+        else:
+            closed_pnl, close_price = bingx_get_closed_pnl(ex_sym)
 
         csv_log_synora_trade({
             "opened_at":   trade.get("opened_at", ""),
@@ -885,7 +1309,6 @@ async def handle_close(symbol: str, reason: str = "CANCEL") -> None:
         pnl_str = f"+{closed_pnl:.2f}" if closed_pnl >= 0 else f"{closed_pnl:.2f}"
         tg(f"🔴 <b>SYNORA Position geschlossen</b>\n{symbol} ({reason})\nP&L: {pnl_str} USDT")
     else:
-        err = res.get("retMsg", "unbekannt")
         tg(f"⚠️ SYNORA: Close-Fehler {symbol}: {err}")
         log.warning(f"Close-Fehler: {res}")
 
@@ -918,7 +1341,7 @@ def _determine_outcome(trade: dict, close_price: float) -> str:
     return "manual"
 
 async def check_closed_positions() -> None:
-    """Periodischer Loop: prüft ob Synora-Positionen auf Bybit geschlossen wurden."""
+    """Periodischer Loop: prüft ob Synora-Positionen geschlossen wurden (Bybit oder BingX)."""
     log.info("Position-Polling gestartet (Intervall: %ds)", POSITION_POLL_INTERVAL)
     while True:
         await asyncio.sleep(POSITION_POLL_INTERVAL)
@@ -928,42 +1351,56 @@ async def check_closed_positions() -> None:
 
         for symbol, trade in trades_snapshot.items():
             try:
-                # Aktuelle Position auf Bybit abfragen
-                res = bybit_get("/v5/position/list", {
-                    "category": BYBIT_CATEGORY,
-                    "symbol":   symbol,
-                })
-                items = (res.get("result") or {}).get("list") or []
-                pos_size = 0.0
-                for item in items:
-                    if item.get("symbol") == symbol:
-                        pos_size = float(item.get("size", "0") or "0")
-                        break
+                exchange = trade.get("exchange", "bybit")
+                ex_sym   = trade.get("exchange_symbol", symbol)
+
+                # ── Position-Grösse abfragen ────────────────
+                if exchange == "bybit":
+                    res = bybit_get("/v5/position/list", {
+                        "category": BYBIT_CATEGORY, "symbol": symbol,
+                    })
+                    items = (res.get("result") or {}).get("list") or []
+                    pos_size = 0.0
+                    for item in items:
+                        if item.get("symbol") == symbol:
+                            pos_size = float(item.get("size", "0") or "0")
+                            break
+
+                    # Migration: alter State ohne 'exchange'-Feld
+                    # → wenn Bybit size=0, auch BingX prüfen bevor wir als "closed" werten
+                    if pos_size == 0 and "exchange" not in trade and BINGX_API_KEY:
+                        bx_sym   = to_bingx_symbol(symbol)
+                        bx_size  = bingx_get_position_size(bx_sym, trade["side"])
+                        if bx_size > 0:
+                            log.info(f"Migration: {symbol} auf BingX ({bx_sym}) gefunden — State aktualisiert")
+                            _state["trades"][symbol]["exchange"]        = "bingx"
+                            _state["trades"][symbol]["exchange_symbol"] = bx_sym
+                            save_state()
+                            continue   # Position noch offen auf BingX
+                else:
+                    pos_size = bingx_get_position_size(ex_sym, trade["side"])
 
                 if pos_size > 0:
                     continue   # Position noch offen
 
-                # Position ist zu — offene DCA-Limit-Orders stornieren
-                # (SL/TP schliesst nur die Position, Limit-Orders bleiben sonst aktiv)
-                cancel_open_orders(symbol)
-
-                # Closed-P&L von Bybit holen
-                pnl_res = bybit_get("/v5/position/closed-pnl", {
-                    "category": BYBIT_CATEGORY,
-                    "symbol":   symbol,
-                    "limit":    "1",
-                })
-                pnl_items = (pnl_res.get("result") or {}).get("list") or []
-                closed_pnl  = 0.0
-                close_price = 0.0
-                if pnl_items:
-                    p = pnl_items[0]
-                    closed_pnl  = float(p.get("closedPnl",    0) or 0)
-                    close_price = float(p.get("avgExitPrice", 0) or 0)
+                # ── Position ist geschlossen ─────────────────
+                if exchange == "bybit":
+                    cancel_open_orders(symbol)
+                    pnl_res   = bybit_get("/v5/position/closed-pnl", {
+                        "category": BYBIT_CATEGORY, "symbol": symbol, "limit": "1",
+                    })
+                    pnl_items = (pnl_res.get("result") or {}).get("list") or []
+                    closed_pnl = close_price = 0.0
+                    if pnl_items:
+                        p = pnl_items[0]
+                        closed_pnl  = float(p.get("closedPnl",    0) or 0)
+                        close_price = float(p.get("avgExitPrice", 0) or 0)
+                else:
+                    bingx_cancel_open_orders(ex_sym)
+                    closed_pnl, close_price = bingx_get_closed_pnl(ex_sym)
 
                 outcome = _determine_outcome(trade, close_price)
-
-                record = {
+                record  = {
                     "opened_at":   trade.get("opened_at", ""),
                     "closed_at":   datetime.now(timezone.utc).isoformat(),
                     "symbol":      symbol,
@@ -978,13 +1415,11 @@ async def check_closed_positions() -> None:
                     "outcome":     outcome,
                 }
                 csv_log_synora_trade(record)
-
-                # Aus State entfernen
                 _state["trades"].pop(symbol, None)
                 save_state()
 
-                emoji    = "✅" if closed_pnl >= 0 else "❌"
-                pnl_str  = f"+{closed_pnl:.2f}" if closed_pnl >= 0 else f"{closed_pnl:.2f}"
+                emoji   = "✅" if closed_pnl >= 0 else "❌"
+                pnl_str = f"+{closed_pnl:.2f}" if closed_pnl >= 0 else f"{closed_pnl:.2f}"
                 tg(
                     f"{emoji} <b>SYNORA Trade geschlossen</b>\n"
                     f"Symbol: <b>{symbol}</b> | {outcome}\n"
