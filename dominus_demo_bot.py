@@ -1,5 +1,5 @@
 """
-DOMINUS Demo-Bot v4.52 — PAPER TRADING
+DOMINUS Demo-Bot v4.53 — PAPER TRADING
 ════════════════════════════════════
 Vollautomatisches Paper Trading auf Bitget Demo-Account.
 Kein echtes Kapital — identische Logik wie Live-Script.
@@ -1021,6 +1021,7 @@ H4_BUFFER_SEC  = _env_int("H4_BUFFER_SEC", 300)  # 5 Min
 harsi_warn_buffer:      list = []
 harsi_warn_buffer_lock  = __import__("threading").Lock()
 HARSI_WARN_BUFFER_SEC   = _env_int("HARSI_WARN_BUFFER_SEC", 60)  # 60s Sammelzeit
+HARSI_SCORE_PENALTY     = _env_int("HARSI_SCORE_PENALTY", 20)   # v4.53: Score-Malus wenn HARSI in Extremzone
 _harsi_warn_timer: object = None   # aktiver threading.Timer (oder None)
 
 trailing_sl_level: dict = {}  # {symbol: int} — 0=initial, 1=Entry, 2=TP1-Preis, 3=TP2-Preis
@@ -4893,12 +4894,15 @@ def score_entry(e: dict) -> dict:
         else:
             breakdown.append(f"±0 WR n/a ({n_tr}T)")
 
-    # 6) HARSI-Divergenz-Flag (+5 / Warnung)
+    # 6) HARSI-Divergenz-Flag (+5 / Malus) — v4.53 Option B
     if harsi_w == 0:
         score += 5
         breakdown.append("+5 kein HARSI-warn")
     else:
-        warnings.append("HARSI-Divergenz aktiv")
+        _penalty = min(int(HARSI_SCORE_PENALTY), 30)
+        score -= _penalty
+        breakdown.append(f"\u2212{_penalty} HARSI in Extremzone")
+        warnings.append("HARSI noch in Extremzone \u2014 Score reduziert")
 
     # 7) Timing-Frische (+5 bis 0)
     if elapsed_m <= 30:
@@ -9320,8 +9324,18 @@ def start_webhook_server():
             btc_t2_txt = "BTC + Total2 gleiche Richtung ✓"
         premium_txt  = "Premium-Setup (dunkelgrün/-rot)"   if premium_val     == 1 else "Kein Premium (höheres Risiko)"
 
-        # v4.38: harsi_warn=1 → Signale bündeln statt einzeln senden
+        # v4.53 Option B: harsi_warn=1 → Queue mit Score-Malus
         if harsi_warn_val != 0:
+            if ENTRY_QUEUE_ENABLED:
+                _sugg_hw = build_trade_suggestion(symbol, direction, entry, data.get("sling_sl"), data.get("atr"))
+                enqueue_entry({"symbol": symbol, "direction": direction, "entry": entry, "warn_line": "\u26a0\ufe0f HARSI noch in Extremzone \u2014 Score reduziert", "timing_elapsed_min": 0, "sugg": _sugg_hw, "harsi_warn": 1, "sling_sl": data.get("sling_sl"), "atr": data.get("atr"), "xinfo": _xinfo, "source": "H2_SIGNAL_HARSI_WARN", "ts": __import__("time").time()})
+                if f"{symbol}_{direction}" in last_h2_signal_time:
+                    del last_h2_signal_time[f"{symbol}_{direction}"]
+                    save_state()
+                log(f"HARSI-Warn-Queue: {symbol} {direction} eingereiht (Score-Malus {HARSI_SCORE_PENALTY}pt)")
+                return
+            # Fallback: alter Buffer-Pfad wenn Queue disabled
+        if False and harsi_warn_val != 0:  # dead code — nur Queue-disabled Fallback
             _h2_ts      = _ensure_aware_utc(last_h2_signal_time.get(
                 f"{symbol}_{direction}", datetime.now(timezone.utc)))
             _expiry_utc = _h2_ts + timedelta(minutes=30)
@@ -9402,7 +9416,7 @@ def start_webhook_server():
     @app.route("/", methods=["GET"])
     @app.route("/health", methods=["GET"])
     def health():
-        return jsonify({"status": "running", "version": "v4.46", "mode": "DEMO"}), 200
+        return jsonify({"status": "running", "version": "v4.53", "mode": "DEMO"}), 200
 
     @app.route("/dashboard", methods=["GET"])
     def dashboard():
@@ -10415,7 +10429,7 @@ def main():
         log("  → Bitget: Futures → Klassisches Demo-Trading → API-Keys erstellen")
         return
 
-    log("DOMINUS Demo-Bot v4.37 gestartet [DEMO-MODUS — Paper Trading]")
+    log("DOMINUS Demo-Bot v4.53 gestartet [DEMO-MODUS — Paper Trading]")
     log("  Bitget Demo-Account Keys aktiv (DEMO_API_KEY / DEMO_SECRET_KEY)")
     log("  Kein paperId-Header — Demo-Routing via separate API-Credentials")
     log(f"  Telegram Demo-Kanal: {TELEGRAM_CHAT_ID}")
