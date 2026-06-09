@@ -71,6 +71,7 @@ import csv as csv_module
 import hmac
 import hashlib
 from datetime import datetime, timezone
+from typing import Optional
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
@@ -92,6 +93,13 @@ API_HASH          = os.environ.get("TELEGRAM_API_HASH", "")
 SESSION_STRING    = os.environ.get("SYNORA_SESSION_STRING") or os.environ.get("DOMINUS_SESSION_STRING", "")
 TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID  = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+# ── Telegram Forum Topics (Option C — Supergruppe mit Coin-Threads) ───────────
+TELEGRAM_FORUM_GROUP_ID   = int(os.environ.get("TELEGRAM_FORUM_GROUP_ID",   "0") or "0")
+TELEGRAM_SYSTEM_TOPIC_ID  = int(os.environ.get("TELEGRAM_SYSTEM_TOPIC_ID",  "0") or "0")
+TELEGRAM_REPORTS_TOPIC_ID = int(os.environ.get("TELEGRAM_REPORTS_TOPIC_ID", "0") or "0")
+TELEGRAM_STATUS_TOPIC_ID  = int(os.environ.get("TELEGRAM_STATUS_TOPIC_ID",  "0") or "0")
+_FORUM_ENABLED = bool(TELEGRAM_FORUM_GROUP_ID)
 
 # Synora-spezifisch
 SYNORA_CHANNEL    = os.environ.get("SYNORA_CHANNEL_ID", "")   # int-ID oder Einladungslink
@@ -236,7 +244,7 @@ def read_trades_csv() -> list:
 # ═══════════════════════════════════════════════════════════════
 
 def tg(msg: str, parse_mode: str = "HTML") -> None:
-    """Sendet eine Nachricht an den Telegram-Chat."""
+    """Sendet eine Nachricht an den Telegram-Chat (Fallback / Direkt-Chat)."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         log.info(f"[TG] {msg}")
         return
@@ -253,6 +261,207 @@ def tg(msg: str, parse_mode: str = "HTML") -> None:
         )
     except Exception as e:
         log.error(f"Telegram-Fehler: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════
+# TELEGRAM FORUM TOPICS  (Option C — Supergruppe mit Coin-Threads)
+# ═══════════════════════════════════════════════════════════════
+#
+# Farb-Konstanten (Telegram API icon_color):
+#   13338331 = teal     → offener Long-Trade
+#   16766590 = orange   → offener Short-Trade
+#    8311585 = grün     → Trade gewonnen (TP)
+#    7322096 = rot      → Trade verloren (SL)
+#    6316715 = blau     → System / Alarme
+#
+# Konzept für 160 Coins:
+#   Topics werden LAZY erstellt — nur wenn ein Trade öffnet.
+#   Nach Trade-Close wird das Topic archiviert (closeForumTopic).
+#   → Im Hub sieht man nur aktuell offene Trades (~2-10 gleichzeitig).
+#   Geschlossene Topics sinken zum Boden, bleiben aber als History abrufbar.
+#
+TG_COLOR_LONG_OPEN  = 13338331   # teal
+TG_COLOR_SHORT_OPEN = 16766590   # orange
+TG_COLOR_WIN        = 8311585    # grün
+TG_COLOR_LOSS       = 7322096    # rot
+TG_COLOR_SYSTEM     = 6316715    # blau
+
+_coin_topic_cache: dict = {}     # symbol → thread_id (in-memory; befüllt aus State beim Zugriff)
+
+
+def _forum_api(method: str, params: dict) -> dict:
+    """Sendet einen Telegram Bot API Request."""
+    if not TELEGRAM_TOKEN:
+        return {}
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}",
+            json=params, timeout=10,
+        )
+        return r.json()
+    except Exception as e:
+        log.error(f"Forum-API Fehler ({method}): {e}")
+        return {}
+
+
+def tg_topic(msg: str, thread_id: int = 0, parse_mode: str = "HTML") -> None:
+    """Sendet eine Nachricht an ein spezifisches Forum-Topic.
+    Falls Forum nicht konfiguriert oder thread_id=0: Fallback auf TELEGRAM_CHAT_ID.
+    """
+    if not TELEGRAM_TOKEN:
+        log.info(f"[TG-TOPIC] {msg}")
+        return
+    use_forum = _FORUM_ENABLED and bool(thread_id)
+    chat_id   = str(TELEGRAM_FORUM_GROUP_ID) if use_forum else TELEGRAM_CHAT_ID
+    body: dict = {
+        "chat_id":                  chat_id,
+        "text":                     msg,
+        "parse_mode":               parse_mode,
+        "disable_web_page_preview": True,
+    }
+    if use_forum:
+        body["message_thread_id"] = thread_id
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json=body, timeout=10,
+        )
+    except Exception as e:
+        log.error(f"Telegram-Topic Fehler: {e}")
+
+
+def tg_coin(symbol: str, msg: str) -> None:
+    """Sendet ans coin-spezifische Trade-Topic (oder Fallback auf normalen Chat)."""
+    if not _FORUM_ENABLED:
+        tg(msg)
+        return
+    tid = _get_coin_topic_id(symbol)
+    tg_topic(msg, thread_id=tid)
+
+
+def tg_system(msg: str) -> None:
+    """Sendet ans System-Alarme Topic (oder Fallback auf normalen Chat)."""
+    tg_topic(msg, thread_id=TELEGRAM_SYSTEM_TOPIC_ID) if _FORUM_ENABLED else tg(msg)
+
+
+def tg_report(msg: str) -> None:
+    """Sendet ans Berichte Topic (oder Fallback auf normalen Chat)."""
+    tg_topic(msg, thread_id=TELEGRAM_REPORTS_TOPIC_ID) if _FORUM_ENABLED else tg(msg)
+
+
+def tg_status(msg: str) -> None:
+    """Sendet ans Bot-Status Topic (oder Fallback auf normalen Chat)."""
+    tg_topic(msg, thread_id=TELEGRAM_STATUS_TOPIC_ID) if _FORUM_ENABLED else tg(msg)
+
+
+def _forum_create_topic(name: str, icon_color: int = TG_COLOR_SYSTEM) -> int:
+    """Erstellt ein neues Forum-Topic; gibt thread_id zurück (0 = Fehler)."""
+    res = _forum_api("createForumTopic", {
+        "chat_id":    TELEGRAM_FORUM_GROUP_ID,
+        "name":       name,
+        "icon_color": icon_color,
+    })
+    return int((res.get("result") or {}).get("message_thread_id") or 0)
+
+
+def _forum_close_topic(thread_id: int) -> None:
+    """Archiviert ein Forum-Topic (erscheint am Boden der Liste)."""
+    _forum_api("closeForumTopic", {
+        "chat_id":           TELEGRAM_FORUM_GROUP_ID,
+        "message_thread_id": thread_id,
+    })
+
+
+def _forum_reopen_topic(thread_id: int) -> None:
+    """Öffnet ein archiviertes Forum-Topic wieder."""
+    _forum_api("reopenForumTopic", {
+        "chat_id":           TELEGRAM_FORUM_GROUP_ID,
+        "message_thread_id": thread_id,
+    })
+
+
+def _forum_edit_color(thread_id: int, icon_color: int) -> None:
+    """Ändert die Icon-Farbe eines Forum-Topics."""
+    _forum_api("editForumTopic", {
+        "chat_id":           TELEGRAM_FORUM_GROUP_ID,
+        "message_thread_id": thread_id,
+        "icon_color":        icon_color,
+    })
+
+
+def _get_coin_topic_id(symbol: str) -> int:
+    """Gibt die thread_id für ein Coin-Topic zurück (Cache → State → 0)."""
+    if symbol in _coin_topic_cache:
+        return _coin_topic_cache[symbol]
+    tid = int((_state.get("telegram_topics") or {}).get(symbol, {}).get("thread_id") or 0)
+    if tid:
+        _coin_topic_cache[symbol] = tid
+    return tid
+
+
+def _open_coin_topic(symbol: str, side: str) -> int:
+    """
+    Erstellt oder öffnet (reopen) ein Coin-Trade-Topic beim Trade-Entry.
+    Speichert thread_id im State und Cache. Gibt thread_id zurück.
+    """
+    if not _FORUM_ENABLED:
+        return 0
+    color = TG_COLOR_LONG_OPEN if side == "LONG" else TG_COLOR_SHORT_OPEN
+    tid   = 0
+
+    existing = (_state.get("telegram_topics") or {}).get(symbol)
+    if existing:
+        tid = int(existing.get("thread_id") or 0)
+
+    if tid:
+        # Bereits bekanntes Topic — reopenen + Farbe setzen
+        _forum_reopen_topic(tid)
+        _forum_edit_color(tid, color)
+        _state.setdefault("telegram_topics", {})[symbol]["status"] = "open"
+    else:
+        # Neues Topic erstellen (lazy)
+        coin_name = symbol.replace("USDT", "").replace("PERP", "")
+        label     = f"{'📈' if side == 'LONG' else '📉'} {coin_name}"
+        tid       = _forum_create_topic(label, icon_color=color)
+        if not tid:
+            log.error(f"Forum: Topic konnte nicht erstellt werden für {symbol}")
+            return 0
+        _state.setdefault("telegram_topics", {})[symbol] = {
+            "thread_id": tid,
+            "status":    "open",
+        }
+
+    _coin_topic_cache[symbol] = tid
+    save_state()
+    return tid
+
+
+def _close_coin_topic(symbol: str, won: Optional[bool] = None) -> None:
+    """
+    Schliesst das Coin-Topic nach Trade-Ende und setzt die finale Icon-Farbe.
+    won=True  → grün (TP-Win)
+    won=False → rot  (SL-Loss)
+    won=None  → Farbe unverändert
+    Topic wird archiviert (sinkt in der Gruppen-Liste nach unten).
+    """
+    if not _FORUM_ENABLED:
+        return
+    tid = _get_coin_topic_id(symbol)
+    if not tid:
+        return
+    if won is True:
+        _forum_edit_color(tid, TG_COLOR_WIN)
+    elif won is False:
+        _forum_edit_color(tid, TG_COLOR_LOSS)
+    _forum_close_topic(tid)
+
+    topics = _state.setdefault("telegram_topics", {})
+    if symbol in topics:
+        topics[symbol]["status"] = "closed"
+        save_state()
+
+    _coin_topic_cache.pop(symbol, None)
+    log.info(f"Forum: Topic für {symbol} geschlossen (won={won})")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1075,14 +1284,14 @@ async def _verify_sl(symbol: str, trade: dict) -> None:
         if ok_fix:
             log.info(f"SL-Monitor {symbol}: SL auf {sl_state} korrigiert ✓")
             if sl_live <= 0:
-                tg(
+                tg_system(
                     f"🚨 <b>SYNORA: SL fehlte!</b>\n"
                     f"{symbol} {side} — SL war nicht gesetzt!\n"
                     f"Automatisch korrigiert auf {sl_state}"
                 )
         else:
             log.error(f"SL-Monitor {symbol}: Korrektur fehlgeschlagen! {res_fix}")
-            tg(
+            tg_system(
                 f"🚨 <b>SYNORA: SL-Korrektur FEHLGESCHLAGEN</b>\n"
                 f"{symbol} — SL={sl_state} nicht gesetzt!\n"
                 f"Bitte manuell setzen!"
@@ -1145,7 +1354,7 @@ async def _cancel_dca_if_sl_at_be(symbol: str, trade: dict) -> None:
         cancel_open_orders(symbol)
     else:
         bingx_cancel_open_orders(ex_sym)
-    tg(
+    tg_system(
         f"🚨 <b>SYNORA: DCA-Orders storniert</b>\n"
         f"<b>{symbol}</b> — {reason}\n"
         f"{len(dca_open)} DCA-Limit-Order(s) waren noch offen — automatisch storniert."
@@ -1172,7 +1381,7 @@ async def reconcile_trade_state(startup: bool = False) -> None:
     trades_snapshot = dict(_state.get("trades", {}))
     if not trades_snapshot:
         if startup:
-            tg("🟣 <b>SYNORA Reconcile</b>: Keine offenen Trades — bereit ✓")
+            tg_status("🟣 <b>SYNORA Reconcile</b>: Keine offenen Trades — bereit ✓")
         return
 
     fixes        = []   # gesammelte Korrekturen für Startup-Bericht
@@ -1287,7 +1496,7 @@ async def reconcile_trade_state(startup: bool = False) -> None:
                     bingx_cancel_open_orders(ex_sym)
                 fixes.append(f"{symbol}: {len(dca_open)} DCA-Order(s) storniert ({reason})")
                 log.info(f"Reconcile: DCA storniert für {symbol} — {reason}")
-                tg(
+                tg_system(
                     f"🚨 <b>SYNORA: DCA-Orders storniert</b>\n"
                     f"<b>{symbol}</b> — {reason}\n"
                     f"{len(dca_open)} Limit-Order(s) waren noch offen!"
@@ -1328,7 +1537,7 @@ async def reconcile_trade_state(startup: bool = False) -> None:
     elif not _state.get("trades"):
         parts.append("\nKeine offenen Trades nach Reconcile.")
 
-    tg("".join(parts))
+    tg_status("".join(parts))
 
 
 async def _check_dynamic_profit_levels(symbol: str, trade: dict, pos_size: float) -> None:
@@ -1394,7 +1603,7 @@ async def _check_dynamic_profit_levels(symbol: str, trade: dict, pos_size: float
 
         if not ok:
             log.error(f"Dynamic Partial Close Fehler Level +{profit_pct}%: {err}")
-            tg(f"⚠️ SYNORA Dynamic: Partial-Close Fehler bei +{profit_pct}% {symbol}: {err}")
+            tg_system(f"⚠️ SYNORA Dynamic: Partial-Close Fehler bei +{profit_pct}% {symbol}: {err}")
             continue   # nächste Stufe trotzdem prüfen
 
         remaining_qty -= qty_to_close
@@ -1432,7 +1641,8 @@ async def _check_dynamic_profit_levels(symbol: str, trade: dict, pos_size: float
 
         save_state()
 
-        tg(
+        tg_coin(
+            symbol,
             f"📈 <b>SYNORA Partial Close</b> [Stufe +{profit_pct}%]\n"
             f"Symbol: <b>{symbol}</b> {side} {lev}X\n"
             f"Geschlossen: {payout_pct}% ({qty_fmt})\n"
@@ -1484,7 +1694,7 @@ async def execute_signal(sig: dict) -> None:
 
     # Prüfen ob bereits ein Trade offen
     if symbol in _state.get("trades", {}):
-        tg(f"⚠️ SYNORA: {symbol} bereits offen — Signal ignoriert")
+        tg_system(f"⚠️ SYNORA: {symbol} bereits offen — Signal ignoriert")
         log.warning(f"Trade für {symbol} bereits im State, übersprungen")
         return
 
@@ -1496,14 +1706,14 @@ async def execute_signal(sig: dict) -> None:
     if exchange == "bybit":
         _load_instrument_info(symbol)
         if not set_leverage(symbol, lev):
-            tg(f"❌ SYNORA: Hebel-Fehler für {symbol} (Bybit) — Trade abgebrochen")
+            tg_system(f"❌ SYNORA: Hebel-Fehler für {symbol} (Bybit) — Trade abgebrochen")
             return
         mark     = get_mark_price(symbol)
         budget   = get_available_balance()
     else:
         _load_bingx_instrument_info(ex_sym)
         if not bingx_set_leverage(ex_sym, side, lev):
-            tg(f"❌ SYNORA: Hebel-Fehler für {ex_sym} (BingX) — Trade abgebrochen")
+            tg_system(f"❌ SYNORA: Hebel-Fehler für {ex_sym} (BingX) — Trade abgebrochen")
             return
         mark     = bingx_get_mark_price(ex_sym)
         budget   = get_bingx_balance()
@@ -1512,7 +1722,7 @@ async def execute_signal(sig: dict) -> None:
     log.info(f"Mark-Preis ({exchange_label}): {ref_price} | Budget: {budget:.2f} USDT")
 
     if budget < 5.0:
-        tg(f"❌ SYNORA: Balance zu gering ({budget:.2f} USDT) — Trade abgebrochen")
+        tg_system(f"❌ SYNORA: Balance zu gering ({budget:.2f} USDT) — Trade abgebrochen")
         return
 
     # 3. Qty berechnen — Entry + DCA1 aus aktuellem Budget, DCA2 live nach DCA1
@@ -1526,7 +1736,7 @@ async def execute_signal(sig: dict) -> None:
         qty_dca2  = bingx_calc_qty(ex_sym, budget * SPLIT_DCA2,  lev, dca2)
 
     if qty_entry <= 0:
-        tg(f"❌ SYNORA: Qty=0 für {symbol} (Budget zu klein?) — Trade abgebrochen")
+        tg_system(f"❌ SYNORA: Qty=0 für {symbol} (Budget zu klein?) — Trade abgebrochen")
         return
 
     # 4. Market Entry
@@ -1542,7 +1752,7 @@ async def execute_signal(sig: dict) -> None:
         entry_id  = (res_entry.get("data") or {}).get("orderId", "?")
 
     if not ok_entry:
-        tg(f"❌ SYNORA: Market Order Fehler {symbol} ({exchange_label}): {err_entry}")
+        tg_system(f"❌ SYNORA: Market Order Fehler {symbol} ({exchange_label}): {err_entry}")
         log.error(f"Market Order Fehler: {res_entry}")
         return
     log.info(f"Market Entry platziert ({exchange_label}): OrderId={entry_id}")
@@ -1566,7 +1776,7 @@ async def execute_signal(sig: dict) -> None:
             break
         log.warning(f"SL-Fehler Versuch {attempt+1}/3: {res_sl}")
     if not sl_set:
-        tg(f"🚨 <b>SYNORA: SL NICHT GESETZT</b> für {symbol}!\nSL={sl} | Manuell setzen!")
+        tg_system(f"🚨 <b>SYNORA: SL NICHT GESETZT</b> für {symbol}!\nSL={sl} | Manuell setzen!")
 
     # 7. DCA Limit Orders
     dca1_id = dca2_id = None
@@ -1635,12 +1845,14 @@ async def execute_signal(sig: dict) -> None:
         "dynamic_levels_done":  [],            # bereits ausgeführte Stufen
     }
     save_state()
+    _open_coin_topic(symbol, side)   # Forum-Topic für diesen Coin erstellen/öffnen
 
     # 9. Telegram-Benachrichtigung
     sl_dist_pct = abs(sl - entry) / entry * 100
     qty_dca1_fmt = fmt_qty(symbol, qty_dca1) if exchange == "bybit" else bingx_fmt_qty(ex_sym, qty_dca1)
     qty_dca2_fmt = fmt_qty(symbol, qty_dca2) if exchange == "bybit" else bingx_fmt_qty(ex_sym, qty_dca2)
-    tg(
+    tg_coin(
+        symbol,
         f"🟣 <b>SYNORA Trade eröffnet</b> [{exchange_label}]\n"
         f"Symbol: <b>{symbol}</b> {side} {lev}X\n"
         f"Entry (Market): {entry}\n"
@@ -1685,7 +1897,8 @@ async def handle_update(upd: dict) -> None:
             price_fmt = fmt_price(symbol, p) if exchange == "bybit" else bingx_fmt_price(ex_sym, p)
             level_lines.append(f"  +{pct:2d}% → {price_fmt} | {payout}% | {sl_lbl}")
 
-        tg(
+        tg_coin(
+            symbol,
             f"📊 <b>SYNORA Dynamisches Profit-Modell 3 aktiviert</b>\n"
             f"Symbol: <b>{symbol}</b> | Mode: {SYNORA_MAX_GAIN_MODE}\n"
             f"Max. Ziel: {max_gain}% → {fmt_price(symbol, tp_price) if exchange == 'bybit' else bingx_fmt_price(ex_sym, tp_price)}\n\n"
@@ -1709,7 +1922,8 @@ async def handle_update(upd: dict) -> None:
     if ok:
         _state["trades"][symbol]["tp"] = tp_price
         save_state()
-        tg(
+        tg_coin(
+            symbol,
             f"🎯 <b>SYNORA TP gesetzt</b>\n"
             f"Symbol: <b>{symbol}</b>\n"
             f"Maximaler Gewinn: {max_gain}%\n"
@@ -1717,7 +1931,7 @@ async def handle_update(upd: dict) -> None:
             f"(Mode: {SYNORA_MAX_GAIN_MODE})"
         )
     else:
-        tg(f"⚠️ SYNORA: TP-Fehler {symbol}: {err}")
+        tg_system(f"⚠️ SYNORA: TP-Fehler {symbol}: {err}")
         log.warning(f"TP-Fehler: {res}")
 
 
@@ -1756,7 +1970,8 @@ async def handle_close(symbol: str, reason: str = "CANCEL") -> None:
         log.info(f"CLOSE {symbol}: Position bereits geschlossen (size=0)")
         del _state["trades"][symbol]
         save_state()
-        tg(f"ℹ️ SYNORA: {symbol} war bereits geschlossen ({reason})")
+        tg_coin(symbol, f"ℹ️ SYNORA: {symbol} war bereits geschlossen ({reason})")
+        _close_coin_topic(symbol)
         return
 
     log.info(f"CLOSE {symbol} ({exchange}): schliesse {actual_qty} Kontrakte")
@@ -1802,9 +2017,10 @@ async def handle_close(symbol: str, reason: str = "CANCEL") -> None:
         del _state["trades"][symbol]
         save_state()
         pnl_str = f"+{closed_pnl:.2f}" if closed_pnl >= 0 else f"{closed_pnl:.2f}"
-        tg(f"🔴 <b>SYNORA Position geschlossen</b>\n{symbol} ({reason})\nP&L: {pnl_str} USDT")
+        tg_coin(symbol, f"🔴 <b>SYNORA Position geschlossen</b>\n{symbol} ({reason})\nP&L: {pnl_str} USDT")
+        _close_coin_topic(symbol, won=closed_pnl >= 0)
     else:
-        tg(f"⚠️ SYNORA: Close-Fehler {symbol}: {err}")
+        tg_system(f"⚠️ SYNORA: Close-Fehler {symbol}: {err}")
         log.warning(f"Close-Fehler: {res}")
 
 
@@ -1922,11 +2138,13 @@ async def check_closed_positions() -> None:
 
                 emoji   = "✅" if closed_pnl >= 0 else "❌"
                 pnl_str = f"+{closed_pnl:.2f}" if closed_pnl >= 0 else f"{closed_pnl:.2f}"
-                tg(
+                tg_coin(
+                    symbol,
                     f"{emoji} <b>SYNORA Trade geschlossen</b>\n"
                     f"Symbol: <b>{symbol}</b> | {outcome}\n"
                     f"Close: {close_price} | P&L: <b>{pnl_str} USDT</b>"
                 )
+                _close_coin_topic(symbol, won=closed_pnl >= 0)
                 log.info(f"Trade {symbol} geschlossen: {outcome} | P&L {pnl_str}")
 
             except Exception as e:
@@ -2377,7 +2595,7 @@ def activate_model():
 
     msg = "\n".join(lines)
     log.info(f"[activate_model] {symbol}: Modell 3 aktiviert, qty_init={qty_init}")
-    tg(f"📊 <b>SYNORA Modell 3 manuell aktiviert</b>\n<b>{symbol}</b> {side} {lev}x\nqty_initial: {qty_init}")
+    tg_coin(symbol, f"📊 <b>SYNORA Modell 3 manuell aktiviert</b>\n<b>{symbol}</b> {side} {lev}x\nqty_initial: {qty_init}")
     return Response(msg, content_type="text/plain; charset=utf-8", status=200)
 
 
@@ -2482,7 +2700,7 @@ async def main() -> None:
     cap_info = f" | Cap: {SYNORA_BUDGET_CAP_USDT:.0f} USDT" if SYNORA_BUDGET_CAP_USDT > 0 else " | kein Cap"
     log.info(f"Starte Synora Monitor | Budget: live vom Sub-Account{cap_info} | Source: {SYNORA_CHANNEL}")
     cap_str = f"{SYNORA_BUDGET_CAP_USDT:.0f} USDT Cap" if SYNORA_BUDGET_CAP_USDT > 0 else "kein Cap"
-    tg(f"🟣 <b>SYNORA Monitor gestartet</b>\nBudget: live vom Sub-Account ({cap_str}) | Bybit Sub-Account")
+    tg_status(f"🟣 <b>SYNORA Monitor gestartet</b>\nBudget: live vom Sub-Account ({cap_str}) | Bybit Sub-Account")
 
     client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
     await client.start()

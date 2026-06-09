@@ -940,6 +940,7 @@ import requests
 import math
 import shutil
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 try:
     from flask import Flask, request as flask_request, jsonify
     FLASK_AVAILABLE = True
@@ -991,6 +992,17 @@ POLL_INTERVAL = 20    # Sekunden zwischen Checks
 
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+# ── Telegram Forum Topics (Option C — Supergruppe mit Coin-Threads) ───────────
+TELEGRAM_FORUM_GROUP_ID   = int(os.environ.get("TELEGRAM_FORUM_GROUP_ID",   "0") or "0")
+TELEGRAM_SYSTEM_TOPIC_ID  = int(os.environ.get("TELEGRAM_SYSTEM_TOPIC_ID",  "0") or "0")
+TELEGRAM_REPORTS_TOPIC_ID = int(os.environ.get("TELEGRAM_REPORTS_TOPIC_ID", "0") or "0")
+TELEGRAM_STATUS_TOPIC_ID  = int(os.environ.get("TELEGRAM_STATUS_TOPIC_ID",  "0") or "0")
+_FORUM_ENABLED = bool(TELEGRAM_FORUM_GROUP_ID)
+
+# Forum-State: Coin → {thread_id, status}  (persistent via save_state/load_state)
+_forum_topics:     dict = {}
+_coin_topic_cache: dict = {}   # In-Memory-Cache: symbol → thread_id
 WEBHOOK_SECRET   = os.environ.get("WEBHOOK_SECRET", "dominus")  # Token für TradingView
 DEMO_WEBHOOK_URL = os.environ.get("DEMO_WEBHOOK_URL", "")  # Demo-Bot Weiterleitungs-URL
 WEBHOOK_URL      = os.environ.get("WEBHOOK_URL", "")  # optional: vollständige Railway-URL inkl. ?token=… für /alarm-Vorlagen
@@ -2011,32 +2023,42 @@ def forward_to_demo(payload: dict) -> None:
 
 
 def telegram(msg: str, reply_markup: dict = None, return_id: bool = False,
-             exchange: str = None):
+             exchange: str = None, thread_id: int = 0):
     """v4.57: exchange= Parameter für 🔵/🟣 Prefix.
     exchange='BYBIT' → 🟣 Prefix, exchange='BITGET' oder None → kein Prefix.
+
+    Forum-Routing (Option C):
+    Wenn TELEGRAM_FORUM_GROUP_ID gesetzt, gehen alle Nachrichten in die Forum-Gruppe.
+    thread_id=0 → Status-Topic (generelle operative Nachrichten).
+    Explizites thread_id > 0 → spezifisches Topic.
     """
     if exchange == "BYBIT" and not msg.startswith("🟣"):
         msg = f"🟣 {msg}"
-    """
-    Sendet Telegram-Nachricht wenn konfiguriert.
 
-    reply_markup: optional inline keyboard (dict mit {"inline_keyboard": [[...]]})
-                  — z.B. Ergebnis von build_setup_buttons(symbol).
-    return_id:    v4.25 — wenn True, wird die message_id der gesendeten Nachricht
-                  zurückgegeben (oder None bei Fehler). Default False behält
-                  Backward-Compat mit allen bestehenden Aufrufern.
-    """
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+    if not TELEGRAM_TOKEN:
         return None if return_id else None
+
+    # ── Forum-Routing ──────────────────────────────────────────────
+    if _FORUM_ENABLED:
+        resolved_tid = thread_id or TELEGRAM_STATUS_TOPIC_ID
+        chat_id      = str(TELEGRAM_FORUM_GROUP_ID)
+    else:
+        if not TELEGRAM_CHAT_ID:
+            return None if return_id else None
+        resolved_tid = 0
+        chat_id      = TELEGRAM_CHAT_ID
+
     try:
         payload = {
-            "chat_id":                  TELEGRAM_CHAT_ID,
+            "chat_id":                  chat_id,
             "text":                     msg,
             "parse_mode":               "HTML",
             "disable_web_page_preview": True,
         }
         if reply_markup:
             payload["reply_markup"] = reply_markup
+        if resolved_tid:
+            payload["message_thread_id"] = resolved_tid
         r = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
             json=payload,
@@ -2121,6 +2143,144 @@ def telegram_file(filepath: str, caption: str = "") -> bool:
         log(f"[TG-FILE] Fehler beim Senden von {os.path.basename(filepath)}: {e}")
         return False
 
+
+
+# ═══════════════════════════════════════════════════════════════
+# TELEGRAM FORUM TOPICS  (Option C — Supergruppe mit Coin-Threads)
+# ═══════════════════════════════════════════════════════════════
+#
+# Konzept für viele Coins:
+#   Topics werden LAZY erstellt — nur wenn ein Trade öffnet.
+#   Nach Trade-Close wird das Topic archiviert (closeForumTopic).
+#   Alle sonstigen telegram()-Calls landen im Status-Topic (auto-routing via telegram()).
+#
+TG_COLOR_LONG_OPEN  = 13338331   # teal   → offener Long-Trade
+TG_COLOR_SHORT_OPEN = 16766590   # orange → offener Short-Trade
+TG_COLOR_WIN        = 8311585    # grün   → Trade gewonnen (TP)
+TG_COLOR_LOSS       = 7322096    # rot    → Trade verloren (SL)
+
+
+def _forum_api(method: str, params: dict) -> dict:
+    """Sendet einen Telegram Bot API Request für Forum-Operationen."""
+    if not TELEGRAM_TOKEN:
+        return {}
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}",
+            json=params, timeout=10,
+        )
+        return r.json()
+    except Exception as e:
+        log(f"[Forum-API] Fehler ({method}): {e}")
+        return {}
+
+
+def telegram_coin(symbol: str, msg: str, reply_markup: dict = None) -> None:
+    """Sendet ans coin-spezifische Trade-Topic (oder Status-Topic als Fallback)."""
+    tid = _coin_topic_cache.get(symbol) or int((_forum_topics.get(symbol) or {}).get("thread_id") or 0)
+    telegram(msg, reply_markup=reply_markup, thread_id=tid)
+
+
+def telegram_report(msg: str) -> None:
+    """Sendet ans Berichte-Topic (oder Status-Topic als Fallback)."""
+    telegram(msg, thread_id=TELEGRAM_REPORTS_TOPIC_ID)
+
+
+def telegram_status(msg: str) -> None:
+    """Sendet ans Bot-Status-Topic (identisch mit normalem telegram()-Routing)."""
+    telegram(msg, thread_id=TELEGRAM_STATUS_TOPIC_ID)
+
+
+def telegram_system(msg: str) -> None:
+    """Sendet ans System-Alarme Topic."""
+    telegram(msg, thread_id=TELEGRAM_SYSTEM_TOPIC_ID)
+
+
+def _forum_create_topic(name: str, icon_color: int = 6316715) -> int:
+    """Erstellt ein neues Forum-Topic; gibt thread_id zurück (0 = Fehler)."""
+    res = _forum_api("createForumTopic", {
+        "chat_id":    TELEGRAM_FORUM_GROUP_ID,
+        "name":       name,
+        "icon_color": icon_color,
+    })
+    return int((res.get("result") or {}).get("message_thread_id") or 0)
+
+
+def _forum_close_topic(thread_id: int) -> None:
+    _forum_api("closeForumTopic", {
+        "chat_id":           TELEGRAM_FORUM_GROUP_ID,
+        "message_thread_id": thread_id,
+    })
+
+
+def _forum_reopen_topic(thread_id: int) -> None:
+    _forum_api("reopenForumTopic", {
+        "chat_id":           TELEGRAM_FORUM_GROUP_ID,
+        "message_thread_id": thread_id,
+    })
+
+
+def _forum_edit_color(thread_id: int, icon_color: int) -> None:
+    _forum_api("editForumTopic", {
+        "chat_id":           TELEGRAM_FORUM_GROUP_ID,
+        "message_thread_id": thread_id,
+        "icon_color":        icon_color,
+    })
+
+
+def _open_coin_topic(symbol: str, direction: str) -> int:
+    """
+    Erstellt oder öffnet (reopen) ein Coin-Trade-Topic beim Trade-Entry.
+    Speichert thread_id in _forum_topics + _coin_topic_cache. Gibt thread_id zurück.
+    """
+    if not _FORUM_ENABLED:
+        return 0
+    side  = direction.upper()
+    color = TG_COLOR_LONG_OPEN if side == "LONG" else TG_COLOR_SHORT_OPEN
+    tid   = 0
+
+    existing = _forum_topics.get(symbol)
+    if existing:
+        tid = int(existing.get("thread_id") or 0)
+
+    if tid:
+        _forum_reopen_topic(tid)
+        _forum_edit_color(tid, color)
+        _forum_topics[symbol]["status"] = "open"
+    else:
+        coin_name = symbol.replace("USDT", "").replace("PERP", "")
+        label     = f"{'📈' if side == 'LONG' else '📉'} {coin_name}"
+        tid       = _forum_create_topic(label, icon_color=color)
+        if not tid:
+            log(f"[Forum] Topic konnte nicht erstellt werden für {symbol}")
+            return 0
+        _forum_topics[symbol] = {"thread_id": tid, "status": "open"}
+
+    _coin_topic_cache[symbol] = tid
+    save_state()
+    return tid
+
+
+def _close_coin_topic(symbol: str, won: Optional[bool] = None) -> None:
+    """
+    Schliesst das Coin-Topic nach Trade-Ende und setzt die finale Icon-Farbe.
+    won=True → grün (Gewinn), won=False → rot (Verlust), won=None → unverändert.
+    """
+    if not _FORUM_ENABLED:
+        return
+    tid = _coin_topic_cache.get(symbol) or int((_forum_topics.get(symbol) or {}).get("thread_id") or 0)
+    if not tid:
+        return
+    if won is True:
+        _forum_edit_color(tid, TG_COLOR_WIN)
+    elif won is False:
+        _forum_edit_color(tid, TG_COLOR_LOSS)
+    _forum_close_topic(tid)
+    if symbol in _forum_topics:
+        _forum_topics[symbol]["status"] = "closed"
+        save_state()
+    _coin_topic_cache.pop(symbol, None)
+    log(f"[Forum] Topic für {symbol} geschlossen (won={won})")
 
 
 def telegram_answer_callback(
@@ -3820,7 +3980,8 @@ def handle_position_closed(symbol: str, reason: str = ""):
         f"/berechnen für neuen Trade",
     ]
 
-    telegram("\n".join(msg_lines), reply_markup=build_setup_buttons(symbol))
+    telegram_coin(symbol, "\n".join(msg_lines), reply_markup=build_setup_buttons(symbol))
+    _close_coin_topic(symbol, won=won)
 
     # Trade für Daily Report aufzeichnen + Google Sheets Archiv
     _trade_record = {
@@ -5446,6 +5607,7 @@ def setup_new_trade(pos: dict):
     }
 
     # ── 6. Telegram-Zusammenfassung ─────────────────────────
+    _open_coin_topic(symbol, direction)   # Forum-Topic für diesen Coin erstellen/öffnen
     dca1_str = dca_results[0] if len(dca_results) > 0 else "Fehler"
     dca2_str = dca_results[1] if len(dca_results) > 1 else "Fehler"
 
@@ -5472,7 +5634,7 @@ def setup_new_trade(pos: dict):
         f"({order_margin*3/balance*100:.1f}% Kapital)"
         if balance > 0 else ""
     )
-    telegram(msg, reply_markup=build_setup_buttons(symbol))
+    telegram_coin(symbol, msg, reply_markup=build_setup_buttons(symbol))
 
     # Abweichungs-Warnung (Hebel / Kelly / R:R) — separate Nachricht nach Haupt-Report
     send_deviation_warnings(
@@ -11678,6 +11840,7 @@ def save_state():
                 _s: _v for _s, _v in recent_closes.items()
                 if time.time() - float(_v.get("ts_close", 0)) < PHANTOM_REOPEN_TTL_SEC
             },
+            "forum_topics":            _forum_topics,
         }
         with open(STATE_FILE, "w") as f:
             json.dump(state, f)
@@ -11741,11 +11904,14 @@ def load_state():
                     recent_closes[_sym] = _snap
             except Exception:
                 pass
+        # Forum-Topic-Mapping laden (Coin → thread_id)
+        _forum_topics.update(s.get("forum_topics", {}))
         _me_btc = macro_extreme["btc"]["state"]
         _me_t2  = macro_extreme["total2"]["state"]
         log(f"[load_state] State geladen: {len(last_known_avg)} Position(en) | "
             f"BTC={btc_dir or '?'} Total2={t2_dir or '?'} | "
-            f"Makro-Extreme BTC={_me_btc} Total2={_me_t2}")
+            f"Makro-Extreme BTC={_me_btc} Total2={_me_t2} | "
+            f"Forum-Topics={len(_forum_topics)}")
     except Exception as e:
         log(f"[load_state] Fehler: {e}")
 
@@ -12679,7 +12845,7 @@ def main():
             if _now.hour == 23 and _now.minute == 59 and daily_report_sent_date != _today:
                 log("[Auto-Report] Täglicher P&L Report wird gesendet (23:59)...")
                 try:
-                    telegram(build_daily_report(_today))
+                    telegram_report(build_daily_report(_today))
                     daily_report_sent_date = _today
                     save_state()
                     log("[Auto-Report] ✓ Report gesendet")
@@ -12692,7 +12858,7 @@ def main():
                     and weekly_report_sent_week != _week):
                 log("[Weekly-Report] Wochenbericht wird gesendet (Mo 08:00)...")
                 try:
-                    telegram(build_weekly_report())
+                    telegram_report(build_weekly_report())
                     weekly_report_sent_week = _week
                     save_state()
                     log("[Weekly-Report] ✓ Report gesendet")
