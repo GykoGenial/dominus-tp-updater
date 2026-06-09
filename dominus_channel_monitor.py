@@ -124,6 +124,17 @@ CHANNEL_LINK   = os.environ["DOMINUS_CHANNEL_LINK"]
 BOT_TOKEN      = os.environ["TELEGRAM_TOKEN"]
 CHAT_ID        = os.environ["TELEGRAM_CHAT_ID"]
 
+# ── Telegram Forum Topics (Option C) ────────────────────────────────
+TELEGRAM_FORUM_GROUP_ID     = int(os.environ.get("TELEGRAM_FORUM_GROUP_ID",     "0") or "0")
+TELEGRAM_WATCHLIST_TOPIC_ID = int(os.environ.get("TELEGRAM_WATCHLIST_TOPIC_ID", "0") or "0")
+_FORUM_ENABLED = bool(TELEGRAM_FORUM_GROUP_ID)
+
+def _tg_chat() -> str:
+    return str(TELEGRAM_FORUM_GROUP_ID) if _FORUM_ENABLED else CHAT_ID
+
+def _tg_tid() -> int:
+    return TELEGRAM_WATCHLIST_TOPIC_ID if _FORUM_ENABLED else 0
+
 # TV-Abgleich: öffentliche TradingView-Watchlist als "Ist-Stand"-Referenz
 # Default-Link zentral hinterlegt — per Railway-Variable TV_WATCHLIST_URL überschreibbar.
 # Leerer String = TV-Abgleich deaktiviert (altes Verhalten).
@@ -475,19 +486,26 @@ def send_watchlist_file(state: dict, new_coins: list[str], skipped: list[str]) -
     lines += ["", f"Gesamte Watchlist: <b>{len(watchlist)} Symbole</b>"]
     lines += ["↓ Datei importieren: TradingView → Watchlist → ⋮ → Import"]
 
+    chat = _tg_chat()
+    tid  = _tg_tid()
+    msg_payload: dict = {
+        "chat_id": chat, "text": "\n".join(lines),
+        "parse_mode": "HTML", "disable_web_page_preview": True,
+    }
+    if tid:
+        msg_payload["message_thread_id"] = tid
+    doc_data: dict = {"chat_id": chat}
+    if tid:
+        doc_data["message_thread_id"] = str(tid)
     try:
         requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            json={
-                "chat_id": CHAT_ID, "text": "\n".join(lines),
-                "parse_mode": "HTML", "disable_web_page_preview": True,
-            },
-            timeout=10,
+            json=msg_payload, timeout=10,
         )
         # .txt-Datei senden
         requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument",
-            data={"chat_id": CHAT_ID},
+            data=doc_data,
             files={"document": (filename, io.BytesIO(txt_content.encode()), "text/plain")},
             timeout=15,
         )
@@ -496,12 +514,16 @@ def send_watchlist_file(state: dict, new_coins: list[str], skipped: list[str]) -
 
 
 def send_text(text: str) -> None:
+    payload: dict = {
+        "chat_id": _tg_chat(), "text": text,
+        "parse_mode": "HTML", "disable_web_page_preview": True,
+    }
+    if _tg_tid():
+        payload["message_thread_id"] = _tg_tid()
     try:
         requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML",
-                  "disable_web_page_preview": True},
-            timeout=10,
+            json=payload, timeout=10,
         )
     except Exception as e:
         log.warning(f"Telegram-Send fehlgeschlagen: {e}")
@@ -642,10 +664,15 @@ def send_clicklist_file(state: dict, caption_prefix: str = "📋 Bitget Clicklis
     caption  = f"{caption_prefix} — {len(available)} neu"
     if unavailable:
         caption += f" (+{len(unavailable)} nicht auf Bitget)"
+    chat = _tg_chat()
+    tid  = _tg_tid()
+    doc_data: dict = {"chat_id": chat, "caption": caption}
+    if tid:
+        doc_data["message_thread_id"] = str(tid)
     try:
         requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument",
-            data={"chat_id": CHAT_ID, "caption": caption},
+            data=doc_data,
             files={"document": (filename, io.BytesIO(html.encode("utf-8")), "text/html")},
             timeout=15,
         )
