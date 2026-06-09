@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SYNORA Monitor  v1.2  (2026-06-09)
+SYNORA Monitor  v1.3  (2026-06-09)
 ════════════════════════════════════════════════════════════════
 Vollautomatischer SYNORA-Signal-Executor auf Bybit (Sub-Account).
 
@@ -1671,20 +1671,141 @@ def dashboard():
     pnl_color  = "#22c55e" if stats["net_pnl"] >= 0 else "#ef4444"
     wr_color   = "#22c55e" if stats["winrate"] >= 50 else "#ef4444"
 
-    open_rows = ""
+    # ── Offene Positionen: Card-Rendering mit allen State-Feldern ──
+    open_cards = ""
     for sym, tr in open_pos.items():
-        tp_str = f"{tr['tp']:.4f}" if tr.get("tp") else "—"
-        open_rows += (
-            f"<tr>"
-            f"<td>{sym}</td>"
-            f"<td class='{'long' if tr['side']=='LONG' else 'short'}'>{tr['side']}</td>"
-            f"<td>{tr['lev']}x</td>"
-            f"<td>{tr['entry']}</td>"
-            f"<td>{tr['sl']}</td>"
-            f"<td>{tp_str}</td>"
-            f"<td>{(tr.get('opened_at','')[:16]).replace('T',' ')}</td>"
-            f"</tr>"
+        side      = tr.get("side", "?")
+        lev       = tr.get("lev", "?")
+        entry     = float(tr.get("entry", 0))
+        sl        = float(tr.get("sl", 0))
+        tp        = tr.get("tp")
+        dca1      = float(tr.get("dca1", 0))
+        dca2      = float(tr.get("dca2", 0))
+        exchange  = tr.get("exchange", "bybit")
+        ex_sym    = tr.get("exchange_symbol", sym)
+        budget    = float(tr.get("budget_usdt", 0))
+        opened    = (tr.get("opened_at", "")[:16]).replace("T", " ")
+        q_entry   = float(tr.get("qty_entry", 0))
+        q_dca1    = float(tr.get("qty_dca1", 0))
+        q_dca2    = float(tr.get("qty_dca2", 0))
+        q_init    = float(tr.get("qty_total_initial", q_entry + q_dca1 + q_dca2))
+        dyn_active = tr.get("dynamic_model_active", False)
+        dyn_done   = tr.get("dynamic_levels_done", [])
+
+        # Live Mark-Preis + unrealisierter Profit
+        try:
+            if exchange == "bybit":
+                mark = get_mark_price(sym)
+            else:
+                mark = bingx_get_mark_price(ex_sym)
+        except Exception:
+            mark = 0.0
+        if mark > 0 and entry > 0:
+            live_pct = _current_profit_pct(side, entry, mark, int(lev))
+            pct_color = "#22c55e" if live_pct >= 0 else "#ef4444"
+            mark_str  = f"{mark:.6g}"
+            pct_str   = f'<span style="color:{pct_color};font-weight:700">{live_pct:+.1f}%</span>'
+        else:
+            mark_str = "—"
+            pct_str  = "—"
+
+        # TP-Anzeige
+        tp_str = f"{float(tp):.6g}" if tp else "—"
+
+        # SL-Distanz
+        if entry > 0 and sl > 0:
+            sl_dist = abs(sl - entry) / entry * 100
+            sl_str  = f"{sl:.6g} <small style='color:#64748b'>({sl_dist:.1f}%)</small>"
+        else:
+            sl_str = "—"
+
+        # Exchange-Badge
+        ex_badge = (
+            f"<span style='background:#1e40af33;color:#60a5fa;border:1px solid #1e40af55;"
+            f"border-radius:4px;padding:1px 7px;font-size:.72rem'>Bybit</span>"
+            if exchange == "bybit" else
+            f"<span style='background:#92400e33;color:#fbbf24;border:1px solid #92400e55;"
+            f"border-radius:4px;padding:1px 7px;font-size:.72rem'>BingX</span>"
         )
+
+        # Dynamic Model Fortschritts-Badges
+        if dyn_active:
+            level_badges = ""
+            for pct, payout, sl_off in DYNAMIC_MODEL_LEVELS:
+                done = pct in dyn_done
+                if done:
+                    badge_style = "background:#16532433;color:#22c55e;border:1px solid #22c55e55"
+                    icon = "✓"
+                else:
+                    badge_style = "background:#1e233033;color:#475569;border:1px solid #2d3748"
+                    icon = ""
+                level_badges += (
+                    f"<span style='{badge_style};border-radius:4px;padding:2px 7px;"
+                    f"font-size:.72rem;margin:1px;display:inline-block'>"
+                    f"{icon}+{pct}%</span>"
+                )
+            dyn_block = (
+                f"<div style='margin-top:10px'>"
+                f"<div style='font-size:.72rem;color:#94a3b8;margin-bottom:4px'>📊 DYNAMISCHES MODELL 3</div>"
+                f"{level_badges}"
+                f"</div>"
+            )
+        elif tp:
+            dyn_block = (
+                f"<div style='margin-top:10px;font-size:.72rem;color:#64748b'>"
+                f"Modell 1 (einfacher TP) — Warte auf Preis {tp_str}"
+                f"</div>"
+            )
+        else:
+            dyn_block = (
+                f"<div style='margin-top:10px;font-size:.72rem;color:#64748b'>"
+                f"⏳ Warte auf SYNORA UPDATE…"
+                f"</div>"
+            )
+
+        side_color = "#22c55e" if side == "LONG" else "#ef4444"
+        open_cards += f"""
+<div style="background:#1a1f2e;border:1px solid #2d3748;border-radius:10px;padding:16px;margin-bottom:14px">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;flex-wrap:wrap;gap:8px">
+    <div style="display:flex;align-items:center;gap:10px">
+      <span style="font-size:1.1rem;font-weight:700;color:#e2e8f0">{sym}</span>
+      <span style="color:{side_color};font-weight:700;font-size:.9rem">{side}</span>
+      <span style="color:#94a3b8;font-size:.85rem">{lev}x</span>
+      {ex_badge}
+    </div>
+    <div style="text-align:right">
+      <div style="font-size:.75rem;color:#64748b">Live: {mark_str} &nbsp;|&nbsp; Profit: {pct_str}</div>
+      <div style="font-size:.72rem;color:#475569">eröffnet {opened} UTC</div>
+    </div>
+  </div>
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px;font-size:.8rem">
+    <div style="background:#0f1117;border-radius:6px;padding:8px">
+      <div style="color:#64748b;font-size:.68rem;margin-bottom:2px">ENTRY</div>
+      <div style="color:#e2e8f0;font-weight:600">{entry:.6g}</div>
+    </div>
+    <div style="background:#0f1117;border-radius:6px;padding:8px">
+      <div style="color:#64748b;font-size:.68rem;margin-bottom:2px">STOP-LOSS</div>
+      <div style="color:#ef4444">{sl_str}</div>
+    </div>
+    <div style="background:#0f1117;border-radius:6px;padding:8px">
+      <div style="color:#64748b;font-size:.68rem;margin-bottom:2px">DCA1 (25%)</div>
+      <div style="color:#94a3b8">{dca1:.6g} <small style="color:#475569">×{q_dca1:.4g}</small></div>
+    </div>
+    <div style="background:#0f1117;border-radius:6px;padding:8px">
+      <div style="color:#64748b;font-size:.68rem;margin-bottom:2px">DCA2 (65%)</div>
+      <div style="color:#94a3b8">{dca2:.6g} <small style="color:#475569">×{q_dca2:.4g}</small></div>
+    </div>
+    <div style="background:#0f1117;border-radius:6px;padding:8px">
+      <div style="color:#64748b;font-size:.68rem;margin-bottom:2px">TP / MAX</div>
+      <div style="color:#22c55e">{tp_str}</div>
+    </div>
+    <div style="background:#0f1117;border-radius:6px;padding:8px">
+      <div style="color:#64748b;font-size:.68rem;margin-bottom:2px">QTY INITIAL</div>
+      <div style="color:#94a3b8">{q_init:.4g} <small style="color:#475569">({budget:.0f} USDT)</small></div>
+    </div>
+  </div>
+  {dyn_block}
+</div>"""
 
     trade_rows = ""
     for t in recent:
@@ -1765,10 +1886,7 @@ def dashboard():
 {"" if not open_pos else f'''
 <div class="section">
   <h3>Offene Positionen <span class="open-badge">{len(open_pos)} aktiv</span></h3>
-  <table>
-    <tr><th>Symbol</th><th>Side</th><th>Hb</th><th>Entry</th><th>SL</th><th>TP</th><th>Eröffnet</th></tr>
-    {open_rows}
-  </table>
+  {open_cards}
 </div>'''}
 
 <div class="section">
