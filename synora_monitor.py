@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SYNORA Monitor  v1.1  (2026-06-06)
+SYNORA Monitor  v1.2  (2026-06-09)
 ════════════════════════════════════════════════════════════════
 Vollautomatischer SYNORA-Signal-Executor auf Bybit (Sub-Account).
 
@@ -129,11 +129,27 @@ BYBIT_RECV_WINDOW        = "5000"
 BYBIT_CATEGORY           = "linear"   # USDT Perpetual
 
 # Capital-Split (wie in Synora-Doku: 10% / 25% / 65%)
-# 2% Sicherheitspuffer gegen Bybit retCode 110007 'ab not enough' (Fees + Margin-Reserve)
-BUDGET_SAFETY = 0.98
-SPLIT_ENTRY   = 0.10
-SPLIT_DCA1    = 0.25
-SPLIT_DCA2    = 0.65
+SPLIT_ENTRY = 0.10
+SPLIT_DCA1  = 0.25
+SPLIT_DCA2  = 0.65
+
+# Dynamisches Profit-Modell
+# 1 = einfacher TP via UPDATE-Nachricht (alter Modus)
+# 3 = 6-Stufen-Modell (aktiviert nach UPDATE-Nachricht)
+SYNORA_PROFIT_MODEL = int(os.environ.get("SYNORA_PROFIT_MODEL", "3"))
+
+# Tabelle: (profit_pct, payout_pct_of_initial, sl_offset_pct_or_None)
+# profit_pct    = ROI auf Margin (% bei roi-Mode) oder Preis-% (bei price-Mode)
+# payout_pct    = % der INITIALEN Positions-Grösse zu schliessen
+# sl_offset_pct = Profit-% der im SL gesichert wird (None = kein Update)
+DYNAMIC_MODEL_LEVELS = [
+    (10,   25.0,  0),    # +10%: 25% schliessen, SL → Break-Even
+    (15,   12.5,  None), # +15%: 12.5% schliessen, SL unverändert (bereits Break-Even)
+    (20,   25.0,  5),    # +20%: 25% schliessen, SL → +5% gesichert
+    (30,   12.5,  15),   # +30%: 12.5% schliessen, SL → +15% gesichert
+    (40,   12.5,  25),   # +40%: 12.5% schliessen, SL → +25% gesichert
+    (50,   12.5,  None), # +50%: letzte 12.5%, SL-Update optional
+]
 
 # ═══════════════════════════════════════════════════════════════
 # LOGGING
@@ -997,6 +1013,124 @@ def close_position_market(symbol: str, side: str, qty: float) -> dict:
     return res
 
 
+def _current_profit_pct(side: str, entry: float, current_price: float, lev: int) -> float:
+    """
+    Berechnet den aktuellen unrealisierten Profit % (konsistent mit SYNORA_MAX_GAIN_MODE).
+    roi-Mode:   ROI auf Margin = Preisbewegung% × Hebel
+    price-Mode: direkte Preisbewegung %
+    """
+    if side == "LONG":
+        price_move_pct = (current_price - entry) / entry * 100
+    else:
+        price_move_pct = (entry - current_price) / entry * 100
+    if SYNORA_MAX_GAIN_MODE == "roi":
+        return price_move_pct * lev
+    return price_move_pct
+
+
+async def _check_dynamic_profit_levels(symbol: str, trade: dict, pos_size: float) -> None:
+    """
+    Prüft und führt das Dynamische Profit-Modell 3 (6 Stufen) aus.
+    Wird aus check_closed_positions() aufgerufen wenn Position noch offen ist.
+    """
+    if not trade.get("dynamic_model_active"):
+        return
+
+    exchange = trade.get("exchange", "bybit")
+    ex_sym   = trade.get("exchange_symbol", symbol)
+    side     = trade["side"]
+    lev      = int(trade.get("lev", 1))
+    entry    = float(trade["entry"])
+
+    # Aktuellen Mark-Preis holen
+    if exchange == "bybit":
+        current_price = get_mark_price(symbol)
+    else:
+        current_price = bingx_get_mark_price(ex_sym)
+
+    if current_price <= 0:
+        log.warning(f"Dynamic: kein Mark-Preis für {symbol} ({exchange})")
+        return
+
+    current_pct   = _current_profit_pct(side, entry, current_price, lev)
+    levels_done   = list(trade.get("dynamic_levels_done", []))
+    initial_qty   = float(trade.get("qty_total_initial", pos_size))
+    remaining_qty = pos_size   # wird nach jedem Close aktualisiert
+
+    for profit_pct, payout_pct, sl_offset in DYNAMIC_MODEL_LEVELS:
+        if profit_pct in levels_done:
+            continue
+        if current_pct < profit_pct:
+            break   # noch nicht erreicht (Liste ist aufsteigend sortiert)
+
+        # Stufe ist neu erreicht
+        qty_to_close = snap_qty(symbol, initial_qty * (payout_pct / 100)) \
+                       if exchange == "bybit" \
+                       else bingx_snap_qty(ex_sym, initial_qty * (payout_pct / 100))
+        qty_to_close = min(qty_to_close, remaining_qty)   # nicht mehr als vorhanden
+
+        if qty_to_close <= 0:
+            log.warning(f"Dynamic Level +{profit_pct}%: qty_to_close=0 für {symbol} — übersprungen")
+            levels_done.append(profit_pct)
+            continue
+
+        qty_fmt = fmt_qty(symbol, qty_to_close) if exchange == "bybit" \
+                  else bingx_fmt_qty(ex_sym, qty_to_close)
+        log.info(f"Dynamic Level +{profit_pct}%: schliesse {payout_pct}% "
+                 f"({qty_fmt}) von {symbol} | Preis={current_price} Profit={current_pct:.1f}%")
+
+        # Partial Close
+        if exchange == "bybit":
+            res = close_position_market(symbol, side, qty_to_close)
+            ok  = bybit_ok(res)
+            err = res.get("retMsg", "?")
+        else:
+            res = bingx_close_position_market(ex_sym, side, qty_to_close)
+            ok  = bingx_ok(res)
+            err = res.get("msg", "?")
+
+        if not ok:
+            log.error(f"Dynamic Partial Close Fehler Level +{profit_pct}%: {err}")
+            tg(f"⚠️ SYNORA Dynamic: Partial-Close Fehler bei +{profit_pct}% {symbol}: {err}")
+            continue   # nächste Stufe trotzdem prüfen
+
+        remaining_qty -= qty_to_close
+        levels_done.append(profit_pct)
+        _state["trades"][symbol]["dynamic_levels_done"] = levels_done
+        log.info(f"Dynamic Level +{profit_pct}% ausgeführt ✓ — verbleibend: {remaining_qty:.4f}")
+
+        # SL-Anpassung
+        sl_msg = ""
+        if sl_offset is not None:
+            new_sl = calc_tp_price(side, entry, sl_offset, lev)  # sl_offset=0 → Break-Even
+            if exchange == "bybit":
+                res_sl = set_sl(symbol, side, new_sl)
+                sl_ok  = bybit_ok(res_sl)
+            else:
+                res_sl = bingx_set_sl(ex_sym, side, new_sl)
+                sl_ok  = bingx_ok(res_sl)
+            if sl_ok:
+                _state["trades"][symbol]["sl"] = new_sl
+                label = "Break-Even" if sl_offset == 0 else f"+{sl_offset}%"
+                sl_msg = f"\nSL → {label} ({fmt_price(symbol, new_sl) if exchange == 'bybit' else bingx_fmt_price(ex_sym, new_sl)})"
+                log.info(f"Dynamic SL aktualisiert: {label} = {new_sl:.6f}")
+            else:
+                sl_msg = f"\n⚠️ SL-Update fehlgeschlagen (+{sl_offset}%)"
+                log.warning(f"Dynamic SL-Fehler Level +{profit_pct}%: {res_sl}")
+
+        save_state()
+
+        tg(
+            f"📈 <b>SYNORA Partial Close</b> [Stufe +{profit_pct}%]\n"
+            f"Symbol: <b>{symbol}</b> {side} {lev}X\n"
+            f"Geschlossen: {payout_pct}% ({qty_fmt})\n"
+            f"Aktuell: {current_pct:.1f}% Profit{sl_msg}"
+        )
+
+        if remaining_qty <= 0:
+            break   # Position vollständig geschlossen
+
+
 def calc_tp_price(side: str, entry: float, max_gain_pct: float, lev: int) -> float:
     """
     Berechnet den TP-Preis aus dem Maximalen Gewinn %.
@@ -1069,16 +1203,15 @@ async def execute_signal(sig: dict) -> None:
         tg(f"❌ SYNORA: Balance zu gering ({budget:.2f} USDT) — Trade abgebrochen")
         return
 
-    # 3. Qty berechnen (98% des Budgets — 2% Puffer für Fees & Margin-Reserve)
-    b = budget * BUDGET_SAFETY
+    # 3. Qty berechnen — Entry + DCA1 aus aktuellem Budget, DCA2 live nach DCA1
     if exchange == "bybit":
-        qty_entry = calc_qty(symbol, b * SPLIT_ENTRY, lev, ref_price)
-        qty_dca1  = calc_qty(symbol, b * SPLIT_DCA1,  lev, dca1)
-        qty_dca2  = calc_qty(symbol, b * SPLIT_DCA2,  lev, dca2)
+        qty_entry = calc_qty(symbol, budget * SPLIT_ENTRY, lev, ref_price)
+        qty_dca1  = calc_qty(symbol, budget * SPLIT_DCA1,  lev, dca1)
+        qty_dca2  = calc_qty(symbol, budget * SPLIT_DCA2,  lev, dca2)
     else:
-        qty_entry = bingx_calc_qty(ex_sym, b * SPLIT_ENTRY, lev, ref_price)
-        qty_dca1  = bingx_calc_qty(ex_sym, b * SPLIT_DCA1,  lev, dca1)
-        qty_dca2  = bingx_calc_qty(ex_sym, b * SPLIT_DCA2,  lev, dca2)
+        qty_entry = bingx_calc_qty(ex_sym, budget * SPLIT_ENTRY, lev, ref_price)
+        qty_dca1  = bingx_calc_qty(ex_sym, budget * SPLIT_DCA1,  lev, dca1)
+        qty_dca2  = bingx_calc_qty(ex_sym, budget * SPLIT_DCA2,  lev, dca2)
 
     if qty_entry <= 0:
         tg(f"❌ SYNORA: Qty=0 für {symbol} (Budget zu klein?) — Trade abgebrochen")
@@ -1126,12 +1259,18 @@ async def execute_signal(sig: dict) -> None:
             else:
                 log.warning(f"DCA1 Fehler: {res_dca1}")
         if qty_dca2 > 0:
-            res_dca2 = place_limit_order(symbol, side, qty_dca2, dca2)
-            if bybit_ok(res_dca2):
-                dca2_id = (res_dca2.get("result") or {}).get("orderId")
-                log.info(f"DCA2 Limit {dca2} × {fmt_qty(symbol, qty_dca2)} platziert")
-            else:
-                log.warning(f"DCA2 Fehler: {res_dca2}")
+            # Balance nach Entry+DCA1 neu lesen damit DCA2 nicht wegen Margin-Reserve scheitert
+            _balance_cache["ts"] = 0
+            budget_remaining = get_available_balance()
+            qty_dca2 = calc_qty(symbol, budget_remaining, lev, dca2)
+            log.info(f"DCA2: verbleibender Balance={budget_remaining:.2f} USDT → qty={fmt_qty(symbol, qty_dca2)}")
+            if qty_dca2 > 0:
+                res_dca2 = place_limit_order(symbol, side, qty_dca2, dca2)
+                if bybit_ok(res_dca2):
+                    dca2_id = (res_dca2.get("result") or {}).get("orderId")
+                    log.info(f"DCA2 Limit {dca2} × {fmt_qty(symbol, qty_dca2)} platziert")
+                else:
+                    log.warning(f"DCA2 Fehler: {res_dca2}")
     else:
         if qty_dca1 > 0:
             res_dca1 = bingx_place_limit_order(ex_sym, side, qty_dca1, dca1)
@@ -1141,31 +1280,39 @@ async def execute_signal(sig: dict) -> None:
             else:
                 log.warning(f"BingX DCA1 Fehler: {res_dca1}")
         if qty_dca2 > 0:
-            res_dca2 = bingx_place_limit_order(ex_sym, side, qty_dca2, dca2)
-            if bingx_ok(res_dca2):
-                dca2_id = (res_dca2.get("data") or {}).get("orderId")
-                log.info(f"BingX DCA2 Limit {dca2} × {bingx_fmt_qty(ex_sym, qty_dca2)} platziert")
-            else:
-                log.warning(f"BingX DCA2 Fehler: {res_dca2}")
+            _bingx_balance_cache["ts"] = 0
+            budget_remaining = get_bingx_balance()
+            qty_dca2 = bingx_calc_qty(ex_sym, budget_remaining, lev, dca2)
+            log.info(f"BingX DCA2: verbleibender Balance={budget_remaining:.2f} USDT → qty={bingx_fmt_qty(ex_sym, qty_dca2)}")
+            if qty_dca2 > 0:
+                res_dca2 = bingx_place_limit_order(ex_sym, side, qty_dca2, dca2)
+                if bingx_ok(res_dca2):
+                    dca2_id = (res_dca2.get("data") or {}).get("orderId")
+                    log.info(f"BingX DCA2 Limit {dca2} × {bingx_fmt_qty(ex_sym, qty_dca2)} platziert")
+                else:
+                    log.warning(f"BingX DCA2 Fehler: {res_dca2}")
 
     # 8. State speichern (inkl. Exchange-Info für alle Folge-Aktionen)
     _state.setdefault("trades", {})[symbol] = {
-        "side":             side,
-        "lev":              lev,
-        "entry":            entry,
-        "dca1":             dca1,
-        "dca2":             dca2,
-        "sl":               sl,
-        "qty_entry":        qty_entry,
-        "qty_dca1":         qty_dca1,
-        "qty_dca2":         qty_dca2,
-        "dca1_order_id":    dca1_id,
-        "dca2_order_id":    dca2_id,
-        "tp":               None,
-        "opened_at":        datetime.now(timezone.utc).isoformat(),
-        "budget_usdt":      budget,
-        "exchange":         exchange,        # "bybit" oder "bingx"
-        "exchange_symbol":  ex_sym,          # z.B. "SUSHI-USDT" für BingX
+        "side":               side,
+        "lev":                lev,
+        "entry":              entry,
+        "dca1":               dca1,
+        "dca2":               dca2,
+        "sl":                 sl,
+        "qty_entry":          qty_entry,
+        "qty_dca1":           qty_dca1,
+        "qty_dca2":           qty_dca2,
+        "qty_total_initial":  qty_entry + qty_dca1 + qty_dca2,  # Basis für Dynamic-Model
+        "dca1_order_id":      dca1_id,
+        "dca2_order_id":      dca2_id,
+        "tp":                 None,
+        "opened_at":          datetime.now(timezone.utc).isoformat(),
+        "budget_usdt":        budget,
+        "exchange":           exchange,        # "bybit" oder "bingx"
+        "exchange_symbol":    ex_sym,          # z.B. "SUSHI-USDT" für BingX
+        "dynamic_model_active": False,         # wird via UPDATE aktiviert
+        "dynamic_levels_done":  [],            # bereits ausgeführte Stufen
     }
     save_state()
 
@@ -1203,6 +1350,31 @@ async def handle_update(upd: dict) -> None:
     tp_price = calc_tp_price(side, entry, max_gain, lev)
     log.info(f"UPDATE {symbol} ({exchange}): max_gain={max_gain}% → TP={tp_price:.6f}")
 
+    # ── Dynamisches Profit-Modell 3 ──────────────────────────────
+    if SYNORA_PROFIT_MODEL == 3:
+        _state["trades"][symbol]["dynamic_model_active"] = True
+        _state["trades"][symbol].setdefault("dynamic_levels_done", [])
+        _state["trades"][symbol]["tp"] = tp_price   # als Info-Referenz
+        save_state()
+
+        # Aufschlüsselung der 6 Stufen für Telegram
+        level_lines = []
+        for pct, payout, sl_off in DYNAMIC_MODEL_LEVELS:
+            p = calc_tp_price(side, entry, pct, lev)
+            sl_lbl = f"SL→+{sl_off}%" if sl_off else ("SL→BE" if sl_off == 0 else "—")
+            price_fmt = fmt_price(symbol, p) if exchange == "bybit" else bingx_fmt_price(ex_sym, p)
+            level_lines.append(f"  +{pct:2d}% → {price_fmt} | {payout}% | {sl_lbl}")
+
+        tg(
+            f"📊 <b>SYNORA Dynamisches Profit-Modell 3 aktiviert</b>\n"
+            f"Symbol: <b>{symbol}</b> | Mode: {SYNORA_MAX_GAIN_MODE}\n"
+            f"Max. Ziel: {max_gain}% → {fmt_price(symbol, tp_price) if exchange == 'bybit' else bingx_fmt_price(ex_sym, tp_price)}\n\n"
+            f"<pre>" + "\n".join(level_lines) + "</pre>"
+        )
+        log.info(f"Dynamisches Profit-Modell 3 aktiviert für {symbol}")
+        return
+
+    # ── Einfacher TP (Modell 1) ───────────────────────────────────
     if exchange == "bybit":
         res = set_tp(symbol, side, tp_price)
         ok  = bybit_ok(res)
@@ -1384,6 +1556,9 @@ async def check_closed_positions() -> None:
                     pos_size = bingx_get_position_size(ex_sym, trade["side"])
 
                 if pos_size > 0:
+                    # Dynamisches Profit-Modell 3 prüfen
+                    if SYNORA_PROFIT_MODEL == 3:
+                        await _check_dynamic_profit_levels(symbol, trade, pos_size)
                     continue   # Position noch offen
 
                 # ── Position ist geschlossen ─────────────────
