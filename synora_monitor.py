@@ -129,9 +129,11 @@ BYBIT_RECV_WINDOW        = "5000"
 BYBIT_CATEGORY           = "linear"   # USDT Perpetual
 
 # Capital-Split (wie in Synora-Doku: 10% / 25% / 65%)
-SPLIT_ENTRY = 0.10
-SPLIT_DCA1  = 0.25
-SPLIT_DCA2  = 0.65
+# 2% Sicherheitspuffer gegen Bybit retCode 110007 'ab not enough' (Fees + Margin-Reserve)
+BUDGET_SAFETY = 0.98
+SPLIT_ENTRY   = 0.10
+SPLIT_DCA1    = 0.25
+SPLIT_DCA2    = 0.65
 
 # ═══════════════════════════════════════════════════════════════
 # LOGGING
@@ -1067,15 +1069,16 @@ async def execute_signal(sig: dict) -> None:
         tg(f"❌ SYNORA: Balance zu gering ({budget:.2f} USDT) — Trade abgebrochen")
         return
 
-    # 3. Qty berechnen
+    # 3. Qty berechnen (98% des Budgets — 2% Puffer für Fees & Margin-Reserve)
+    b = budget * BUDGET_SAFETY
     if exchange == "bybit":
-        qty_entry = calc_qty(symbol, budget * SPLIT_ENTRY, lev, ref_price)
-        qty_dca1  = calc_qty(symbol, budget * SPLIT_DCA1,  lev, dca1)
-        qty_dca2  = calc_qty(symbol, budget * SPLIT_DCA2,  lev, dca2)
+        qty_entry = calc_qty(symbol, b * SPLIT_ENTRY, lev, ref_price)
+        qty_dca1  = calc_qty(symbol, b * SPLIT_DCA1,  lev, dca1)
+        qty_dca2  = calc_qty(symbol, b * SPLIT_DCA2,  lev, dca2)
     else:
-        qty_entry = bingx_calc_qty(ex_sym, budget * SPLIT_ENTRY, lev, ref_price)
-        qty_dca1  = bingx_calc_qty(ex_sym, budget * SPLIT_DCA1,  lev, dca1)
-        qty_dca2  = bingx_calc_qty(ex_sym, budget * SPLIT_DCA2,  lev, dca2)
+        qty_entry = bingx_calc_qty(ex_sym, b * SPLIT_ENTRY, lev, ref_price)
+        qty_dca1  = bingx_calc_qty(ex_sym, b * SPLIT_DCA1,  lev, dca1)
+        qty_dca2  = bingx_calc_qty(ex_sym, b * SPLIT_DCA2,  lev, dca2)
 
     if qty_entry <= 0:
         tg(f"❌ SYNORA: Qty=0 für {symbol} (Budget zu klein?) — Trade abgebrochen")
@@ -1159,7 +1162,7 @@ async def execute_signal(sig: dict) -> None:
         "dca1_order_id":    dca1_id,
         "dca2_order_id":    dca2_id,
         "tp":               None,
-        "opened_at":        datetime.utcnow().isoformat(),
+        "opened_at":        datetime.now(timezone.utc).isoformat(),
         "budget_usdt":      budget,
         "exchange":         exchange,        # "bybit" oder "bingx"
         "exchange_symbol":  ex_sym,          # z.B. "SUSHI-USDT" für BingX
@@ -1691,6 +1694,75 @@ def force_signal():
     except Exception as e:
         log.error(f"[force_signal] Fehler: {e}")
         return Response(f"❌ Fehler: {e}", status=500)
+
+
+@flask_app.route("/verify")
+def verify():
+    """
+    Prüft alle offenen Trades live gegen Bybit/BingX.
+    Zeigt: Position (Size, Entry, SL, TP) + offene Limit-Orders (DCA1/DCA2).
+    URL: /verify?secret=XXX
+    """
+    secret = request.args.get("secret", "")
+    if SYNORA_DASHBOARD_SECRET and secret != SYNORA_DASHBOARD_SECRET:
+        return Response("403 Forbidden", status=403)
+
+    trades = _state.get("trades", {})
+    if not trades:
+        return Response("ℹ️ Keine offenen Trades im State.", content_type="text/plain; charset=utf-8")
+
+    lines = ["=== SYNORA VERIFY ===\n"]
+    for symbol, trade in trades.items():
+        exchange = trade.get("exchange", "bybit")
+        ex_sym   = trade.get("exchange_symbol", symbol)
+        lines.append(f"── {symbol} [{exchange.upper()}] ──")
+        lines.append(f"  State: {trade.get('side')} {trade.get('lev')}x | Entry={trade.get('entry')} SL={trade.get('sl')} TP={trade.get('tp') or '—'}")
+
+        if exchange == "bybit":
+            # Position live abfragen
+            pos_res = bybit_get("/v5/position/list", {"category": BYBIT_CATEGORY, "symbol": symbol})
+            pos_items = (pos_res.get("result") or {}).get("list") or []
+            pos_found = False
+            for p in pos_items:
+                if p.get("symbol") == symbol and float(p.get("size", 0) or 0) > 0:
+                    lines.append(f"  Bybit Position: size={p.get('size')} | avgEntry={p.get('avgPrice')} | SL={p.get('stopLoss') or '—'} | TP={p.get('takeProfit') or '—'} | uPnL={p.get('unrealisedPnl')}")
+                    pos_found = True
+            if not pos_found:
+                lines.append("  ⚠️ Bybit: KEINE offene Position gefunden!")
+
+            # Offene Orders (DCA)
+            ord_res = bybit_get("/v5/order/realtime", {"category": BYBIT_CATEGORY, "symbol": symbol})
+            ord_items = (ord_res.get("result") or {}).get("list") or []
+            if ord_items:
+                lines.append(f"  Bybit Orders ({len(ord_items)}):")
+                for o in ord_items:
+                    lines.append(f"    {o.get('side')} {o.get('orderType')} qty={o.get('qty')} price={o.get('price')} status={o.get('orderStatus')}")
+            else:
+                lines.append("  ⚠️ Bybit: Keine offenen Limit-Orders (DCA fehlt?)")
+
+        else:
+            # BingX Position
+            bx_size = bingx_get_position_size(ex_sym, trade["side"])
+            if bx_size > 0:
+                lines.append(f"  BingX Position: size={bx_size}")
+            else:
+                lines.append("  ⚠️ BingX: KEINE offene Position gefunden!")
+
+            # BingX offene Orders
+            ord_res = bingx_get("/openApi/swap/v2/trade/openOrders", {"symbol": ex_sym})
+            ord_items = (ord_res.get("data") or {}).get("orders") or []
+            if ord_items:
+                lines.append(f"  BingX Orders ({len(ord_items)}):")
+                for o in ord_items:
+                    lines.append(f"    {o.get('side')} {o.get('type')} qty={o.get('origQty')} price={o.get('price')}")
+            else:
+                lines.append("  ⚠️ BingX: Keine offenen Limit-Orders (DCA fehlt?)")
+
+        lines.append("")
+
+    result = "\n".join(lines)
+    log.info(f"[verify] {result}")
+    return Response(result, content_type="text/plain; charset=utf-8")
 
 
 def run_flask() -> None:
