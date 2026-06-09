@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SYNORA Monitor  v1.4  (2026-06-09)
+SYNORA Monitor  v1.5  (2026-06-09)
 ════════════════════════════════════════════════════════════════
 Vollautomatischer SYNORA-Signal-Executor auf Bybit (Sub-Account).
 
@@ -1098,6 +1098,15 @@ async def _check_dynamic_profit_levels(symbol: str, trade: dict, pos_size: float
         levels_done.append(profit_pct)
         _state["trades"][symbol]["dynamic_levels_done"] = levels_done
         log.info(f"Dynamic Level +{profit_pct}% ausgeführt ✓ — verbleibend: {remaining_qty:.4f}")
+
+        # DCA-Orders stornieren sobald SL auf Break-Even geht (erste Stufe +10%)
+        # → offene DCAs würden Position bei ungünstiger Rückbewegung vergrössern
+        if sl_offset == 0 and profit_pct == 10:
+            log.info(f"Dynamic: storniere offene DCA-Orders für {symbol} (SL → Break-Even)")
+            if exchange == "bybit":
+                cancel_open_orders(symbol)
+            else:
+                bingx_cancel_open_orders(ex_sym)
 
         # SL-Anpassung
         sl_msg = ""
