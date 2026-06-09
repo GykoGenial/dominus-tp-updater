@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SYNORA Monitor  v1.5  (2026-06-09)
+SYNORA Monitor  v1.6  (2026-06-09)
 ════════════════════════════════════════════════════════════════
 Vollautomatischer SYNORA-Signal-Executor auf Bybit (Sub-Account).
 
@@ -1028,6 +1028,309 @@ def _current_profit_pct(side: str, entry: float, current_price: float, lev: int)
     return price_move_pct
 
 
+async def _verify_sl(symbol: str, trade: dict) -> None:
+    """
+    Liest den tatsächlich auf der Exchange gesetzten SL zurück.
+    Falls er fehlt oder um mehr als 0.1% vom State abweicht → korrigiert ihn.
+    Wird bei jedem Polling-Zyklus aufgerufen solange Position offen ist.
+    """
+    exchange = trade.get("exchange", "bybit")
+    ex_sym   = trade.get("exchange_symbol", symbol)
+    side     = trade["side"]
+    sl_state = float(trade.get("sl", 0))
+    if sl_state <= 0:
+        return  # kein SL im State → nichts zu prüfen
+
+    try:
+        if exchange == "bybit":
+            res   = bybit_get("/v5/position/list", {"category": BYBIT_CATEGORY, "symbol": symbol})
+            items = (res.get("result") or {}).get("list") or []
+            sl_live = 0.0
+            for item in items:
+                if item.get("symbol") == symbol:
+                    sl_live = float(item.get("stopLoss", "0") or "0")
+                    break
+        else:
+            res   = bingx_get("/openApi/swap/v2/user/positions", {"symbol": ex_sym})
+            data  = res.get("data") or []
+            sl_live = 0.0
+            for pos in data:
+                if pos.get("symbol") == ex_sym and pos.get("positionSide") == side:
+                    sl_live = float(pos.get("stopLoss", 0) or 0)
+                    break
+    except Exception as e:
+        log.warning(f"SL-Monitor: Fehler beim Lesen ({symbol}): {e}")
+        return
+
+    # SL fehlt oder weicht mehr als 0.1% ab
+    if sl_live <= 0 or abs(sl_live - sl_state) / sl_state > 0.001:
+        log.warning(f"SL-Monitor {symbol}: live={sl_live} ≠ state={sl_state} → korrigiere")
+        if exchange == "bybit":
+            res_fix = set_sl(symbol, side, sl_state)
+            ok_fix  = bybit_ok(res_fix)
+        else:
+            res_fix = bingx_set_sl(ex_sym, side, sl_state)
+            ok_fix  = bingx_ok(res_fix)
+
+        if ok_fix:
+            log.info(f"SL-Monitor {symbol}: SL auf {sl_state} korrigiert ✓")
+            if sl_live <= 0:
+                tg(
+                    f"🚨 <b>SYNORA: SL fehlte!</b>\n"
+                    f"{symbol} {side} — SL war nicht gesetzt!\n"
+                    f"Automatisch korrigiert auf {sl_state}"
+                )
+        else:
+            log.error(f"SL-Monitor {symbol}: Korrektur fehlgeschlagen! {res_fix}")
+            tg(
+                f"🚨 <b>SYNORA: SL-Korrektur FEHLGESCHLAGEN</b>\n"
+                f"{symbol} — SL={sl_state} nicht gesetzt!\n"
+                f"Bitte manuell setzen!"
+            )
+
+
+def _sl_is_at_breakeven_or_better(side: str, entry: float, sl: float) -> bool:
+    """
+    Prüft ob SL auf Break-Even oder Profit-Sicherung liegt.
+    LONG:  SL ≥ entry × 0.999  →  Break-Even oder besser
+    SHORT: SL ≤ entry × 1.001  →  Break-Even oder besser
+    """
+    if entry <= 0 or sl <= 0:
+        return False
+    if side == "LONG":
+        return sl >= entry * 0.999
+    else:
+        return sl <= entry * 1.001
+
+
+async def _cancel_dca_if_sl_at_be(symbol: str, trade: dict) -> None:
+    """
+    Storniert noch offene DCA-Limit-Orders wenn:
+      • SL wurde auf Break-Even oder Profit-Sicherung bewegt, ODER
+      • Level 10 des Dynamic-Models wurde ausgeführt (SL → BE).
+    Wird bei jedem Polling-Zyklus aufgerufen.
+    """
+    side     = trade["side"]
+    entry    = float(trade.get("entry", 0))
+    sl_state = float(trade.get("sl", 0))
+    exchange = trade.get("exchange", "bybit")
+    ex_sym   = trade.get("exchange_symbol", symbol)
+    levels_done = list(trade.get("dynamic_levels_done", []))
+
+    level_10_done = 10 in levels_done
+    sl_at_be      = _sl_is_at_breakeven_or_better(side, entry, sl_state)
+
+    if not (level_10_done or sl_at_be):
+        return  # DCAs dürfen noch offen sein
+
+    # Offene Limit-Orders prüfen (nur canceln wenn wirklich welche vorhanden)
+    try:
+        if exchange == "bybit":
+            ord_res   = bybit_get("/v5/order/realtime", {"category": BYBIT_CATEGORY, "symbol": symbol})
+            ord_items = (ord_res.get("result") or {}).get("list") or []
+            dca_open  = [o for o in ord_items if o.get("orderType") == "Limit"]
+        else:
+            ord_res  = bingx_get("/openApi/swap/v2/trade/openOrders", {"symbol": ex_sym})
+            dca_open = ((ord_res.get("data") or {}).get("orders") or [])
+    except Exception as e:
+        log.warning(f"DCA-Cancel-Check Fehler ({symbol}): {e}")
+        return
+
+    if not dca_open:
+        return
+
+    reason = "Level 10 done" if level_10_done else f"SL@BE ({sl_state:.6g})"
+    log.info(f"DCA-Cancel: storniere {len(dca_open)} Order(s) für {symbol} — {reason}")
+    if exchange == "bybit":
+        cancel_open_orders(symbol)
+    else:
+        bingx_cancel_open_orders(ex_sym)
+    tg(
+        f"🚨 <b>SYNORA: DCA-Orders storniert</b>\n"
+        f"<b>{symbol}</b> — {reason}\n"
+        f"{len(dca_open)} DCA-Limit-Order(s) waren noch offen — automatisch storniert."
+    )
+
+
+async def reconcile_trade_state(startup: bool = False) -> None:
+    """
+    Vollständige State-Überprüfung aller offenen Trades gegen die Exchange.
+    Korrigiert Abweichungen automatisch und sendet bei startup=True einen
+    Telegram-Bericht mit dem vollständigen Status jedes Trades.
+
+    Prüft + korrigiert:
+      1. Position existiert noch  → sonst State bereinigen
+      2. qty_total_initial        → initialisieren falls fehlend
+      3. dynamic_levels_done      → initialisieren falls fehlend
+      4. SL gesetzt + korrekt     → korrigieren falls abweichend (nur startup)
+      5. DCA-Orders               → stornieren falls SL auf/über Break-Even
+
+    Aufruf:
+      startup=True  → einmalig aus main() nach client.start()
+      startup=False → aus check_closed_positions() (leichtgewichtig, via _cancel_dca_if_sl_at_be)
+    """
+    trades_snapshot = dict(_state.get("trades", {}))
+    if not trades_snapshot:
+        if startup:
+            tg("🟣 <b>SYNORA Reconcile</b>: Keine offenen Trades — bereit ✓")
+        return
+
+    fixes        = []   # gesammelte Korrekturen für Startup-Bericht
+    removed      = []   # aus State bereinigt
+    status_lines = []
+
+    for symbol, trade in trades_snapshot.items():
+        exchange   = trade.get("exchange", "bybit")
+        ex_sym     = trade.get("exchange_symbol", symbol)
+        side       = trade["side"]
+        lev        = int(trade.get("lev", 1))
+        entry      = float(trade.get("entry", 0))
+        sl_state   = float(trade.get("sl", 0))
+        dyn_active = trade.get("dynamic_model_active", False)
+        dyn_done   = list(trade.get("dynamic_levels_done", []))
+
+        pos_size     = -1.0
+        sl_live      = 0.0
+        avg_entry_ex = 0.0
+
+        # ── 1. Position-Existenz prüfen (nur Startup) ────────────
+        if startup:
+            try:
+                if exchange == "bybit":
+                    res   = bybit_get("/v5/position/list", {"category": BYBIT_CATEGORY, "symbol": symbol})
+                    items = (res.get("result") or {}).get("list") or []
+                    pos_size = 0.0
+                    for item in items:
+                        if item.get("symbol") == symbol:
+                            pos_size     = float(item.get("size",      "0") or "0")
+                            sl_live      = float(item.get("stopLoss",  "0") or "0")
+                            avg_entry_ex = float(item.get("avgPrice",  "0") or "0")
+                            break
+                else:
+                    res  = bingx_get("/openApi/swap/v2/user/positions", {"symbol": ex_sym})
+                    data = res.get("data") or []
+                    pos_size = 0.0
+                    for pos in data:
+                        if pos.get("symbol") == ex_sym and pos.get("positionSide") == side:
+                            pos_size     = abs(float(pos.get("positionAmt", 0) or 0))
+                            sl_live      = float(pos.get("stopLoss", 0) or 0)
+                            avg_entry_ex = float(pos.get("avgPrice",  0) or 0)
+                            break
+            except Exception as e:
+                log.error(f"Reconcile: Position-Abfrage Fehler ({symbol}): {e}")
+                pos_size = -1.0  # unbekannt
+
+            if pos_size == 0.0:
+                log.warning(f"Reconcile STARTUP: {symbol} hat keine Position! State bereinigt.")
+                _state["trades"].pop(symbol, None)
+                save_state()
+                removed.append(symbol)
+                continue
+
+        # ── 2. qty_total_initial initialisieren ──────────────────
+        if "qty_total_initial" not in trade or float(trade.get("qty_total_initial", 0)) <= 0:
+            qty_init = (float(trade.get("qty_entry", 0)) +
+                        float(trade.get("qty_dca1",  0)) +
+                        float(trade.get("qty_dca2",  0)))
+            if qty_init <= 0 and pos_size > 0:
+                qty_init = pos_size   # Fallback: aktuelle Pos-Grösse
+            if qty_init > 0:
+                _state["trades"][symbol]["qty_total_initial"] = qty_init
+                fixes.append(f"{symbol}: qty_total_initial={qty_init:.4f} gesetzt")
+                log.info(f"Reconcile: qty_total_initial={qty_init} für {symbol} initialisiert")
+
+        # ── 3. dynamic_levels_done initialisieren ─────────────────
+        if "dynamic_levels_done" not in trade:
+            _state["trades"][symbol]["dynamic_levels_done"] = []
+            fixes.append(f"{symbol}: dynamic_levels_done initialisiert")
+
+        # ── 4. SL prüfen + korrigieren (nur Startup) ─────────────
+        if startup and sl_state > 0:
+            sl_ok = sl_live > 0 and abs(sl_live - sl_state) / sl_state <= 0.001
+            if not sl_ok:
+                log.warning(f"Reconcile STARTUP SL: {symbol} live={sl_live} state={sl_state} → korrigiere")
+                if exchange == "bybit":
+                    res_sl   = set_sl(symbol, side, sl_state)
+                    sl_fixed = bybit_ok(res_sl)
+                else:
+                    res_sl   = bingx_set_sl(ex_sym, side, sl_state)
+                    sl_fixed = bingx_ok(res_sl)
+                if sl_fixed:
+                    fixes.append(f"{symbol}: SL {sl_live:.6g} → {sl_state:.6g} korrigiert ✓")
+                    log.info(f"Reconcile SL fix {symbol}: {sl_live} → {sl_state} ✓")
+                else:
+                    fixes.append(f"{symbol}: ⚠️ SL-Korrektur FEHLGESCHLAGEN! ({sl_live:.6g} → {sl_state:.6g})")
+                    log.error(f"Reconcile SL-Fehler {symbol}: {res_sl}")
+
+        # ── 5. DCA-Orders stornieren falls SL auf Break-Even ──────
+        level_10_done = 10 in dyn_done
+        sl_at_be      = _sl_is_at_breakeven_or_better(side, entry, sl_state)
+
+        if level_10_done or sl_at_be:
+            try:
+                if exchange == "bybit":
+                    ord_res   = bybit_get("/v5/order/realtime", {"category": BYBIT_CATEGORY, "symbol": symbol})
+                    ord_items = (ord_res.get("result") or {}).get("list") or []
+                    dca_open  = [o for o in ord_items if o.get("orderType") == "Limit"]
+                else:
+                    ord_res  = bingx_get("/openApi/swap/v2/trade/openOrders", {"symbol": ex_sym})
+                    dca_open = ((ord_res.get("data") or {}).get("orders") or [])
+            except Exception as e:
+                log.warning(f"Reconcile: Order-Check Fehler ({symbol}): {e}")
+                dca_open = []
+
+            if dca_open:
+                reason = "Level 10 done" if level_10_done else f"SL@BE ({sl_state:.6g})"
+                if exchange == "bybit":
+                    cancel_open_orders(symbol)
+                else:
+                    bingx_cancel_open_orders(ex_sym)
+                fixes.append(f"{symbol}: {len(dca_open)} DCA-Order(s) storniert ({reason})")
+                log.info(f"Reconcile: DCA storniert für {symbol} — {reason}")
+                tg(
+                    f"🚨 <b>SYNORA: DCA-Orders storniert</b>\n"
+                    f"<b>{symbol}</b> — {reason}\n"
+                    f"{len(dca_open)} Limit-Order(s) waren noch offen!"
+                )
+
+        save_state()
+
+        # Status-Zeile für Startup-Bericht
+        if startup:
+            sl_live_str = f"{sl_live:.6g}" if sl_live > 0 else "⚠️ fehlt!"
+            dyn_str     = (f"Modell 3 aktiv ({len(dyn_done)}/6 Stufen)"
+                           if dyn_active else "⏳ warte auf SYNORA UPDATE")
+            be_flag     = " | 🔒SL@BE" if (sl_at_be or level_10_done) else ""
+            pos_str     = f"{pos_size:.4g}" if pos_size >= 0 else "?"
+            status_lines.append(
+                f"<b>{symbol}</b> {side} {lev}x{be_flag}\n"
+                f"  Pos={pos_str} | avgEntry={avg_entry_ex:.6g}\n"
+                f"  SL(state)={sl_state:.6g} | SL(live)={sl_live_str}\n"
+                f"  {dyn_str}"
+            )
+
+    if not startup:
+        return
+
+    # ── Startup-Telegram-Bericht ────────────────────────────────
+    parts = ["🔄 <b>SYNORA Startup-Reconcile</b>\n"]
+
+    if removed:
+        parts.append(f"⚠️ <b>Bereinigt</b> (keine Position): {', '.join(removed)}\n")
+
+    if status_lines:
+        parts.append("📊 <b>Offene Trades:</b>\n" + "\n\n".join(status_lines))
+
+    if fixes:
+        parts.append("\n🔧 <b>Korrekturen:</b>\n" + "\n".join(f"• {f}" for f in fixes))
+    elif not removed and _state.get("trades"):
+        parts.append("\n✅ Alles in Ordnung — keine Korrekturen nötig")
+    elif not _state.get("trades"):
+        parts.append("\nKeine offenen Trades nach Reconcile.")
+
+    tg("".join(parts))
+
+
 async def _check_dynamic_profit_levels(symbol: str, trade: dict, pos_size: float) -> None:
     """
     Prüft und führt das Dynamische Profit-Modell 3 (6 Stufen) aus.
@@ -1247,15 +1550,23 @@ async def execute_signal(sig: dict) -> None:
     # 5. Kurz warten damit Position existiert
     await asyncio.sleep(2)
 
-    # 6. Stop-Loss setzen
-    if exchange == "bybit":
-        res_sl = set_sl(symbol, side, sl)
-        if not bybit_ok(res_sl):
-            log.warning(f"SL-Fehler (nicht kritisch): {res_sl}")
-    else:
-        res_sl = bingx_set_sl(ex_sym, side, sl)
-        if not bingx_ok(res_sl):
-            log.warning(f"BingX SL-Fehler (nicht kritisch): {res_sl}")
+    # 6. Stop-Loss setzen (mit Retry)
+    sl_set = False
+    for attempt in range(3):
+        if attempt > 0:
+            await asyncio.sleep(2)
+        if exchange == "bybit":
+            res_sl = set_sl(symbol, side, sl)
+            sl_set = bybit_ok(res_sl)
+        else:
+            res_sl = bingx_set_sl(ex_sym, side, sl)
+            sl_set = bingx_ok(res_sl)
+        if sl_set:
+            log.info(f"SL gesetzt: {sl} (Versuch {attempt+1})")
+            break
+        log.warning(f"SL-Fehler Versuch {attempt+1}/3: {res_sl}")
+    if not sl_set:
+        tg(f"🚨 <b>SYNORA: SL NICHT GESETZT</b> für {symbol}!\nSL={sl} | Manuell setzen!")
 
     # 7. DCA Limit Orders
     dca1_id = dca2_id = None
@@ -1565,7 +1876,11 @@ async def check_closed_positions() -> None:
                     pos_size = bingx_get_position_size(ex_sym, trade["side"])
 
                 if pos_size > 0:
-                    # Dynamisches Profit-Modell 3 prüfen
+                    # ── SL-Monitor: prüfe ob SL auf Exchange korrekt gesetzt ist ──
+                    await _verify_sl(symbol, trade)
+                    # ── DCA stornieren falls SL auf Break-Even (Reconcile) ───────
+                    await _cancel_dca_if_sl_at_be(symbol, trade)
+                    # ── Dynamisches Profit-Modell 3 prüfen ───────────────────────
                     if SYNORA_PROFIT_MODEL == 3:
                         await _check_dynamic_profit_levels(symbol, trade, pos_size)
                     continue   # Position noch offen
@@ -2171,6 +2486,9 @@ async def main() -> None:
 
     client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
     await client.start()
+
+    # ── Startup-Reconcile: alle offenen Trades prüfen + korrigieren ──
+    await reconcile_trade_state(startup=True)
 
     # ── Position-Polling starten ─────────────────────────────
     asyncio.ensure_future(check_closed_positions())
