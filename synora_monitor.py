@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SYNORA Monitor  v1.3  (2026-06-09)
+SYNORA Monitor  v1.4  (2026-06-09)
 ════════════════════════════════════════════════════════════════
 Vollautomatischer SYNORA-Signal-Executor auf Bybit (Sub-Account).
 
@@ -1987,6 +1987,74 @@ def force_signal():
     except Exception as e:
         log.error(f"[force_signal] Fehler: {e}")
         return Response(f"❌ Fehler: {e}", status=500)
+
+
+@flask_app.route("/activate_model")
+def activate_model():
+    """
+    Aktiviert das Dynamische Profit-Modell 3 manuell für einen laufenden Trade.
+    Nützlich für Trades die vor dem Feature-Deploy eröffnet wurden.
+
+    URL: /activate_model?secret=XXX&symbol=WLDUSDT
+    Optional: &qty_initial=37.6  (überschreibt qty_total_initial im State)
+    """
+    secret = request.args.get("secret", "")
+    if SYNORA_DASHBOARD_SECRET and secret != SYNORA_DASHBOARD_SECRET:
+        return Response("403 Forbidden", status=403)
+
+    symbol = request.args.get("symbol", "").upper()
+    if not symbol:
+        return Response("❌ Parameter 'symbol' fehlt", status=400)
+
+    trade = _state.get("trades", {}).get(symbol)
+    if not trade:
+        return Response(f"❌ Kein offener Trade für {symbol} im State", status=404)
+
+    if trade.get("dynamic_model_active"):
+        done = trade.get("dynamic_levels_done", [])
+        return Response(
+            f"ℹ️ {symbol}: Dynamisches Modell bereits aktiv. "
+            f"Erledigte Stufen: {done or 'keine'}",
+            status=200,
+        )
+
+    # qty_total_initial setzen falls noch nicht vorhanden
+    if "qty_total_initial" not in trade:
+        qty_override = request.args.get("qty_initial")
+        if qty_override:
+            try:
+                qty_init = float(qty_override)
+            except ValueError:
+                return Response("❌ Ungültiger Wert für qty_initial", status=400)
+        else:
+            # Aus Entry+DCA1+DCA2 rekonstruieren (DCAs evtl. nicht gefüllt — konservativ)
+            qty_init = float(trade.get("qty_entry", 0))
+        _state["trades"][symbol]["qty_total_initial"] = qty_init
+        log.info(f"activate_model: qty_total_initial={qty_init} für {symbol} gesetzt")
+
+    _state["trades"][symbol]["dynamic_model_active"] = True
+    _state["trades"][symbol].setdefault("dynamic_levels_done", [])
+    save_state()
+
+    qty_init = _state["trades"][symbol]["qty_total_initial"]
+    entry    = float(trade.get("entry", 0))
+    side     = trade.get("side", "?")
+    lev      = int(trade.get("lev", 1))
+
+    # Stufen-Preise berechnen für Anzeige
+    lines = [f"✅ Dynamisches Modell 3 aktiviert für {symbol}\n"]
+    lines.append(f"Entry: {entry} | Side: {side} | Hebel: {lev}x")
+    lines.append(f"qty_total_initial: {qty_init}\n")
+    lines.append("Stufen:")
+    for pct, payout, sl_off in DYNAMIC_MODEL_LEVELS:
+        price = calc_tp_price(side, entry, pct, lev)
+        sl_lbl = f"SL→BE" if sl_off == 0 else (f"SL→+{sl_off}%" if sl_off else "—")
+        lines.append(f"  +{pct:2d}% ({price:.6g}) → {payout}% schliessen | {sl_lbl}")
+
+    msg = "\n".join(lines)
+    log.info(f"[activate_model] {symbol}: Modell 3 aktiviert, qty_init={qty_init}")
+    tg(f"📊 <b>SYNORA Modell 3 manuell aktiviert</b>\n<b>{symbol}</b> {side} {lev}x\nqty_initial: {qty_init}")
+    return Response(msg, content_type="text/plain; charset=utf-8", status=200)
 
 
 @flask_app.route("/verify")
