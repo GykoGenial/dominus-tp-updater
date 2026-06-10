@@ -11791,7 +11791,7 @@ def start_webhook_server():
     log(f"Webhook-Server gestartet auf Port {port}")
     log(f"Endpoint: POST /webhook  (Token: {_tok_hint})")
     log("Token-Übergabe: Query-Param ?token=… ODER JSON-Body-Feld \"token\" — beides wird akzeptiert.")
-    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False, threaded=True)
 
 
 
