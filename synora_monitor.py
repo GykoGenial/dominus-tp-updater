@@ -3019,9 +3019,9 @@ async def check_auto_daily_report() -> None:
 # TELETHON — BOT/KANAL-LISTENER
 # ═══════════════════════════════════════════════════════════════
 
-async def catchup_missed_messages(client, source, lookback_seconds: int = 300) -> None:
+async def catchup_missed_messages(client, source, lookback_seconds: int = 1800) -> None:
     """
-    Liest beim Startup die letzten `lookback_seconds` Sekunden (Default: 5 Min) des Synora-Kanals
+    Liest beim Startup die letzten `lookback_seconds` Sekunden (Default: 30 Min) des Synora-Kanals
     und führt verpasste Signale/Updates/Closes sofort aus.
 
     Reihenfolge: chronologisch (älteste zuerst), damit DCA-Updates nach dem
@@ -3192,7 +3192,7 @@ async def main() -> None:
             return
 
     # ── Startup-Catchup: verpasste Nachrichten der letzten 60s ──
-    await catchup_missed_messages(client, source, lookback_seconds=300)
+    await catchup_missed_messages(client, source, lookback_seconds=1800)
 
     log.info("Warte auf Signale …")
     await client.run_until_disconnected()
