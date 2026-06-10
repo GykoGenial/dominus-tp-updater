@@ -554,6 +554,8 @@ def bybit_ok(res: dict) -> bool:
 
 _balance_cache: dict = {"value": 0.0, "ts": 0.0}
 _main_loop = None   # wird in main() gesetzt, für Flask→Asyncio Bridge
+_paused    = False  # /pause → True, /resume → False
+_cmd_offset = 0     # getUpdates long-polling offset
 BALANCE_CACHE_TTL = 30   # Sekunden
 
 def get_available_balance() -> float:
@@ -2674,6 +2676,199 @@ def run_flask() -> None:
 
 
 # ═══════════════════════════════════════════════════════════════
+# TELEGRAM COMMANDS  (Bot API long-polling)
+# ═══════════════════════════════════════════════════════════════
+
+def tg_reply(chat_id, msg: str) -> None:
+    """Antwortet direkt in den Anfrager-Chat (kein Forum-Routing)."""
+    if not TELEGRAM_TOKEN:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={
+                "chat_id":                  chat_id,
+                "text":                     msg,
+                "parse_mode":               "HTML",
+                "disable_web_page_preview": True,
+            },
+            timeout=10,
+        )
+    except Exception as e:
+        log.error(f"tg_reply Fehler: {e}")
+
+
+def build_synora_status_msg() -> str:
+    """Erstellt die /status Nachricht aus dem aktuellen State."""
+    trades = _state.get("trades", {})
+    pause_line = "\n⏸ <b>Bot pausiert</b> — keine neuen Trades.\n" if _paused else ""
+    if not trades:
+        return f"🟣 <b>SYNORA Status</b>{pause_line}\n\nKeine offenen Trades."
+    lines = [f"🟣 <b>SYNORA Status</b> — {len(trades)} offene Trade(s){pause_line}\n"]
+    for sym, t in trades.items():
+        side   = t.get("side", "?")
+        lev    = t.get("lev", "?")
+        entry  = t.get("entry", 0)
+        sl     = t.get("sl", 0)
+        exch   = t.get("exchange", "bybit").upper()
+        icon   = "📈" if side == "LONG" else "📉"
+        opened = t.get("opened_at", "")[:16].replace("T", " ")
+        lines.append(
+            f"{icon} <b>{sym}</b> {side} {lev}x @ {entry:.6g}"
+            f"\n   SL: {sl:.6g} | {exch} | {opened} UTC"
+        )
+    return "\n".join(lines)
+
+
+def build_synora_report_msg(period: str = "today") -> str:
+    """P&L-Report aus der CSV.  period: 'today' | 'yesterday' | 'month'"""
+    all_trades = read_trades_csv()
+    now = datetime.now(timezone.utc)
+
+    if period == "month":
+        label = f"Monats-Report {now.strftime('%m/%Y')}"
+        key = now.strftime("%Y-%m")
+        filtered = [r for r in all_trades if r.get("closed_at", "")[:7] == key]
+    elif period == "yesterday":
+        from datetime import timedelta
+        yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+        label = f"Tages-Report {(now - timedelta(days=1)).strftime('%d.%m.%Y')}"
+        filtered = [r for r in all_trades if r.get("closed_at", "")[:10] == yesterday]
+    else:  # today
+        label = f"Tages-Report {now.strftime('%d.%m.%Y')}"
+        filtered = [r for r in all_trades if r.get("closed_at", "")[:10] == now.strftime("%Y-%m-%d")]
+
+    if not filtered:
+        return f"🟣 <b>SYNORA {label}</b>\n\nKeine abgeschlossenen Trades."
+
+    wins  = [r for r in filtered if r.get("outcome") == "TP"]
+    losses = [r for r in filtered if r.get("outcome") == "SL"]
+    total_pnl = sum(float(r.get("pnl_usdt") or 0) for r in filtered)
+    total_n   = len(filtered)
+    wr        = len(wins) / total_n * 100 if total_n else 0
+
+    lines = [
+        f"🟣 <b>SYNORA {label}</b>",
+        f"Trades: {total_n} | ✅ {len(wins)} TP / ❌ {len(losses)} SL",
+        f"Winrate: {wr:.0f}%",
+        f"P&amp;L: <b>{'%+.2f' % total_pnl} USDT</b>",
+        "",
+    ]
+    for r in filtered[-10:]:
+        sym  = r.get("symbol", "?")
+        side = r.get("side", "?")
+        pnl  = float(r.get("pnl_usdt") or 0)
+        out  = "✅" if r.get("outcome") == "TP" else "❌"
+        icon = "📈" if side == "LONG" else "📉"
+        lines.append(f"{out} {icon} {sym} {side}  {'+' if pnl >= 0 else ''}{pnl:.2f} USDT")
+
+    return "\n".join(lines)
+
+
+def handle_synora_command(text: str, chat_id) -> None:
+    """Verarbeitet Telegram-Befehle (läuft im Thread, nicht async)."""
+    global _paused
+    cmd = text.strip().lower().split()[0].split("@")[0]
+    log.info(f"Befehl: {cmd} (chat={chat_id})")
+
+    if cmd == "/status":
+        msg = build_synora_status_msg()
+        tg_reply(chat_id, msg)
+        tg_status(msg)
+
+    elif cmd == "/report":
+        args = text.strip().lower().split()
+        period = "month" if len(args) > 1 and "monat" in args[1] else "today"
+        msg = build_synora_report_msg(period)
+        tg_reply(chat_id, msg)
+        tg_report(msg)
+
+    elif cmd == "/refresh":
+        tg_reply(chat_id, "🔄 Lade State neu …")
+        load_state()
+        n = len(_state.get("trades", {}))
+        tg_reply(chat_id, f"✅ State neu geladen — {n} offene Trade(s).")
+
+    elif cmd == "/pause":
+        _paused = True
+        msg = "⏸ <b>SYNORA pausiert</b> — neue Signale werden ignoriert."
+        tg_reply(chat_id, msg)
+        tg_status(msg)
+
+    elif cmd == "/resume":
+        _paused = False
+        msg = "▶️ <b>SYNORA aktiv</b> — verarbeite wieder Signale."
+        tg_reply(chat_id, msg)
+        tg_status(msg)
+
+    elif cmd == "/hilfe":
+        tg_reply(chat_id,
+            "🟣 <b>SYNORA Befehle</b>\n\n"
+            "/status — offene Trades\n"
+            "/report — heutiger P&amp;L-Report\n"
+            "/report monat — Monats-Report\n"
+            "/pause — neue Signale pausieren\n"
+            "/resume — Bot wieder aktivieren\n"
+            "/refresh — State neu laden\n"
+            "/hilfe — diese Hilfe"
+        )
+    else:
+        tg_reply(chat_id, f"❓ Unbekannter Befehl: <code>{cmd}</code>\nTippe /hilfe für alle Befehle.")
+
+
+async def poll_synora_commands() -> None:
+    """Asyncio-Task: Bot API long-polling für Telegram-Befehle."""
+    global _cmd_offset
+    log.info("Command-Polling gestartet ✓")
+    while True:
+        try:
+            r = requests.get(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
+                params={
+                    "offset":           _cmd_offset,
+                    "timeout":          30,
+                    "allowed_updates":  ["message"],
+                },
+                timeout=35,
+            )
+            data = r.json()
+            if not data.get("ok"):
+                await asyncio.sleep(5)
+                continue
+            for upd in data.get("result", []):
+                _cmd_offset = upd["update_id"] + 1
+                msg  = upd.get("message", {})
+                text = msg.get("text", "")
+                cid  = msg.get("chat", {}).get("id")
+                if text.startswith("/") and cid:
+                    threading.Thread(
+                        target=handle_synora_command,
+                        args=(text, cid),
+                        daemon=True,
+                    ).start()
+        except Exception as e:
+            log.error(f"Command-Polling Fehler: {e}")
+            await asyncio.sleep(10)
+
+
+async def check_auto_daily_report() -> None:
+    """Asyncio-Task: sendet jeden Morgen um 08:00 UTC den gestrigen Report."""
+    log.info("Auto-Daily-Report Task gestartet ✓")
+    last_sent_date = None
+    while True:
+        now = datetime.now(timezone.utc)
+        if now.hour == 8 and now.minute < 1 and now.date() != last_sent_date:
+            try:
+                msg = build_synora_report_msg("yesterday")
+                tg_report(msg)
+                last_sent_date = now.date()
+                log.info("Auto-Daily-Report gesendet ✓")
+            except Exception as e:
+                log.error(f"Auto-Daily-Report Fehler: {e}")
+        await asyncio.sleep(55)
+
+
+# ═══════════════════════════════════════════════════════════════
 # TELETHON — BOT/KANAL-LISTENER
 # ═══════════════════════════════════════════════════════════════
 
@@ -2708,8 +2903,10 @@ async def main() -> None:
     # ── Startup-Reconcile: alle offenen Trades prüfen + korrigieren ──
     await reconcile_trade_state(startup=True)
 
-    # ── Position-Polling starten ─────────────────────────────
+    # ── Position-Polling + Commands + Auto-Report starten ───
     asyncio.ensure_future(check_closed_positions())
+    asyncio.ensure_future(poll_synora_commands())
+    asyncio.ensure_future(check_auto_daily_report())
 
     # Source resolven — funktioniert für Bot-Chats (int user_id) UND Kanäle (int/-100... oder Link)
     try:
@@ -2735,6 +2932,10 @@ async def main() -> None:
         sig = parse_signal(text)
         if sig:
             log.info(f"Signal erkannt: {sig}")
+            if _paused:
+                log.info("Bot pausiert — Signal ignoriert.")
+                tg_status(f"⏸ <b>SYNORA pausiert</b> — Signal ignoriert:\n{sig.get('symbol')} {sig.get('side')}")
+                return
             await execute_signal(sig)
             return
 
