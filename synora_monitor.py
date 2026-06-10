@@ -2818,6 +2818,84 @@ def tg_reply(chat_id, msg: str) -> None:
         log.error(f"tg_reply Fehler: {e}")
 
 
+def build_verify_msg() -> str:
+    """
+    Prüft alle offenen Trades live gegen Bybit/BingX.
+    Gibt eine Telegram-HTML-Nachricht zurück mit Position, SL, TP und DCA-Orders.
+    """
+    trades = _state.get("trades", {})
+    if not trades:
+        return "🟣 <b>SYNORA Verify</b>\n\nKeine offenen Trades im State."
+
+    lines = [f"🔍 <b>SYNORA Verify</b> — {len(trades)} Trade(s)\n"]
+
+    for symbol, trade in trades.items():
+        exchange = trade.get("exchange", "bybit")
+        ex_sym   = trade.get("exchange_symbol", symbol)
+        side     = trade.get("side", "?")
+        lev      = trade.get("lev", "?")
+        icon     = "📈" if side == "LONG" else "📉"
+        lines.append(f"{icon} <b>{symbol}</b> {side} {lev}x [{exchange.upper()}]")
+
+        if exchange == "bybit":
+            # ── Position ──
+            pos_res   = bybit_get("/v5/position/list", {"category": BYBIT_CATEGORY, "symbol": symbol})
+            pos_items = (pos_res.get("result") or {}).get("list") or []
+            pos_found = False
+            for p in pos_items:
+                if p.get("symbol") == symbol and float(p.get("size", 0) or 0) > 0:
+                    sl_live = p.get("stopLoss") or "—"
+                    tp_live = p.get("takeProfit") or "—"
+                    upnl    = float(p.get("unrealisedPnl") or 0)
+                    upnl_icon = "🟢" if upnl >= 0 else "🔴"
+                    lines.append(
+                        f"  Pos: {p.get('size')} | Entry: {p.get('avgPrice')}\n"
+                        f"  SL: {sl_live} | TP: {tp_live}\n"
+                        f"  uPnL: {upnl_icon} {upnl:.2f} USDT"
+                    )
+                    pos_found = True
+            if not pos_found:
+                lines.append("  ⚠️ <b>KEINE Position auf Bybit gefunden!</b>")
+
+            # ── Offene Orders (DCA) ──
+            ord_res   = bybit_get("/v5/order/realtime", {"category": BYBIT_CATEGORY, "symbol": symbol})
+            ord_items = (ord_res.get("result") or {}).get("list") or []
+            if ord_items:
+                lines.append(f"  Orders ({len(ord_items)}):")
+                for o in ord_items:
+                    lines.append(
+                        f"    {o.get('side')} {o.get('orderType')} "
+                        f"qty={o.get('qty')} @ {o.get('price')}"
+                    )
+            else:
+                lines.append("  ⚠️ Keine offenen DCA-Orders gefunden")
+
+        else:
+            # ── BingX Position ──
+            bx_size = bingx_get_position_size(ex_sym, side)
+            if bx_size > 0:
+                lines.append(f"  Pos: {bx_size}")
+            else:
+                lines.append("  ⚠️ <b>KEINE Position auf BingX gefunden!</b>")
+
+            # ── BingX Orders ──
+            ord_res   = bingx_get("/openApi/swap/v2/trade/openOrders", {"symbol": ex_sym})
+            ord_items = (ord_res.get("data") or {}).get("orders") or []
+            if ord_items:
+                lines.append(f"  Orders ({len(ord_items)}):")
+                for o in ord_items:
+                    lines.append(
+                        f"    {o.get('side')} {o.get('type')} "
+                        f"qty={o.get('origQty')} @ {o.get('price')}"
+                    )
+            else:
+                lines.append("  ⚠️ Keine offenen DCA-Orders gefunden")
+
+        lines.append("")
+
+    return "\n".join(lines).rstrip()
+
+
 def build_synora_status_msg() -> str:
     """Erstellt die /status Nachricht aus dem aktuellen State."""
     trades = _state.get("trades", {})
@@ -2947,10 +3025,16 @@ def handle_synora_command(text: str, chat_id) -> None:
         )
         tg_reply(chat_id, msg)
 
+    elif cmd == "/verify":
+        tg_reply(chat_id, "🔍 Prüfe live gegen Exchange …")
+        msg = build_verify_msg()
+        tg_reply(chat_id, msg)
+
     elif cmd == "/hilfe":
         tg_reply(chat_id,
             "🟣 <b>SYNORA Befehle</b>\n\n"
             "/status — offene Trades\n"
+            "/verify — TP &amp; DCA live prüfen (Exchange)\n"
             "/balance — verfügbare Balance (Bybit + BingX)\n"
             "/report — heutiger P&amp;L-Report\n"
             "/report monat — Monats-Report\n"
