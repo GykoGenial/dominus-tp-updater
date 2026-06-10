@@ -1848,11 +1848,34 @@ async def execute_signal(sig: dict) -> None:
 
     log.info(f"Führe aus: {side} {symbol} {lev}X | Entry={entry} SL={sl} DCA1={dca1} DCA2={dca2}")
 
-    # Prüfen ob bereits ein Trade offen
+    # Prüfen ob bereits ein Trade offen (gleiches Symbol)
     if symbol in _state.get("trades", {}):
         tg_system(f"⚠️ SYNORA: {symbol} bereits offen — Signal ignoriert")
         log.warning(f"Trade für {symbol} bereits im State, übersprungen")
         return
+
+    # Kapitalverwaltung (SYNORA-Strategie): Neuer Trade nur wenn alle laufenden
+    # Positionen Break-Even erreicht haben (SL auf Einstiegspreis oder besser).
+    # FAQ #6: "Solange ein Trade nicht abgesichert ist, sollte kein weiteres
+    # Signal gehandelt werden."
+    for open_sym, open_trade in _state.get("trades", {}).items():
+        open_side   = open_trade.get("side", "LONG")
+        open_entry  = float(open_trade.get("entry", 0))
+        open_sl     = float(open_trade.get("sl", 0))
+        levels_done = open_trade.get("dynamic_levels_done", [])
+        at_be       = _sl_is_at_breakeven_or_better(open_side, open_entry, open_sl)
+        tp1_done    = 10 in levels_done  # TP1 (+10%) = Break-Even laut Modell 3
+        if not at_be and not tp1_done:
+            tg_system(
+                f"⛔ <b>SYNORA: Signal blockiert — Kapitalschutz</b>\n"
+                f"Neues Signal: <b>{symbol} {side}</b>\n"
+                f"Offener Trade: <b>{open_sym}</b> noch nicht abgesichert "
+                f"(SL nicht auf Break-Even)\n\n"
+                f"Gemäss SYNORA-Strategie: Neuer Trade erst wenn laufende "
+                f"Position ≥ TP1 (Break-Even) erreicht hat."
+            )
+            log.warning(f"Signal {symbol} blockiert — {open_sym} noch nicht Break-Even")
+            return
 
     # 1. Exchange-Routing: Bybit bevorzugt, Fallback BingX
     exchange, ex_sym = resolve_exchange(symbol)
@@ -3482,10 +3505,17 @@ async def check_auto_daily_report() -> None:
 # TELETHON — BOT/KANAL-LISTENER
 # ═══════════════════════════════════════════════════════════════
 
-async def catchup_missed_messages(client, source, lookback_seconds: int = 1800) -> None:
+SIGNAL_VALIDITY_SECONDS = 7200   # 2 Stunden gemäss SYNORA-Strategie (Zeitfaktor)
+
+async def catchup_missed_messages(client, source, lookback_seconds: int = SIGNAL_VALIDITY_SECONDS) -> None:
     """
-    Liest beim Startup die letzten `lookback_seconds` Sekunden (Default: 30 Min) des Synora-Kanals
+    Liest beim Startup die letzten `lookback_seconds` Sekunden (Default: 2h) des Synora-Kanals
     und führt verpasste Signale/Updates/Closes sofort aus.
+
+    Gemäss SYNORA-Strategie PDF:
+      - Signale sind nur valide wenn Einstieg innerhalb von 2 Stunden nach Signal-Veröffentlichung
+      - Preistoleranz max. 3% vom Referenzkurs (Prüfung in execute_signal)
+      - Updates/Closes: kein Zeitlimit (werden immer verarbeitet)
 
     Reihenfolge: chronologisch (älteste zuerst), damit DCA-Updates nach dem
     Signal ankommen falls beide im Fenster liegen.
@@ -3495,7 +3525,8 @@ async def catchup_missed_messages(client, source, lookback_seconds: int = 1800) 
       - Update:  nur ausführen wenn Symbol bereits im State
       - Close:   nur ausführen wenn Symbol bereits im State
     """
-    cutoff = datetime.now(timezone.utc) - timedelta(seconds=lookback_seconds)
+    now    = datetime.now(timezone.utc)
+    cutoff = now - timedelta(seconds=lookback_seconds)
 
     try:
         missed: list = []
@@ -3515,7 +3546,7 @@ async def catchup_missed_messages(client, source, lookback_seconds: int = 1800) 
 
         # Chronologisch verarbeiten (iter_messages liefert newest-first)
         missed.reverse()
-        log.info(f"Catchup: {len(missed)} Nachricht(en) im 60s-Fenster gefunden → prüfe …")
+        log.info(f"Catchup: {len(missed)} Nachricht(en) im {lookback_seconds//60}-Min-Fenster gefunden → prüfe …")
 
         executed: list[str] = []
 
@@ -3533,10 +3564,24 @@ async def catchup_missed_messages(client, source, lookback_seconds: int = 1800) 
                 if _paused:
                     log.info(f"Catchup: Bot pausiert — Signal {symbol} ignoriert")
                     continue
-                log.info(f"Catchup: Signal {symbol} {sig.get('side')} wird nachgeholt …")
+
+                # Zeitvalidierung: Signal älter als 2h → abgelaufen (SYNORA-Strategie)
+                age_seconds = (now - msg_date).total_seconds()
+                if age_seconds > SIGNAL_VALIDITY_SECONDS:
+                    age_min = int(age_seconds // 60)
+                    log.info(f"Catchup: Signal {symbol} ist {age_min} Min alt — abgelaufen (Max. 120 Min)")
+                    tg_system(
+                        f"⏰ <b>SYNORA Catchup</b>: Signal <b>{symbol}</b> abgelaufen\n"
+                        f"Alter: {age_min} Min | Max. erlaubt: 120 Min (SYNORA-Strategie)\n"
+                        f"Trade wurde <b>nicht</b> ausgeführt."
+                    )
+                    continue
+
+                age_min = int(age_seconds // 60)
+                log.info(f"Catchup: Signal {symbol} {sig.get('side')} ({age_min} Min alt) wird nachgeholt …")
                 tg_system(
                     f"⏱ <b>SYNORA Catchup</b>: Signal <b>{symbol}</b> "
-                    f"({sig.get('side')}) während Neustart verpasst — führe jetzt aus."
+                    f"({sig.get('side')}, {age_min} Min alt) während Neustart verpasst — führe jetzt aus."
                 )
                 await execute_signal(sig)
                 executed.append(f"Signal {symbol} {sig.get('side')}")
@@ -3657,7 +3702,7 @@ async def main() -> None:
             return
 
     # ── Startup-Catchup: verpasste Nachrichten der letzten 60s ──
-    await catchup_missed_messages(client, source, lookback_seconds=1800)
+    await catchup_missed_messages(client, source, lookback_seconds=SIGNAL_VALIDITY_SECONDS)
 
     log.info("Warte auf Signale …")
     await client.run_until_disconnected()
