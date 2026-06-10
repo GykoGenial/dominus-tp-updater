@@ -945,6 +945,21 @@ def bingx_place_limit_order(symbol: str, side: str, qty: float, price: float) ->
     })
 
 
+def bingx_place_tp_order(symbol: str, side: str, qty: float, price: float) -> dict:
+    """Platziert eine Reduce-Only Limit-Order als Teil-TP (Modell 3)."""
+    close_side = "SELL" if side == "LONG" else "BUY"
+    return bingx_post("/openApi/swap/v2/trade/order", {
+        "symbol":       symbol,
+        "side":         close_side,
+        "positionSide": side,
+        "type":         "LIMIT",
+        "quantity":     bingx_fmt_qty(symbol, qty),
+        "price":        bingx_fmt_price(symbol, price),
+        "timeInForce":  "GTC",
+        "reduceOnly":   "true",
+    })
+
+
 def bingx_set_sl(symbol: str, side: str, sl_price: float) -> dict:
     close_side = "SELL" if side == "LONG" else "BUY"
     return bingx_post("/openApi/swap/v2/trade/order", {
@@ -1214,6 +1229,23 @@ def place_limit_order(symbol: str, side: str, qty: float, price: float) -> dict:
         "price":       fmt_price(symbol, price),
         "timeInForce": "GTC",
         "reduceOnly":  False,
+        "closeOnTrigger": False,
+    })
+    return res
+
+
+def place_tp_order(symbol: str, side: str, qty: float, price: float) -> dict:
+    """Platziert eine Reduce-Only Limit-Order als Teil-TP (Modell 3)."""
+    close_side = "Sell" if side == "LONG" else "Buy"
+    res = bybit_post("/v5/order/create", {
+        "category":       BYBIT_CATEGORY,
+        "symbol":         symbol,
+        "side":           close_side,
+        "orderType":      "Limit",
+        "qty":            fmt_qty(symbol, qty),
+        "price":          fmt_price(symbol, price),
+        "timeInForce":    "GTC",
+        "reduceOnly":     True,
         "closeOnTrigger": False,
     })
     return res
@@ -3086,7 +3118,53 @@ async def fix_trade(symbol: str) -> str:
     else:
         fixes.append(f"DCA2 @ {dca2} ✓ (vorhanden)")
 
-    # ── 4. Modell-3-Status sicherstellen ─────────────────────────
+    # ── 4. TP-Orders für ausstehende Modell-3-Stufen setzen ──────
+    if SYNORA_PROFIT_MODEL == 3:
+        initial_qty = float(trade.get("qty_total_initial", pos_size))
+
+        # Reduce-only TP-Orders: nur für noch nicht abgeschlossene Stufen
+        # und nur wenn noch keine Order in der Nähe des TP-Preises existiert
+        for pct, payout, _ in DYNAMIC_MODEL_LEVELS:
+            if pct in levels_done:
+                continue   # Stufe bereits abgeschlossen
+
+            tp_price   = calc_tp_price(side, avg_price, pct, lev)
+            qty_close  = initial_qty * payout / 100.0
+
+            # Qty auf Exchange-Precision runden
+            if exchange == "bybit":
+                qty_close = snap_qty(symbol, qty_close) if qty_close > 0 else 0
+                price_fmt = fmt_price(symbol, tp_price)
+            else:
+                step = _bingx_qty_step_cache.get(ex_sym, 0.001)
+                qty_close = math.floor(qty_close / step) * step
+                price_fmt = bingx_fmt_price(ex_sym, tp_price)
+
+            if qty_close <= 0:
+                continue
+
+            # Prüfen ob bereits eine Order nahe diesem Preis existiert
+            if _price_present(tp_price):
+                fixes.append(f"TP +{pct}% @ {price_fmt} ✓ (vorhanden)")
+                continue
+
+            # Platzieren
+            if exchange == "bybit":
+                res_tp = place_tp_order(symbol, side, qty_close, tp_price)
+                ok_tp  = bybit_ok(res_tp)
+                err_tp = (res_tp.get("retMsg") or "?") if res_tp else "?"
+            else:
+                res_tp = bingx_place_tp_order(ex_sym, side, qty_close, tp_price)
+                ok_tp  = bingx_ok(res_tp)
+                err_tp = (res_tp.get("msg") or "?") if res_tp else "?"
+
+            if ok_tp:
+                qty_fmt = fmt_qty(symbol, qty_close) if exchange == "bybit" else bingx_fmt_qty(ex_sym, qty_close)
+                fixes.append(f"TP +{pct}% @ {price_fmt} × {qty_fmt} gesetzt ✓")
+            else:
+                errors.append(f"TP +{pct}%-Fehler: {err_tp}")
+
+    # ── 5. Modell-3-Status sicherstellen ─────────────────────────
     if SYNORA_PROFIT_MODEL == 3 and not trade.get("dynamic_model_active"):
         _state["trades"][symbol]["dynamic_model_active"] = True
         fixes.append("Profit-Modell 3 aktiviert ✓")
