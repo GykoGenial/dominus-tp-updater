@@ -12829,6 +12829,23 @@ def main():
         save_state()
         log(f"  ✓ Ghost-State bereinigt und persistiert")
 
+    # ── Forum-Topics retroaktiv erstellen für Trades ohne Topic ─────────────
+    # Trades, die vor dem Forum-Feature eröffnet wurden, haben keinen Eintrag
+    # in _forum_topics → telegram_coin() würde ans Status-Topic fallen.
+    if _FORUM_ENABLED:
+        for _sym in list(new_trade_done.keys()):
+            if _sym in _active_syms:  # nur aktive Positionen
+                _existing_tid = int((_forum_topics.get(_sym) or {}).get("thread_id") or 0)
+                if not _existing_tid:
+                    _dir = (trade_data.get(_sym, {}) or {}).get("direction", "long")
+                    log(f"[Forum] Retroaktiv: Topic für {_sym} ({_dir}) wird erstellt...")
+                    try:
+                        _new_tid = _open_coin_topic(_sym, _dir)
+                        if _new_tid:
+                            log(f"[Forum] ✓ {_sym} → thread_id={_new_tid}")
+                    except Exception as _fe:
+                        log(f"[Forum] ✗ Topic-Erstellung {_sym} fehlgeschlagen: {_fe}")
+
     last_check_ms = int(time.time() * 1000)
 
     while True:

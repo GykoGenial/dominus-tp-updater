@@ -1455,6 +1455,15 @@ async def reconcile_trade_state(startup: bool = False) -> None:
         ex_sym     = trade.get("exchange_symbol", symbol)
         side       = trade["side"]
         lev        = int(trade.get("lev", 1))
+
+        # ── 0. Forum-Topic erstellen falls Trade vor Forum-Feature geöffnet ──
+        if _FORUM_ENABLED:
+            existing_tid = (_state.get("telegram_topics") or {}).get(symbol, {}).get("thread_id")
+            if not existing_tid:
+                new_tid = _open_coin_topic(symbol, side)
+                if new_tid:
+                    fixes.append(f"{symbol}: Forum-Topic nachträglich erstellt (thread_id={new_tid})")
+                    log.info(f"Reconcile: Forum-Topic für {symbol} erstellt (thread_id={new_tid})")
         entry      = float(trade.get("entry", 0))
         sl_state   = float(trade.get("sl", 0))
         dyn_active = trade.get("dynamic_model_active", False)
