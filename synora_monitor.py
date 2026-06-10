@@ -3337,7 +3337,7 @@ def handle_synora_command(text: str, chat_id) -> None:
             if not symbol.endswith("USDT"):
                 symbol += "USDT"
         tg_reply(chat_id, f"🔧 Korrigiere <b>{symbol}</b> …")
-        msg = await fix_trade(symbol)
+        msg = asyncio.run(fix_trade(symbol))
         tg_reply(chat_id, msg)
 
     elif cmd == "/hilfe":
