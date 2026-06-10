@@ -181,10 +181,15 @@ log = logging.getLogger("synora")
 _state: dict = {}
 
 def load_state() -> None:
-    global _state
+    global _state, _cmd_offset
     try:
         with open(SYNORA_STATE_FILE, "r") as f:
             _state = json.load(f)
+        # cmd_offset wiederherstellen damit Befehle nach Restart nicht nochmals ausgeführt werden
+        saved_offset = _state.get("_cmd_offset", 0)
+        if saved_offset:
+            _cmd_offset = saved_offset
+            log.info(f"cmd_offset wiederhergestellt: {_cmd_offset}")
         log.info(f"State geladen: {len(_state.get('trades', {}))} offene Trades")
     except FileNotFoundError:
         _state = {"trades": {}}
@@ -196,6 +201,7 @@ def load_state() -> None:
 def save_state() -> None:
     try:
         os.makedirs(os.path.dirname(SYNORA_STATE_FILE), exist_ok=True)
+        _state["_cmd_offset"] = _cmd_offset   # offset persistieren
         with open(SYNORA_STATE_FILE, "w") as f:
             json.dump(_state, f, indent=2, ensure_ascii=False)
     except Exception as e:
@@ -561,6 +567,7 @@ _balance_cache: dict = {"value": 0.0, "ts": 0.0}
 _main_loop = None   # wird in main() gesetzt, für Flask→Asyncio Bridge
 _paused    = False  # /pause → True, /resume → False
 _cmd_offset = 0     # getUpdates long-polling offset
+_fix_lock   = threading.Lock()   # verhindert parallele /fix-Ausführungen
 BALANCE_CACHE_TTL = 30   # Sekunden
 
 def get_available_balance() -> float:
@@ -3013,7 +3020,21 @@ async def fix_trade(symbol: str) -> str:
         avg_price = entry   # BingX: avg aus State
 
     if pos_size == 0:
-        return f"⚠️ <b>{symbol}</b>: Keine offene Position auf Exchange — nichts zu korrigieren."
+        # Ghost-Trade: Position auf Exchange weg → Orders stornieren + State bereinigen
+        exchange = trade.get("exchange", "bybit")
+        ex_sym   = trade.get("exchange_symbol", symbol)
+        if exchange == "bybit":
+            cancel_open_orders(symbol)
+        else:
+            bingx_cancel_open_orders(ex_sym)
+        _state.get("trades", {}).pop(symbol, None)
+        save_state()
+        return (
+            f"🧹 <b>SYNORA Ghost-Trade bereinigt: {symbol}</b>\n"
+            f"Keine offene Position auf Exchange gefunden.\n"
+            f"✅ Alle offenen Orders storniert\n"
+            f"✅ Trade aus State entfernt"
+        )
 
     # ── 2. Korrekten SL für aktuelles Stadium berechnen ──────────
     # Finde höchsten sl_offset aus abgeschlossenen Stufen
@@ -3163,6 +3184,8 @@ async def fix_trade(symbol: str) -> str:
                 fixes.append(f"TP +{pct}% @ {price_fmt} × {qty_fmt} gesetzt ✓")
             else:
                 errors.append(f"TP +{pct}%-Fehler: {err_tp}")
+
+            await asyncio.sleep(0.4)   # Rate-Limit-Schutz
 
     # ── 5. Modell-3-Status sicherstellen ─────────────────────────
     if SYNORA_PROFIT_MODEL == 3 and not trade.get("dynamic_model_active"):
@@ -3336,9 +3359,15 @@ def handle_synora_command(text: str, chat_id) -> None:
             symbol = parts[1].upper()
             if not symbol.endswith("USDT"):
                 symbol += "USDT"
-        tg_reply(chat_id, f"🔧 Korrigiere <b>{symbol}</b> …")
-        msg = asyncio.run(fix_trade(symbol))
-        tg_reply(chat_id, msg)
+        if not _fix_lock.acquire(blocking=False):
+            tg_reply(chat_id, "⏳ /fix läuft bereits — bitte kurz warten.")
+            return
+        try:
+            tg_reply(chat_id, f"🔧 Korrigiere <b>{symbol}</b> …")
+            msg = asyncio.run(fix_trade(symbol))
+            tg_reply(chat_id, msg)
+        finally:
+            _fix_lock.release()
 
     elif cmd == "/hilfe":
         tg_reply(chat_id,
@@ -3379,6 +3408,7 @@ async def poll_synora_commands() -> None:
                 continue
             for upd in data.get("result", []):
                 _cmd_offset = upd["update_id"] + 1
+                save_state()   # offset persistieren → kein Replay nach Restart
                 msg  = upd.get("message", {})
                 text = msg.get("text", "")
                 cid  = msg.get("chat", {}).get("id")
