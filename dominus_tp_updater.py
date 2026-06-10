@@ -3855,7 +3855,9 @@ def get_closed_pnl(symbol: str, since_ms: int) -> dict:
     tp_closes = []
     for f in close_fills:
         pnl_f = float(f.get("profit", 0) or 0)
-        size_f = float(f.get("size", 0) or 0)
+        # FIX17 v4.61: Bitget fill-records liefern Menge als "baseVolume", nicht "size"
+        # (identisches Muster wie in der fill-basierten Peak-Rekonstruktion, Zeile ~12401)
+        size_f = float(f.get("baseVolume", 0) or f.get("size", 0) or 0)
         price_f = float(f.get("price", 0) or 0)
         tp_closes.append({
             "size": size_f,
@@ -5743,9 +5745,13 @@ def verify_tp_orders(symbol: str, expected_count: int,
             time.sleep(15)
         try:
             orders  = _get_plan_orders(symbol)
+            # FIX17 v4.61: clientOid wird von Bitget in orders-plan-pending nicht immer
+            # zurückgegeben → der ORDER_PREFIX-Filter filterte alle eigenen TPs raus
+            # und lieferte stets 0/3 → FIX16 Auto-Repair feuerte unnötig.
+            # Korrektur: nur planType=="profit_plan" prüfen — _get_plan_orders() fragt
+            # bereits symbol-spezifisch ab, daher ist keine weitere clientOid-Prüfung nötig.
             dom_tps = [o for o in orders
-                       if o.get("planType") == "profit_plan"
-                       and (o.get("clientOid") or "").startswith(ORDER_PREFIX)]
+                       if o.get("planType") == "profit_plan"]
             active  = len(dom_tps)
             if active >= expected_count:
                 log(f"  ✓ TP-Verifikation: {active}/{expected_count} profit_plan aktiv")
@@ -5759,8 +5765,7 @@ def verify_tp_orders(symbol: str, expected_count: int,
     try:
         orders  = _get_plan_orders(symbol)
         dom_tps = [o for o in orders
-                   if o.get("planType") == "profit_plan"
-                   and (o.get("clientOid") or "").startswith(ORDER_PREFIX)]
+                   if o.get("planType") == "profit_plan"]
         active  = len(dom_tps)
     except Exception:
         active = 0
