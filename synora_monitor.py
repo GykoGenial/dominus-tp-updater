@@ -3020,19 +3020,57 @@ async def fix_trade(symbol: str) -> str:
         avg_price = entry   # BingX: avg aus State
 
     if pos_size == 0:
-        # Ghost-Trade: Position auf Exchange weg → Orders stornieren + State bereinigen
+        # Ghost-Trade: Position auf Exchange weg → PnL holen, CSV loggen, State bereinigen
         exchange = trade.get("exchange", "bybit")
         ex_sym   = trade.get("exchange_symbol", symbol)
+
+        # Orders stornieren
         if exchange == "bybit":
             cancel_open_orders(symbol)
         else:
             bingx_cancel_open_orders(ex_sym)
+
+        # Letzten abgeschlossenen Trade von Exchange holen
+        closed_pnl  = 0.0
+        close_price = 0.0
+        if exchange == "bybit":
+            pnl_res   = bybit_get("/v5/position/closed-pnl", {
+                "category": BYBIT_CATEGORY, "symbol": symbol, "limit": "1",
+            })
+            pnl_items = (pnl_res.get("result") or {}).get("list") or []
+            if pnl_items:
+                p           = pnl_items[0]
+                closed_pnl  = float(p.get("closedPnl",    0) or 0)
+                close_price = float(p.get("avgExitPrice", 0) or 0)
+        else:
+            closed_pnl, close_price = bingx_get_closed_pnl(ex_sym)
+
+        outcome = _determine_outcome(trade, close_price) if close_price else "SL"
+
+        # In CSV archivieren
+        csv_log_synora_trade({
+            "opened_at":   trade.get("opened_at", ""),
+            "closed_at":   datetime.now(timezone.utc).isoformat(),
+            "symbol":      symbol,
+            "side":        trade.get("side", ""),
+            "lev":         trade.get("lev", 1),
+            "entry":       trade.get("entry", 0),
+            "sl":          trade.get("sl", 0),
+            "tp":          trade.get("tp", 0),
+            "budget_usdt": trade.get("budget_usdt", 0),
+            "close_price": round(close_price, 6),
+            "pnl_usdt":    round(closed_pnl,  4),
+            "outcome":     outcome,
+        })
+
         _state.get("trades", {}).pop(symbol, None)
         save_state()
+        pnl_str = f"{'+' if closed_pnl >= 0 else ''}{closed_pnl:.2f}"
         return (
             f"🧹 <b>SYNORA Ghost-Trade bereinigt: {symbol}</b>\n"
             f"Keine offene Position auf Exchange gefunden.\n"
             f"✅ Alle offenen Orders storniert\n"
+            f"✅ Trade archiviert: {outcome} @ {close_price:.6g} | P&amp;L: <b>{pnl_str} USDT</b>\n"
             f"✅ Trade aus State entfernt"
         )
 
