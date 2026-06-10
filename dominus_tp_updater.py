@@ -10137,9 +10137,12 @@ def poll_telegram_commands():
         if not msg:
             continue
 
-        # Sicherheit: nur eigene Chat-ID
+        # Sicherheit: nur eigene Chat-ID oder Forum-Gruppe
         chat_id = str(msg.get("chat", {}).get("id", ""))
-        if chat_id != str(TELEGRAM_CHAT_ID):
+        _allowed_chats = {str(TELEGRAM_CHAT_ID)}
+        if TELEGRAM_FORUM_GROUP_ID:
+            _allowed_chats.add(str(TELEGRAM_FORUM_GROUP_ID))
+        if chat_id not in _allowed_chats:
             continue
 
         # v4.34 — Document-Upload: nur mit Caption /restore_trades verarbeiten.
