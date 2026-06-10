@@ -3036,16 +3036,18 @@ async def catchup_missed_messages(client, source, lookback_seconds: int = 1800) 
 
     try:
         missed: list = []
-        async for msg in client.iter_messages(source, limit=30):
+        # limit=None → Telethon iteriert bis break; die Datum-Prüfung stoppt
+        # den Loop sobald wir ausserhalb des Fensters sind
+        async for msg in client.iter_messages(source, limit=None):
             if not msg.date:
                 continue
-            msg_date = msg.date.replace(tzinfo=_tz.utc) if msg.date.tzinfo is None else msg.date
+            msg_date = msg.date if msg.date.tzinfo else msg.date.replace(tzinfo=timezone.utc)
             if msg_date < cutoff:
                 break
             missed.append((msg_date, msg.message or ""))
 
         if not missed:
-            log.info("Catchup: Keine Nachrichten in den letzten 60s — nichts nachzuholen.")
+            log.info(f"Catchup: Keine Nachrichten in den letzten {lookback_seconds//60} Min — nichts nachzuholen.")
             return
 
         # Chronologisch verarbeiten (iter_messages liefert newest-first)
