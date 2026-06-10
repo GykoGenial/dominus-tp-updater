@@ -4469,7 +4469,7 @@ def set_sl_harsi(symbol: str, direction: str, harsi_price: float, cur_size: floa
 
         prev_sl_str = f"{current_sl:.5f}" if current_sl > 0 else "—"
         log(f"  ✓ Harsi-SL gesetzt: {sl_str} USDT ({symbol})")
-        telegram(
+        telegram_coin(symbol,
             f"📉 <b>Harsi-Ausstiegslinie — {symbol}</b>\n"
             f"SL → {sl_str} USDT  (vorher: {prev_sl_str})\n"
             f"━━━━━━━━━━\n"
@@ -4479,7 +4479,7 @@ def set_sl_harsi(symbol: str, direction: str, harsi_price: float, cur_size: floa
         )
     else:
         log(f"  ✗ Harsi-SL fehlgeschlagen: {result.get('msg', result)}")
-        telegram(f"❌ <b>Harsi-SL fehlgeschlagen — {symbol}</b>\nBitte SL manuell prüfen!")
+        telegram_system(f"❌ <b>Harsi-SL fehlgeschlagen — {symbol}</b>\nBitte SL manuell prüfen!")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -4728,10 +4728,10 @@ def set_sl_sling(symbol: str, direction: str, pivot_price: float,
         if voided:
             msg_lines += ["", "🧹 <b>DCA Auto-Void:</b>"] + [f"  • {v}" for v in voided]
             msg_lines.append("  (SL überschreitet DCA — DCA-im-Gewinn unmöglich)")
-        telegram("\n".join(msg_lines))
+        telegram_coin(symbol, "\n".join(msg_lines))
     else:
         log(f"  ✗ Sling-SL fehlgeschlagen: {result.get('msg', result)}")
-        telegram(f"❌ <b>Sling-SL fehlgeschlagen — {symbol}</b>\nBitte SL manuell prüfen!")
+        telegram_system(f"❌ <b>Sling-SL fehlgeschlagen — {symbol}</b>\nBitte SL manuell prüfen!")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -5105,15 +5105,14 @@ def execute_trade_order(symbol: str, direction: str, leverage: int,
         err = sl_res.get("msg", str(sl_res))
         log(f"  ✗ PANIC: SL-Set fehlgeschlagen — Position offen ohne SL! {err}")
         try:
-            telegram(
+            telegram_system(
                 f"🚨 <b>PANIC — {symbol}</b>\n"
                 f"Market-Order wurde platziert, aber SL-Set "
                 f"<b>fehlgeschlagen</b>!\n\n"
                 f"Position: {direction.upper()} {filled_qty} @ {avg_price}\n"
                 f"Geplanter SL: {sl_str} USDT\n"
                 f"Fehler: {err}\n\n"
-                f"⚠️ <b>SL jetzt manuell auf Bitget setzen!</b>",
-                reply_markup=build_setup_buttons(symbol),
+                f"⚠️ <b>SL jetzt manuell auf Bitget setzen!</b>"
             )
         except Exception:
             pass
@@ -5315,7 +5314,7 @@ def send_deviation_warnings(
             f"⚠️ {icon} <b>Abweichungen erkannt — {symbol}</b>\n"
             f"━━━━━━━━━━━━\n"
         )
-        telegram(header + "\n\n".join(warnings))
+        telegram_system(header + "\n\n".join(warnings))
         log(f"  ⚠ Abweichungs-Warnung gesendet ({len(warnings)} Punkt(e))")
 
 
@@ -5591,7 +5590,7 @@ def setup_new_trade(pos: dict):
         log(f"[mark_trade_taken] {ex}")
     if not dca_results:
         log(f"  ⚠ DCA-Platzierung komplett fehlgeschlagen — /refresh {symbol} zum Nachholen")
-        telegram(
+        telegram_system(
             f"⚠️ <b>DCA fehlgeschlagen — {symbol}</b>\n"
             f"Beide DCA-Orders konnten nicht gesetzt werden.\n"
             f"Bitte <b>/refresh {symbol}</b> ausführen um sie nachzuholen."
@@ -5778,7 +5777,7 @@ def verify_tp_orders(symbol: str, expected_count: int,
            f"Erwartet: {expected_count} profit_plan | Aktiv: {active}\n"
            f"FIX16: Auto-Repair wird in 5s gestartet...")
     log(msg.replace("<b>", "").replace("</b>", ""))
-    telegram(msg)
+    telegram_system(msg)
     return False
 
 
@@ -5883,7 +5882,7 @@ def _update_tp_for_position_impl(pos: dict, reason: str):
                 _verify_ok = True
             else:
                 log(f"  ✗ FIX16 Auto-Repair fehlgeschlagen — /refresh empfohlen")
-                telegram(
+                telegram_system(
                     f"❌ <b>Auto-Repair fehlgeschlagen — {symbol}</b>\n"
                     f"TPs konnten nach Verifikationsfehler nicht neu gesetzt werden.\n"
                     f"Bitte /refresh senden oder manuell prüfen!"
@@ -5926,7 +5925,7 @@ def _update_tp_for_position_impl(pos: dict, reason: str):
         status = "✓ Alle 4" if count == 4 else f"⚠ {count}/4"
         log(f"  {status} TPs für {symbol} gesetzt und verifiziert.")
         sl_info = f"{known_sl} USDT" if known_sl > 0 else "nicht ermittelbar"
-        telegram(
+        telegram_coin(symbol,
             f"♻️ {dir_icon(direction)} <b>TPs nach DCA — {symbol}</b>\n"
             f"Richtung: {dir_icon(direction)} {direction.upper()} | Hebel: {leverage}x\n"
             f"Neuer Avg: {avg} USDT\n"
@@ -6789,7 +6788,7 @@ def flush_entries() -> None:
     except Exception as ex:
         log(f"[flush_entries] Fehler: {ex}")
         try:
-            telegram(f"❌ <b>Entry-Queue Fehler</b>\n<code>{html.escape(str(ex))}</code>")
+            telegram_system(f"❌ <b>Entry-Queue Fehler</b>\n<code>{html.escape(str(ex))}</code>")
         except Exception:
             pass
 
@@ -12295,7 +12294,7 @@ def check_and_repair_position(pos: dict):
                     log(f"  ✗ SL auf Entry fehlgeschlagen: {res.get('msg', res)}")
             else:
                 log(f"  ⚠ Mark {mark} bereits hinter Entry {avg} — SL auf Entry nicht setzbar")
-                telegram(f"⚠️ <b>{symbol}</b>: Position im Verlust, SL manuell setzen!")
+                telegram_system(f"⚠️ <b>{symbol}</b>: Position im Verlust, SL manuell setzen!")
 
         elif pnl > 0:
             # Position im Gewinn, kein SL gefunden — SL MINDESTENS auf Entry setzen
@@ -12596,7 +12595,7 @@ def check_and_repair_position(pos: dict):
         # Kein automatischer Fix (Sizing unklar), stattdessen Telegram-Warnung.
         log(f"  ⚠ {n_dca}/{n_expected_open} DCA-Orders offen "
             f"({n_dca_filled} gefüllt, {n_expected_open - n_dca} fehlen) — manuelle Prüfung empfohlen")
-        telegram(
+        telegram_system(
             f"⚠️ <b>DCA-Check — {symbol}</b>\n"
             f"{n_dca_filled}/2 DCAs bereits gefüllt, nur {n_dca}/{n_expected_open} "
             f"offene DCA-Orders gefunden.\n"
@@ -12607,7 +12606,7 @@ def check_and_repair_position(pos: dict):
         log(f"  ⚠ Nur {n_dca}/2 DCA-Orders vorhanden → fehlende setzen")
         if sl_price == 0:
             log("  Kein SL-Preis bekannt — DCA-Platzierung übersprungen")
-            telegram(
+            telegram_system(
                 f"⚠️ <b>DCA fehlt — {symbol}</b>\n"
                 f"Kein SL-Preis bekannt, DCAs konnten nicht gesetzt werden.\n"
                 f"Bitte DCA-Orders manuell platzieren."
@@ -12621,7 +12620,7 @@ def check_and_repair_position(pos: dict):
             )
             log(f"  {len(dca_result)}/2 DCAs gesetzt")
             if dca_result:
-                telegram(
+                telegram_coin(symbol,
                     f"🔧 <b>DCAs repariert — {symbol}</b>\n"
                     f"Script-Start: {n_dca}/2 DCA-Orders gefehlt\n"
                     + "\n".join(dca_result)
