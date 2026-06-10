@@ -1239,6 +1239,66 @@ def _current_profit_pct(side: str, entry: float, current_price: float, lev: int)
     return price_move_pct
 
 
+async def _check_dca_fills(symbol: str, trade: dict, pos_size: float, avg_price: float) -> None:
+    """
+    Erkennt gefüllte DCA-Limit-Orders anhand der tatsächlichen Positionsgrösse.
+    Sendet Benachrichtigung ins Coin-Topic wenn DCA1 oder DCA2 gefüllt wurde.
+    """
+    side      = trade.get("side", "LONG")
+    lev       = int(trade.get("lev", 1))
+    exchange  = trade.get("exchange", "bybit")
+    ex_sym    = trade.get("exchange_symbol", symbol)
+    qty_entry = float(trade.get("qty_entry", 0))
+    qty_dca1  = float(trade.get("qty_dca1",  0))
+    qty_dca2  = float(trade.get("qty_dca2",  0))
+    sl        = float(trade.get("sl", 0))
+    notified  = set(trade.get("dca_fills_notified", []))
+
+    # Wenn DCAs bereits storniert wurden, kein Check mehr nötig
+    if trade.get("dca_cancelled"):
+        return
+
+    def _avg_str() -> str:
+        if avg_price > 0:
+            return fmt_price(symbol, avg_price) if exchange == "bybit" else bingx_fmt_price(ex_sym, avg_price)
+        return "—"
+
+    def _sl_dist() -> str:
+        if avg_price > 0 and sl > 0:
+            return f" ({abs(sl - avg_price) / avg_price * 100:.2f}%)"
+        return ""
+
+    changed = False
+
+    # ── DCA1 fill prüfen ─────────────────────────────────────────
+    if "dca1" not in notified and qty_dca1 > 0:
+        if pos_size >= qty_entry + qty_dca1 * 0.7:
+            tg_coin(symbol,
+                f"🔄 <b>SYNORA DCA1 gefüllt</b>\n"
+                f"<b>{symbol}</b> {side} {lev}x\n"
+                f"Neuer Avg: {_avg_str()}\n"
+                f"SL (unverändert): {sl:.6g}{_sl_dist()}"
+            )
+            _state["trades"][symbol].setdefault("dca_fills_notified", []).append("dca1")
+            notified.add("dca1")
+            changed = True
+
+    # ── DCA2 fill prüfen ─────────────────────────────────────────
+    if "dca2" not in notified and qty_dca2 > 0:
+        if pos_size >= qty_entry + qty_dca1 + qty_dca2 * 0.7:
+            tg_coin(symbol,
+                f"🔄 <b>SYNORA DCA2 gefüllt</b>\n"
+                f"<b>{symbol}</b> {side} {lev}x\n"
+                f"Neuer Avg: {_avg_str()}\n"
+                f"SL (unverändert): {sl:.6g}{_sl_dist()}"
+            )
+            _state["trades"][symbol].setdefault("dca_fills_notified", []).append("dca2")
+            changed = True
+
+    if changed:
+        save_state()
+
+
 async def _verify_sl(symbol: str, trade: dict) -> None:
     """
     Liest den tatsächlich auf der Exchange gesetzten SL zurück.
@@ -1286,14 +1346,14 @@ async def _verify_sl(symbol: str, trade: dict) -> None:
         if ok_fix:
             log.info(f"SL-Monitor {symbol}: SL auf {sl_state} korrigiert ✓")
             if sl_live <= 0:
-                tg_system(
+                tg_coin(symbol,
                     f"🚨 <b>SYNORA: SL fehlte!</b>\n"
                     f"{symbol} {side} — SL war nicht gesetzt!\n"
                     f"Automatisch korrigiert auf {sl_state}"
                 )
         else:
             log.error(f"SL-Monitor {symbol}: Korrektur fehlgeschlagen! {res_fix}")
-            tg_system(
+            tg_coin(symbol,
                 f"🚨 <b>SYNORA: SL-Korrektur FEHLGESCHLAGEN</b>\n"
                 f"{symbol} — SL={sl_state} nicht gesetzt!\n"
                 f"Bitte manuell setzen!"
@@ -1356,8 +1416,8 @@ async def _cancel_dca_if_sl_at_be(symbol: str, trade: dict) -> None:
         cancel_open_orders(symbol)
     else:
         bingx_cancel_open_orders(ex_sym)
-    tg_system(
-        f"🚨 <b>SYNORA: DCA-Orders storniert</b>\n"
+    tg_coin(symbol,
+        f"ℹ️ <b>SYNORA: DCA-Orders storniert</b>\n"
         f"<b>{symbol}</b> — {reason}\n"
         f"{len(dca_open)} DCA-Limit-Order(s) waren noch offen — automatisch storniert."
     )
@@ -1499,8 +1559,8 @@ async def reconcile_trade_state(startup: bool = False) -> None:
                 _state["trades"][symbol]["dca_cancelled"] = True
                 fixes.append(f"{symbol}: {len(dca_open)} DCA-Order(s) storniert ({reason})")
                 log.info(f"Reconcile: DCA storniert für {symbol} — {reason}")
-                tg_system(
-                    f"🚨 <b>SYNORA: DCA-Orders storniert</b>\n"
+                tg_coin(symbol,
+                    f"ℹ️ <b>SYNORA: DCA-Orders storniert</b>\n"
                     f"<b>{symbol}</b> — {reason}\n"
                     f"{len(dca_open)} Limit-Order(s) waren noch offen!"
                 )
@@ -2076,10 +2136,12 @@ async def check_closed_positions() -> None:
                         "category": BYBIT_CATEGORY, "symbol": symbol,
                     })
                     items = (res.get("result") or {}).get("list") or []
-                    pos_size = 0.0
+                    pos_size  = 0.0
+                    avg_price = 0.0
                     for item in items:
                         if item.get("symbol") == symbol:
-                            pos_size = float(item.get("size", "0") or "0")
+                            pos_size  = float(item.get("size",     "0") or "0")
+                            avg_price = float(item.get("avgPrice", "0") or "0")
                             break
 
                     # Migration: alter State ohne 'exchange'-Feld
@@ -2094,9 +2156,12 @@ async def check_closed_positions() -> None:
                             save_state()
                             continue   # Position noch offen auf BingX
                 else:
-                    pos_size = bingx_get_position_size(ex_sym, trade["side"])
+                    pos_size  = bingx_get_position_size(ex_sym, trade["side"])
+                    avg_price = 0.0   # BingX: avg_price nicht im size-Call enthalten
 
                 if pos_size > 0:
+                    # ── DCA-Fill-Erkennung ────────────────────────────────────────
+                    await _check_dca_fills(symbol, trade, pos_size, avg_price)
                     # ── SL-Monitor: prüfe ob SL auf Exchange korrekt gesetzt ist ──
                     await _verify_sl(symbol, trade)
                     # ── DCA stornieren falls SL auf Break-Even (Reconcile) ───────
