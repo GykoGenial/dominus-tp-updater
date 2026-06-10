@@ -1561,6 +1561,12 @@ harsi_warn_buffer_lock  = __import__("threading").Lock()
 HARSI_WARN_BUFFER_SEC   = _env_int("HARSI_WARN_BUFFER_SEC", 60)  # 60s Sammelzeit
 _harsi_warn_timer: object = None   # aktiver threading.Timer (oder None)
 
+# BTC/T2-Alignment-Block-Buffer: sammelt geblockte Coins, sendet gebündelt
+btc_t2_block_buffer:      list = []
+btc_t2_block_buffer_lock  = __import__("threading").Lock()
+BTC_T2_BLOCK_BUFFER_SEC   = _env_int("BTC_T2_BLOCK_BUFFER_SEC", 5)  # 5s Sammelzeit
+_btc_t2_block_timer: object = None   # aktiver threading.Timer (oder None)
+
 trailing_sl_level: dict = {}  # {symbol: int} — 0=initial, 1=Entry(BE), 2=no-move(TP2), 3=+5%ROI(TP3), 4=+15%ROI(TP4), 5=+25%ROI(TP5)
 
 # Daily P&L Report — Aufzeichnung abgeschlossener Trades
@@ -10369,6 +10375,54 @@ def flush_harsi_warn_buffer():
     log(f"HARSI-Warn-Zusammenfassung gesendet: {len(longs)} Long, {len(shorts)} Short")
 
 
+def flush_btc_t2_block_buffer():
+    """Sendet geblockte BTC/T2-Alignment-Coins als gebündelte Telegram-Nachricht."""
+    global btc_t2_block_buffer
+    with btc_t2_block_buffer_lock:
+        if not btc_t2_block_buffer:
+            return
+        items             = list(btc_t2_block_buffer)
+        btc_t2_block_buffer = []
+
+    longs  = [i for i in items if i["direction"] == "long"]
+    shorts = [i for i in items if i["direction"] == "short"]
+    n      = len(items)
+
+    lines = [
+        f"⛔ <b>BTC/T2 Alignment — kein Trade ({n} Coin{'s' if n > 1 else ''})</b>",
+        "━" * 12,
+        "",
+    ]
+    if longs:
+        opp_icon = "🔴"
+        dir_icon = "🟢"
+        lines.append(f"🟢 <b>LONG geblockt:</b>")
+        for item in longs:
+            lines.append(f"  • <b>{item['symbol']}</b>  @ {item['entry']}")
+        lines.append(
+            f"\nBTC oder Total2 Impuls zeigt {opp_icon} — stimmt <b>nicht</b> mit "
+            f"Long-Richtung überein."
+        )
+        lines.append(f"Warte bis BTC + Total2 ebenfalls {dir_icon} zeigen.")
+        lines.append("")
+    if shorts:
+        opp_icon = "🟢"
+        dir_icon = "🔴"
+        lines.append(f"🔴 <b>SHORT geblockt:</b>")
+        for item in shorts:
+            lines.append(f"  • <b>{item['symbol']}</b>  @ {item['entry']}")
+        lines.append(
+            f"\nBTC oder Total2 Impuls zeigt {opp_icon} — stimmt <b>nicht</b> mit "
+            f"Short-Richtung überein."
+        )
+        lines.append(f"Warte bis BTC + Total2 ebenfalls {dir_icon} zeigen.")
+        lines.append("")
+
+    lines.append('📖 <i>Dominus Kap. 10: „Keine Übereinstimmung = Kein Trade.“</i>')
+    telegram("\n".join(lines))
+    log(f"BTC/T2-Block-Zusammenfassung gesendet: {len(longs)} Long, {len(shorts)} Short")
+
+
 # ── Wöchentlicher Report (v4.38) ──────────────────────────────────────────────
 
 weekly_report_sent_week: str = ""   # "YYYY-Www" — verhindert Doppel-Senden
@@ -11495,17 +11549,31 @@ def start_webhook_server():
         # → kein Trade, Telegram-Warnung, sofort return.
         # ─────────────────────────────────────────────────────────────
         if BTC_T2_ALIGNMENT_FILTER and btc_t2_warn_val == 1:
-            _dir_icon = "🟢" if direction == "long" else "🔴"
-            _opp_icon = "🔴" if direction == "long" else "🟢"
             log(f"  ⛔ BTC/T2-Alignment-Filter: {symbol} {direction} geblockt (btc_t2_warn=1)")
-            telegram(
-                f"⛔ <b>BTC/T2 Alignment — kein Trade</b>\n"
-                f"{_dir_icon} <b>{symbol} {direction.upper()}</b>\n\n"
-                f"BTC oder Total2 Impuls zeigt {_opp_icon} — stimmt <b>nicht</b> mit "
-                f"der Trade-Richtung überein.\n\n"
-                f"📖 <i>Dominus Kap. 10: „Keine Übereinstimmung = Kein Trade.“</i>\n"
-                f"Warte bis BTC + Total2 Impuls ebenfalls {_dir_icon} zeigen."
-            )
+            # In Buffer aufnehmen — mehrere gleichzeitige Signale → eine gebündelte Nachricht
+            global _btc_t2_block_timer
+            with btc_t2_block_buffer_lock:
+                # Duplikate vermeiden
+                btc_t2_block_buffer[:] = [
+                    x for x in btc_t2_block_buffer
+                    if not (x["symbol"] == symbol and x["direction"] == direction)
+                ]
+                btc_t2_block_buffer.append({
+                    "symbol":    symbol,
+                    "direction": direction,
+                    "entry":     entry,
+                })
+            # Alten Timer canceln, neuen starten (Debounce: BTC_T2_BLOCK_BUFFER_SEC)
+            if _btc_t2_block_timer is not None:
+                try:
+                    _btc_t2_block_timer.cancel()
+                except Exception:
+                    pass
+            import threading as _thr2
+            _btc_t2_block_timer = _thr2.Timer(BTC_T2_BLOCK_BUFFER_SEC, flush_btc_t2_block_buffer)
+            _btc_t2_block_timer.daemon = True
+            _btc_t2_block_timer.start()
+            log(f"  BTC/T2-Block-Buffer +1: {symbol} {direction} — Flush in {BTC_T2_BLOCK_BUFFER_SEC}s")
             return
 
         # ─────────────────────────────────────────────────────────────
