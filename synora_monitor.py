@@ -1838,6 +1838,21 @@ async def execute_signal(sig: dict) -> None:
     ref_price = mark if mark > 0 else entry
     log.info(f"Mark-Preis ({exchange_label}): {ref_price} | Budget: {budget:.2f} USDT")
 
+    # 2b. Signal-Preis Toleranz prüfen (max. 3% Abweichung gemäss Synora-Strategie)
+    if mark > 0:
+        deviation_pct = abs(ref_price - entry) / entry * 100
+        tolerance_exceeded = (side == "LONG" and ref_price > entry * 1.03) or \
+                             (side == "SHORT" and ref_price < entry * 0.97)
+        if tolerance_exceeded:
+            tg_system(
+                f"⚠️ <b>SYNORA: Toleranz überschritten — {symbol}</b>\n"
+                f"Signal-Preis: {entry} | Mark jetzt: {ref_price:.6g}\n"
+                f"Abweichung: {deviation_pct:.1f}% (Max. 3%) — Trade abgebrochen"
+            )
+            log.warning(f"Toleranz {deviation_pct:.1f}% > 3% für {symbol} — Trade abgebrochen")
+            return
+        log.info(f"Toleranz-Check OK: {deviation_pct:.1f}% Abweichung vom Signal-Preis")
+
     if budget < 5.0:
         tg_system(f"❌ SYNORA: Balance zu gering ({budget:.2f} USDT) — Trade abgebrochen")
         return
@@ -1961,13 +1976,19 @@ async def execute_signal(sig: dict) -> None:
         "dynamic_model_active": False,         # wird via UPDATE aktiviert
         "dynamic_levels_done":  [],            # bereits ausgeführte Stufen
     }
+    # 10. Profit-Modell 3 sofort aktivieren (kein UPDATE nötig)
+    if SYNORA_PROFIT_MODEL == 3:
+        _state["trades"][symbol]["dynamic_model_active"] = True
+
     save_state()
     _open_coin_topic(symbol, side)   # Forum-Topic für diesen Coin erstellen/öffnen
 
     # 9. Telegram-Benachrichtigung
-    sl_dist_pct = abs(sl - entry) / entry * 100
+    sl_dist_pct  = abs(sl - entry) / entry * 100
     qty_dca1_fmt = fmt_qty(symbol, qty_dca1) if exchange == "bybit" else bingx_fmt_qty(ex_sym, qty_dca1)
     qty_dca2_fmt = fmt_qty(symbol, qty_dca2) if exchange == "bybit" else bingx_fmt_qty(ex_sym, qty_dca2)
+
+    # Basis-Meldung
     tg_coin(
         symbol,
         f"🟣 <b>SYNORA Trade eröffnet</b> [{exchange_label}]\n"
@@ -1978,6 +1999,22 @@ async def execute_signal(sig: dict) -> None:
         f"DCA2: {dca2} × {qty_dca2_fmt} ({int(SPLIT_DCA2*100)}%)\n"
         f"Budget: {budget:.2f} USDT (live vom Sub-Account)"
     )
+
+    # Profit-Modell 3: Level-Tabelle sofort anzeigen
+    if SYNORA_PROFIT_MODEL == 3:
+        level_lines = []
+        for pct, payout, sl_off in DYNAMIC_MODEL_LEVELS:
+            tp_p     = calc_tp_price(side, entry, pct, lev)
+            sl_lbl   = f"SL→+{sl_off}%" if sl_off else ("SL→BE" if sl_off == 0 else "—")
+            price_fmt = fmt_price(symbol, tp_p) if exchange == "bybit" else bingx_fmt_price(ex_sym, tp_p)
+            level_lines.append(f"  +{pct:2d}% → {price_fmt} | {payout}% | {sl_lbl}")
+        tg_coin(
+            symbol,
+            f"📊 <b>Profit-Modell 3 aktiv</b>\n"
+            f"Mode: {SYNORA_MAX_GAIN_MODE} | Basis: {entry}\n"
+            f"<pre>" + "\n".join(level_lines) + "</pre>"
+        )
+        log.info(f"Profit-Modell 3 sofort aktiviert für {symbol}")
 
 
 async def handle_update(upd: dict) -> None:
