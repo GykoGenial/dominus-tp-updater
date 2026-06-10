@@ -967,14 +967,15 @@ PASSPHRASE = os.environ.get("PASSPHRASE", "")
 PRODUCT_TYPE = "usdt-futures"
 MARGIN_COIN  = "USDT"
 
-# DOMINUS Auszahlungsschema — asymmetrisch optimiert (+16% EV)
+# SYNORA Modell 3 Auszahlungsschema — 6 TP-Levels, progressiver Kapitalschutz
 TP1_ROI   = 0.10   # 10% ROI
-TP2_ROI   = 0.20   # 20% ROI
-TP3_ROI   = 0.30   # 30% ROI
-TP4_ROI   = 0.40   # 40% ROI
-# Asymmetrische Schliess-Grössen: weniger bei TP1 (bereits gesichert),
-# mehr bei TP3/TP4 (maximaler Gewinn)
-TP_CLOSE_PCTS = [0.15, 0.20, 0.25, 0.40]  # TP1/TP2/TP3/TP4-Anteil
+TP2_ROI   = 0.15   # 15% ROI
+TP3_ROI   = 0.20   # 20% ROI
+TP4_ROI   = 0.30   # 30% ROI
+TP5_ROI   = 0.40   # 40% ROI
+TP6_ROI   = 0.50   # 50% ROI
+# SYNORA Modell 3: 25/12.5/25/12.5/12.5/12.5% — TP1-TP5 Teilschliessung, TP6 Full-Close
+TP_CLOSE_PCTS = [0.25, 0.125, 0.25, 0.125, 0.125, 0.125]  # TP1-TP6
 
 # DCA-Platzierung relativ zu Entry→SL Abstand
 DCA1_RATIO = 1/3      # DCA1 bei 1/3 des Weges zum SL
@@ -1560,7 +1561,7 @@ harsi_warn_buffer_lock  = __import__("threading").Lock()
 HARSI_WARN_BUFFER_SEC   = _env_int("HARSI_WARN_BUFFER_SEC", 60)  # 60s Sammelzeit
 _harsi_warn_timer: object = None   # aktiver threading.Timer (oder None)
 
-trailing_sl_level: dict = {}  # {symbol: int} — 0=initial, 1=Entry, 2=TP1-Preis, 3=TP2-Preis
+trailing_sl_level: dict = {}  # {symbol: int} — 0=initial, 1=Entry(BE), 2=no-move(TP2), 3=+5%ROI(TP3), 4=+15%ROI(TP4), 5=+25%ROI(TP5)
 
 # Daily P&L Report — Aufzeichnung abgeschlossener Trades
 closed_trades: list = []
@@ -2750,22 +2751,22 @@ def place_tp_orders_bybit(symbol: str, avg: float, size: float,
     dec_p  = get_price_decimals_bybit(symbol)
     count  = 0
     prices = {}
-    tp_rois = [TP1_ROI, TP2_ROI, TP3_ROI, TP4_ROI]
+    tp_rois = [TP1_ROI, TP2_ROI, TP3_ROI, TP4_ROI, TP5_ROI, TP6_ROI]
     tp_pcts = TP_CLOSE_PCTS
 
-    # TP4 zuerst (position-level trading-stop)
-    tp4_price = calc_tp_price(avg, tp_rois[3], direction, leverage)
-    tp4_str   = round_price(tp4_price, dec_p)
-    res4 = _bybit_set_trading_stop(symbol, direction, tp_price=tp4_str)
-    if _bybit_ok(res4):
+    # TP6 zuerst (position-level trading-stop = Full Close)
+    tp6_price = calc_tp_price(avg, TP6_ROI, direction, leverage)
+    tp6_str   = round_price(tp6_price, dec_p)
+    res6 = _bybit_set_trading_stop(symbol, direction, tp_price=tp6_str)
+    if _bybit_ok(res6):
         count += 1
-        prices["tp4"] = tp4_price
-        log(f"  ✓ [Bybit] TP4 @ {tp4_str}")
+        prices["tp6"] = tp6_price
+        log(f"  ✓ [Bybit] TP6 Full Close @ {tp6_str}")
     else:
-        log(f"  ✗ [Bybit] TP4 fehlgeschlagen: {res4.get('retMsg', res4)}")
+        log(f"  ✗ [Bybit] TP6 fehlgeschlagen: {res6.get('retMsg', res6)}")
 
-    # TP1-TP3 als reduceOnly Trigger-Orders
-    for i, (roi, pct) in enumerate(zip(tp_rois[:3], tp_pcts[:3]), start=1):
+    # TP1-TP5 als reduceOnly Trigger-Orders (Teilschliessungen)
+    for i, (roi, pct) in enumerate(zip(tp_rois[:5], tp_pcts[:5]), start=1):
         tp_price = calc_tp_price(avg, roi, direction, leverage)
         tp_str   = round_price(tp_price, dec_p)
         qty      = snap_qty_bybit(symbol, size * pct)
@@ -3366,16 +3367,16 @@ def calc_optimal_leverage(entry: float, sl: float) -> int:
 
 def calc_rr(entry: float, sl: float, leverage: int, direction: str) -> float:
     """
-    R:R Ratio = TP4-Preisbewegung% / SL-Abstand%
-    TP4 bei 40% ROI: Preisbewegung = 0.40 / Hebel
+    R:R Ratio = TP6-Preisbewegung% / SL-Abstand%
+    TP6 bei 50% ROI: Preisbewegung = 0.50 / Hebel
     """
     if entry == 0 or sl == 0:
         return 0.0
     sl_dist_pct = abs(entry - sl) / entry * 100
-    tp4_move_pct = (TP4_ROI / leverage) * 100
+    tp6_move_pct = (TP6_ROI / leverage) * 100
     if sl_dist_pct == 0:
         return 0.0
-    return round(tp4_move_pct / sl_dist_pct, 2)
+    return round(tp6_move_pct / sl_dist_pct, 2)
 
 
 def kelly_recommendation(balance: float, winrate: float) -> dict:
@@ -3384,8 +3385,8 @@ def kelly_recommendation(balance: float, winrate: float) -> dict:
     b = Gewinn/Verlust Ratio (25% Gewinn / 25% Verlust = 1.0 bei ausgeglichenem R:R)
     f* = (p*b - q) / b
     """
-    avg_win  = sum(TP_CLOSE_PCTS[i] * [TP1_ROI, TP2_ROI, TP3_ROI, TP4_ROI][i]
-                   for i in range(4)) * 100  # % des Einsatzes
+    avg_win  = sum(TP_CLOSE_PCTS[i] * [TP1_ROI, TP2_ROI, TP3_ROI, TP4_ROI, TP5_ROI, TP6_ROI][i]
+                   for i in range(6)) * 100  # % des Einsatzes
     avg_loss = 25.0  # % bei SL
     b        = avg_win / avg_loss
     q        = 1 - winrate
@@ -3541,10 +3542,10 @@ def place_tp_orders(symbol: str, avg: float, size: float,
     count    = 0
     prices   = []
 
-    # ── TP4: Full Position Close via place-pos-tpsl ── ZUERST (FIX16 v4.54) ──
+    # ── TP6: Full Position Close via place-pos-tpsl ── ZUERST (FIX16 v4.54) ──
     # place-pos-tpsl cancelt bestehende profit_plan Orders auf Bitget.
-    # Daher TP4 VOR TP1-3 setzen — dann sind keine profit_plan Orders vorhanden.
-    tp4_raw = calc_tp_price(avg, TP4_ROI, direction, leverage)
+    # Daher TP6 VOR TP1-5 setzen — dann sind keine profit_plan Orders vorhanden.
+    tp4_raw = calc_tp_price(avg, TP6_ROI, direction, leverage)
     tp4_str = round_price(tp4_raw, decimals)
     tp4_val = float(tp4_str)
 
@@ -3552,7 +3553,7 @@ def place_tp_orders(symbol: str, avg: float, size: float,
                (direction == "short" and mark_price > 0 and tp4_val >= mark_price)
 
     if tp4_skip:
-        log(f"    ⏭ TP4 (40%) @ {tp4_str} bereits überschritten — übersprungen")
+        log(f"    ⏭ TP6 (50%) @ {tp4_str} bereits überschritten — übersprungen")
     else:
         # Aktuellen SL-Preis lesen um ihn mitzuschicken.
         current_sl = get_sl_price(symbol, direction)
@@ -3565,15 +3566,18 @@ def place_tp_orders(symbol: str, avg: float, size: float,
             _e   = float(_td.get("entry", 0))
             _lev = int(_td.get("leverage", 10))
             _dir = _td.get("direction", direction)
-            if _trl >= 3 and _e > 0:
-                current_sl = calc_tp_price(_e, TP2_ROI, _dir, _lev)
-                log(f"    SL aus Trailing Level 3 (TP2-Preis): {current_sl:.5f}")
-            elif _trl == 2 and _e > 0:
-                current_sl = calc_tp_price(_e, TP1_ROI, _dir, _lev)
-                log(f"    SL aus Trailing Level 2 (TP1-Preis): {current_sl:.5f}")
-            elif _trl == 1 and _e > 0:
+            if _trl >= 5 and _e > 0:
+                current_sl = calc_tp_price(_e, 0.25, _dir, _lev)
+                log(f"    SL aus Trailing Level 5 (+25% ROI): {current_sl:.5f}")
+            elif _trl >= 4 and _e > 0:
+                current_sl = calc_tp_price(_e, 0.15, _dir, _lev)
+                log(f"    SL aus Trailing Level 4 (+15% ROI): {current_sl:.5f}")
+            elif _trl >= 3 and _e > 0:
+                current_sl = calc_tp_price(_e, 0.05, _dir, _lev)
+                log(f"    SL aus Trailing Level 3 (+5% ROI): {current_sl:.5f}")
+            elif _trl >= 1 and _e > 0:
                 current_sl = _e
-                log(f"    SL aus Trailing Level 1 (Entry): {current_sl:.5f}")
+                log(f"    SL aus Trailing Level 1/2 (Entry/Break-Even): {current_sl:.5f}")
         if current_sl == 0 and symbol in trade_data:
             current_sl = trade_data[symbol].get("sl", 0)
             if current_sl > 0:
@@ -3597,11 +3601,11 @@ def place_tp_orders(symbol: str, avg: float, size: float,
 
         res4 = api_post("/api/v2/mix/order/place-pos-tpsl", body4)
         if res4.get("code") == "00000":
-            log(f"    ✓ TP4 Full Close @ {tp4_str} USDT (schliesst gesamte Restposition)")
+            log(f"    ✓ TP6 Full Close @ {tp4_str} USDT (schliesst gesamte Restposition)")
             count += 1
-            prices.append(f"TP4 Full Close: {tp4_str}")
+            prices.append(f"TP6 Full Close: {tp4_str}")
             _td = trade_data.setdefault(symbol, {})
-            _td["tp4"] = float(tp4_str)
+            _td["tp4"] = float(tp4_str)   # Feld-Name erhalten für Kompatibilität
             save_state()
             cache_invalidate()
         else:
@@ -3624,19 +3628,21 @@ def place_tp_orders(symbol: str, avg: float, size: float,
                     body4b["stopLossTriggerType"]  = "mark_price"
                 res4b = api_post("/api/v2/mix/order/place-pos-tpsl", body4b)
                 if res4b.get("code") == "00000":
-                    log(f"    ✓ TP4 Full Close @ {tp4_str2} USDT [retry OK]")
+                    log(f"    ✓ TP6 Full Close @ {tp4_str2} USDT [retry OK]")
                     count += 1
-                    prices.append(f"TP4 Full Close: {tp4_str2}")
+                    prices.append(f"TP6 Full Close: {tp4_str2}")
                     _td = trade_data.setdefault(symbol, {})
                     _td["tp4"] = float(tp4_str2)
                     save_state()
                     cache_invalidate()
 
-    # ── TP1–TP3: Teilschliessungen (nach TP4, FIX16 v4.54) ──────────────────
+    # ── TP1–TP5: Teilschliessungen (nach TP6, FIX16 v4.54) ──────────────────
     partial_tps = [
-        (TP1_ROI, "TP1 (10%)", TP_CLOSE_PCTS[0]),
-        (TP2_ROI, "TP2 (20%)", TP_CLOSE_PCTS[1]),
-        (TP3_ROI, "TP3 (30%)", TP_CLOSE_PCTS[2]),
+        (TP1_ROI, "TP1 (10%)",  TP_CLOSE_PCTS[0]),
+        (TP2_ROI, "TP2 (15%)",  TP_CLOSE_PCTS[1]),
+        (TP3_ROI, "TP3 (20%)",  TP_CLOSE_PCTS[2]),
+        (TP4_ROI, "TP4 (30%)",  TP_CLOSE_PCTS[3]),
+        (TP5_ROI, "TP5 (40%)",  TP_CLOSE_PCTS[4]),
     ]
 
     partial_tps_skipped = 0  # zählt übersprungene Teilschliessungen (Position zu klein)
@@ -3722,7 +3728,7 @@ def place_tp_orders(symbol: str, avg: float, size: float,
     # Warnung wenn Teilschliessungen wegen zu kleiner Position nicht setzbar waren
     if partial_tps_skipped > 0:
         warn_msg = (
-            f"⚠️ {symbol}: {partial_tps_skipped}/3 Teilschliessung(en) konnten nicht gesetzt werden "
+            f"⚠️ {symbol}: {partial_tps_skipped}/5 Teilschliessung(en) konnten nicht gesetzt werden "
             f"(Position {size} Kontrakte zu klein für Teilschliessung).\n"
             f"TP1–SL-Mechanismus greift nicht automatisch — SL manuell überwachen!"
         )
@@ -4343,8 +4349,8 @@ def set_sl_trailing(symbol: str, direction: str, sl_price: float, level: int,
         body_sl["stopSurplusTriggerType"]  = "mark_price"
         log(f"  TP4 @ {existing_tp4} wird mitgeführt")
 
-    tp_label   = {3: "TP3", 4: "TP4"}.get(level, f"TP{level}")
-    prev_label = {3: "TP1 (10% ROI)", 4: "TP2 (20% ROI)"}.get(level, "vorherigem TP")
+    tp_label   = {3: "TP3", 4: "TP4", 5: "TP5"}.get(level, f"TP{level}")
+    prev_label = {3: "+5% ROI", 4: "+15% ROI", 5: "+25% ROI"}.get(level, "vorherigem TP")
 
     result = api_post("/api/v2/mix/order/place-pos-tpsl", body_sl)
     if result.get("code") == "00000":
@@ -5692,9 +5698,9 @@ def tps_are_correct(existing: list, avg: float, total: float,
     if len(existing) == 0:
         return False  # Keine TPs → müssen gesetzt werden
 
-    # Erwartete TP-Preise berechnen
+    # Erwartete TP-Preise berechnen (TP1-TP5 = profit_plan, TP6 = Full-Close via pos-tpsl)
     expected_prices = []
-    for roi in [TP1_ROI, TP2_ROI, TP3_ROI, TP4_ROI]:
+    for roi in [TP1_ROI, TP2_ROI, TP3_ROI, TP4_ROI, TP5_ROI]:
         tp = calc_tp_price(avg, roi, direction, leverage)
         tp_str = round_price(tp, decimals)
         tp_val = float(tp_str)
@@ -5824,15 +5830,18 @@ def _update_tp_for_position_impl(pos: dict, reason: str):
         _td  = trade_data.get(symbol, {})
         _e   = float(_td.get("entry", 0))
         _lev = int(_td.get("leverage", 10))
-        if _trl >= 3 and _e > 0:
-            known_sl = calc_tp_price(_e, TP2_ROI, direction, _lev)
-            log(f"  SL aus Trailing Level 3 (TP2-Preis): {known_sl:.5f}")
-        elif _trl == 2 and _e > 0:
-            known_sl = calc_tp_price(_e, TP1_ROI, direction, _lev)
-            log(f"  SL aus Trailing Level 2 (TP1-Preis): {known_sl:.5f}")
-        elif _trl == 1 and _e > 0:
+        if _trl >= 5 and _e > 0:
+            known_sl = calc_tp_price(_e, 0.25, direction, _lev)
+            log(f"  SL aus Trailing Level 5 (+25% ROI): {known_sl:.5f}")
+        elif _trl >= 4 and _e > 0:
+            known_sl = calc_tp_price(_e, 0.15, direction, _lev)
+            log(f"  SL aus Trailing Level 4 (+15% ROI): {known_sl:.5f}")
+        elif _trl >= 3 and _e > 0:
+            known_sl = calc_tp_price(_e, 0.05, direction, _lev)
+            log(f"  SL aus Trailing Level 3 (+5% ROI): {known_sl:.5f}")
+        elif _trl >= 1 and _e > 0:
             known_sl = _e
-            log(f"  SL aus Trailing Level 1 (Entry): {known_sl:.5f}")
+            log(f"  SL aus Trailing Level 1/2 (Entry/Break-Even): {known_sl:.5f}")
     if known_sl == 0 and symbol in trade_data:
         known_sl = trade_data[symbol].get("sl", 0)
     if known_sl > 0:
@@ -8305,9 +8314,11 @@ def cmd_trade(parts: list):
     tps = []
     for roi, label in [
         (TP1_ROI, "TP1 (10%)"),
-        (TP2_ROI, "TP2 (20%)"),
-        (TP3_ROI, "TP3 (30%)"),
-        (TP4_ROI, "TP4 (40%)")
+        (TP2_ROI, "TP2 (15%)"),
+        (TP3_ROI, "TP3 (20%)"),
+        (TP4_ROI, "TP4 (30%)"),
+        (TP5_ROI, "TP5 (40%)"),
+        (TP6_ROI, "TP6 (50%)")
     ]:
         factor = roi / leverage
         if direction == "long":
@@ -8883,11 +8894,13 @@ def infer_trailing_level(symbol: str, direction: str,
     schätzen. `/status` und `/berechnen` bauten ihre Anzeige auf dem Dict
     auf — Resultat: "SL=Entry", obwohl der reale SL bereits auf TP1 stand.
 
-    Rückgabe-Levels:
+    Rückgabe-Levels (SYNORA Modell 3):
       0 = SL unter Entry (ungesichert)     — noch kein TP gehittet
       1 = SL @ Entry (Break-even)          — TP1 erreicht
-      2 = SL @ TP1   (Gewinn gesichert)    — TP2 erreicht
-      3 = SL @ TP2   (fett gesichert)      — TP3 erreicht
+      2 = SL @ Entry (kein Move bei TP2)   — TP2 erreicht
+      3 = SL @ +5% ROI                     — TP3 erreicht
+      4 = SL @ +15% ROI                    — TP4 erreicht
+      5 = SL @ +25% ROI                    — TP5 erreicht
 
     Heilung erfolgt nur **nach oben**: ein kurzzeitig fehlender SL (z.B.
     während einer Neusetzung) darf nicht zu Rückstufung führen.
@@ -8908,8 +8921,10 @@ def infer_trailing_level(symbol: str, direction: str,
         # Kein lesbarer SL → Dict-Wert behalten (nicht auf 0 zurückfallen).
         return stored
 
-    tp1 = calc_tp_price(entry, TP1_ROI, direction, leverage)
-    tp2 = calc_tp_price(entry, TP2_ROI, direction, leverage)
+    # SYNORA Modell 3 SL-Levels: +5%/+15%/+25% ROI
+    sl_3 = calc_tp_price(entry, 0.05, direction, leverage)   # +5% ROI
+    sl_4 = calc_tp_price(entry, 0.15, direction, leverage)   # +15% ROI
+    sl_5 = calc_tp_price(entry, 0.25, direction, leverage)   # +25% ROI
 
     # Toleranz: Bitget rundet TP-Preise auf Tick-Decimals und der SL wird
     # oft in round_price() getrimmt → 0.25% Toleranz deckt das ab.
@@ -8918,19 +8933,23 @@ def infer_trailing_level(symbol: str, direction: str,
 
     if direction == "long":
         # Je höher der SL, desto weiter getrailt.
-        if sl >= tp2 * (1 - TOL_TP):
+        if sl >= sl_5 * (1 - TOL_TP):
+            level = 5
+        elif sl >= sl_4 * (1 - TOL_TP):
+            level = 4
+        elif sl >= sl_3 * (1 - TOL_TP):
             level = 3
-        elif sl >= tp1 * (1 - TOL_TP):
-            level = 2
         elif sl >= entry * (1 - TOL_ENTRY):
-            level = 1
+            level = 1   # Level 1 oder 2 (nicht unterscheidbar via SL-Preis)
         else:
             level = 0
     else:  # short
-        if sl <= tp2 * (1 + TOL_TP):
+        if sl <= sl_5 * (1 + TOL_TP):
+            level = 5
+        elif sl <= sl_4 * (1 + TOL_TP):
+            level = 4
+        elif sl <= sl_3 * (1 + TOL_TP):
             level = 3
-        elif sl <= tp1 * (1 + TOL_TP):
-            level = 2
         elif sl <= entry * (1 + TOL_ENTRY):
             level = 1
         else:
@@ -8945,7 +8964,7 @@ def infer_trailing_level(symbol: str, direction: str,
         except Exception:
             pass
         log(f"  🔧 SL-Level geheilt: {symbol} → Level {level} "
-            f"(SL={sl} · Entry={entry:.6g} · TP1={tp1:.6g} · TP2={tp2:.6g})")
+            f"(SL={sl:.6g} · Entry={entry:.6g} · +5%={sl_3:.6g} · +15%={sl_4:.6g} · +25%={sl_5:.6g})")
         return level
     return stored
 
@@ -9568,18 +9587,17 @@ def cmd_pos(parts: list):
 
     if tps:
         tp_lines = []
-        expected_rois = [TP1_ROI, TP2_ROI, TP3_ROI, TP4_ROI]
+        expected_rois = [TP1_ROI, TP2_ROI, TP3_ROI, TP4_ROI, TP5_ROI, TP6_ROI]
         for i, tp in enumerate(tps, 1):
             px    = tp["price"]
             qty_t = tp.get("qty", 0)
-            # FIX: roi_e * 100 (TP1_ROI = 0.10 → 10%)
             roi_e = expected_rois[i - 1] * 100 if i <= len(expected_rois) else 0
             # TP als "ausgelöst" wenn Mark bereits auf der Gewinnseite des TP liegt
             hit   = (mark >= px if direction == "long" else mark <= px)
             status = "✅ ausgelöst" if hit else "⏳ ausstehend"
             dist_pct = abs(mark - px) / mark * 100 if mark > 0 else 0
             is_tp4 = tp.get("orderId") == "pos_tpsl"
-            label  = f"TP4 (TP-SL)" if is_tp4 else f"TP{i}"
+            label  = f"TP6 (TP-SL)" if is_tp4 else f"TP{i}"
             qty_str = f"  ×{qty_t:.{qty_dec}f} {base_coin}" if qty_t > 0 else ""
             tp_lines.append(
                 f"  {label}: <code>{px:.{decimals}f}</code>"
@@ -11967,8 +11985,8 @@ def detect_filled_tps(close_fills: list, avg: float, leverage: int,
     if not avg or not close_fills:
         return []
 
-    rois   = [TP1_ROI, TP2_ROI, TP3_ROI, TP4_ROI]
-    labels = ["TP1 (10%)", "TP2 (20%)", "TP3 (30%)", "TP4 (40%)"]
+    rois   = [TP1_ROI, TP2_ROI, TP3_ROI, TP4_ROI, TP5_ROI, TP6_ROI]
+    labels = ["TP1 (10%)", "TP2 (15%)", "TP3 (20%)", "TP4 (30%)", "TP5 (40%)", "TP6 (50%)"]
     pcts   = TP_CLOSE_PCTS
     filled = []
 
@@ -12017,8 +12035,8 @@ def analyse_trade_state(avg: float, mark: float, leverage: int,
       tp4_expected   — bool: TP4 sollte noch als Full-Close vorhanden sein
       pnl_roi_pct    — unrealisierter ROI auf Margin (Mark vs Entry, mit Hebel)
     """
-    rois   = [TP1_ROI, TP2_ROI, TP3_ROI, TP4_ROI]
-    labels = ["TP1 (10%)", "TP2 (20%)", "TP3 (30%)", "TP4 (40%)"]
+    rois   = [TP1_ROI, TP2_ROI, TP3_ROI, TP4_ROI, TP5_ROI, TP6_ROI]
+    labels = ["TP1 (10%)", "TP2 (15%)", "TP3 (20%)", "TP4 (30%)", "TP5 (40%)", "TP6 (50%)"]
     pcts   = TP_CLOSE_PCTS
 
     tps_hit       = []
@@ -12038,11 +12056,11 @@ def analyse_trade_state(avg: float, mark: float, leverage: int,
 
     tp1_price_hit = len(tps_hit) >= 1
 
-    # profit_plan Orders: TP1–TP3 der noch nicht passierten TPs
+    # profit_plan Orders: TP1–TP5 der noch nicht passierten TPs; TP6 = Full-Close (pos-tpsl)
     n_expected_profit_plan = sum(
-        1 for t in tps_remaining if t["roi"] < TP4_ROI
+        1 for t in tps_remaining if t["roi"] < TP6_ROI
     )
-    tp4_expected = any(t["roi"] == TP4_ROI for t in tps_remaining)
+    tp4_expected = any(t["roi"] == TP6_ROI for t in tps_remaining)
 
     # Unrealisierter ROI auf Margin
     price_change_pct = (mark - avg) / avg * 100
@@ -12180,9 +12198,9 @@ def check_and_repair_position(pos: dict):
         state["tps_remaining"]         = tps_remaining_adjusted
         state["tp1_price_hit"]         = True
         state["n_expected_profit_plan"] = sum(
-            1 for t in tps_remaining_adjusted if t["roi"] < TP4_ROI
+            1 for t in tps_remaining_adjusted if t["roi"] < TP6_ROI
         )
-        state["tp4_expected"] = any(t["roi"] == TP4_ROI for t in tps_remaining_adjusted)
+        state["tp4_expected"] = any(t["roi"] == TP6_ROI for t in tps_remaining_adjusted)
 
     remaining_labels = [t["label"] for t in state["tps_remaining"]]
     log(f"  Noch offene TPs erwartet: "
@@ -12403,6 +12421,8 @@ def check_and_repair_position(pos: dict):
 
     fill_tp2_hit = any(t["roi"] == TP2_ROI for t in filled_tps)
     fill_tp3_hit = any(t["roi"] == TP3_ROI for t in filled_tps)
+    fill_tp4_hit = any(t["roi"] == TP4_ROI for t in filled_tps)
+    fill_tp5_hit = any(t["roi"] == TP5_ROI for t in filled_tps)
 
     # peak_size rekonstruieren: current_size + alle geschlossenen Fill-Mengen
     # Zuverlässiger als gespeicherter State allein — funktioniert auch nach Neustart
@@ -12417,28 +12437,49 @@ def check_and_repair_position(pos: dict):
 
     # Grössen-basierte Erkennung (unabhängig von Fill-Alter)
     # Nur aktiv wenn _ref echt grösser als aktuelle size (belastbare Info)
-    _size_ratio    = size / _ref if _ref > size else 1.0
-    # Schwellwerte: nach TP3 verbleiben 40% (TP_CLOSE_PCTS 15+20+25=60%), +2% Puffer → 0.42
-    #               nach TP2 verbleiben 65% (TP_CLOSE_PCTS 15+20=35%),     +4% Puffer → 0.69
-    size_tp3_hit   = _size_ratio < 0.42
-    size_tp2_hit   = _size_ratio < 0.69
+    _size_ratio = size / _ref if _ref > size else 1.0
+    # Schwellwerte SYNORA Modell 3:
+    # nach TP2 verbleiben 62.5% (25+12.5=37.5% closed),              +4% Puffer → 0.65
+    # nach TP3 verbleiben 37.5% (25+12.5+25=62.5% closed),           +2% Puffer → 0.40
+    # nach TP4 verbleiben 25%   (25+12.5+25+12.5=75% closed),        +2% Puffer → 0.27
+    # nach TP5 verbleiben 12.5% (25+12.5+25+12.5+12.5=87.5% closed), +2% Puffer → 0.15
+    size_tp5_hit = _size_ratio < 0.15
+    size_tp4_hit = _size_ratio < 0.27
+    size_tp3_hit = _size_ratio < 0.40
+    size_tp2_hit = _size_ratio < 0.65
 
     # Kombination: Fill ODER Grösse bestätigen TP-Level
+    tp5_confirmed = fill_tp5_hit or size_tp5_hit
+    tp4_confirmed = fill_tp4_hit or size_tp4_hit
     tp3_confirmed = fill_tp3_hit or size_tp3_hit
     tp2_confirmed = fill_tp2_hit or size_tp2_hit
 
     log(f"  Phase 2b | fills={len(close_fills)} | "
-        f"fill_tp2={fill_tp2_hit} fill_tp3={fill_tp3_hit} | "
+        f"fill_tp2={fill_tp2_hit} fill_tp3={fill_tp3_hit} fill_tp4={fill_tp4_hit} fill_tp5={fill_tp5_hit} | "
         f"peak={_ref:.2f} cur={size:.2f} ratio={_size_ratio:.2f} | "
-        f"size_tp2={size_tp2_hit} size_tp3={size_tp3_hit} | "
-        f"tp2_confirmed={tp2_confirmed} tp3_confirmed={tp3_confirmed}")
+        f"size_tp2={size_tp2_hit} size_tp3={size_tp3_hit} size_tp4={size_tp4_hit} size_tp5={size_tp5_hit} | "
+        f"tp2={tp2_confirmed} tp3={tp3_confirmed} tp4={tp4_confirmed} tp5={tp5_confirmed}")
 
-    if tp3_confirmed:
-        exp_trail_sl  = calc_tp_price(avg, TP2_ROI, direction, leverage)
+    # SYNORA Modell 3 Trailing SL Schedule:
+    # TP1 → SL auf Entry (BE)   [level=1, handled above]
+    # TP2 → SL bleibt           [level=2, kein SL-Move]
+    # TP3 → SL auf +5% ROI      [level=3]
+    # TP4 → SL auf +15% ROI     [level=4]
+    # TP5 → SL auf +25% ROI     [level=5]
+    if tp5_confirmed:
+        exp_trail_sl  = calc_tp_price(avg, 0.25, direction, leverage)
+        exp_trail_lvl = 5
+        exp_tp_label  = "TP5"
+    elif tp4_confirmed:
+        exp_trail_sl  = calc_tp_price(avg, 0.15, direction, leverage)
+        exp_trail_lvl = 4
+        exp_tp_label  = "TP4"
+    elif tp3_confirmed:
+        exp_trail_sl  = calc_tp_price(avg, 0.05, direction, leverage)
         exp_trail_lvl = 3
         exp_tp_label  = "TP3"
     elif tp2_confirmed:
-        exp_trail_sl  = calc_tp_price(avg, TP1_ROI, direction, leverage)
+        exp_trail_sl  = 0   # Kein SL-Move bei TP2 (SYNORA Modell 3)
         exp_trail_lvl = 2
         exp_tp_label  = "TP2"
     else:
@@ -12459,7 +12500,15 @@ def check_and_repair_position(pos: dict):
                 return False
             return sl_val >= expected if direction == "long" else sl_val <= expected
 
-        if _sl_at_level(sl_price, exp_trail_sl) or _sl_better_than(sl_price, exp_trail_sl):
+        if exp_trail_lvl == 2:
+            # TP2: nur Level markieren, kein SL-Move
+            if current_trail < 2:
+                trailing_sl_level[symbol] = 2
+                save_state()
+                log(f"  TP2 erkannt — Trailing Level 2 gesetzt (SL bleibt auf Entry, kein Move)")
+            else:
+                log(f"  TP2 erkannt — Level {current_trail} bereits gesetzt ✓")
+        elif _sl_at_level(sl_price, exp_trail_sl) or _sl_better_than(sl_price, exp_trail_sl):
             trailing_sl_level[symbol] = max(current_trail, exp_trail_lvl)
             log(f"  {exp_tp_label} erkannt, "
                 f"Trailing SL Level {exp_trail_lvl}: SL @ {sl_price} bereits korrekt ✓")
@@ -12469,17 +12518,17 @@ def check_and_repair_position(pos: dict):
             set_sl_trailing(symbol, direction, exp_trail_sl,
                             level=exp_trail_lvl, cur_size=size)
             # Lokale sl_price-Variable nachführen, damit place_tp_orders den
-            # richtigen (neuen) SL für TP4 mitschickt.
+            # richtigen (neuen) SL für TP6 mitschickt.
             # trailing_sl_level wird in set_sl_trailing() nur bei Erfolg gesetzt.
             if trailing_sl_level.get(symbol, 0) >= exp_trail_lvl:
                 sl_price = exp_trail_sl
                 log(f"  sl_price lokal aktualisiert → {exp_trail_sl:.5f} "
-                    f"(für nachfolgende TP4-Platzierung)")
+                    f"(für nachfolgende TP6-Platzierung)")
                 # Kurze Pause — Bitget braucht einen Moment nach place-pos-tpsl
                 # bevor plan-orders (place-tpsl-order) wieder akzeptiert werden.
                 time.sleep(2)
     else:
-        log(f"  Phase 2b: kein TP2/TP3 erkannt — SL bleibt unverändert")
+        log(f"  Phase 2b: kein TP2-TP5 erkannt — SL bleibt unverändert")
 
     # Trade-Daten aktualisieren — peak_size NIE kleiner setzen als bekanntes Maximum
     _prev_td   = trade_data.get(symbol, {})
