@@ -996,9 +996,10 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 # ── Telegram Forum Topics (Option C — Supergruppe mit Coin-Threads) ───────────
 TELEGRAM_FORUM_GROUP_ID   = int(os.environ.get("TELEGRAM_FORUM_GROUP_ID",   "0") or "0")
-TELEGRAM_SYSTEM_TOPIC_ID  = int(os.environ.get("TELEGRAM_SYSTEM_TOPIC_ID",  "0") or "0")
-TELEGRAM_REPORTS_TOPIC_ID = int(os.environ.get("TELEGRAM_REPORTS_TOPIC_ID", "0") or "0")
-TELEGRAM_STATUS_TOPIC_ID  = int(os.environ.get("TELEGRAM_STATUS_TOPIC_ID",  "0") or "0")
+TELEGRAM_SYSTEM_TOPIC_ID         = int(os.environ.get("TELEGRAM_SYSTEM_TOPIC_ID",         "0") or "0")
+TELEGRAM_REPORTS_TOPIC_ID        = int(os.environ.get("TELEGRAM_REPORTS_TOPIC_ID",        "0") or "0")
+TELEGRAM_STATUS_TOPIC_ID         = int(os.environ.get("TELEGRAM_STATUS_TOPIC_ID",         "0") or "0")
+TELEGRAM_ENTRY_RANKING_TOPIC_ID  = int(os.environ.get("TELEGRAM_ENTRY_RANKING_TOPIC_ID",  "0") or "0")
 # Strategie-Emoji-Prefix für Coin-Topics (z.B. "🔵" → "🔵 BTCUSDT").
 # Ermöglicht Koexistenz mehrerer Strategien in derselben Telegram-Supergroup.
 STRATEGY_EMOJI            = os.environ.get("STRATEGY_EMOJI", "").strip()
@@ -6510,7 +6511,8 @@ def flush_entries() -> None:
         }
         overview_text = format_slot_overview(slot_state)
         keyboard      = build_slot_keyboard(slot_state, mode="overview")
-        msg_id = telegram(overview_text, reply_markup=keyboard, return_id=True)
+        msg_id = telegram(overview_text, reply_markup=keyboard, return_id=True,
+                          thread_id=TELEGRAM_ENTRY_RANKING_TOPIC_ID)
 
         if msg_id:
             with _slot_states_lock:
