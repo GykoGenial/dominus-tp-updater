@@ -70,7 +70,7 @@ import threading
 import csv as csv_module
 import hmac
 import hashlib
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 from cryptography.hazmat.primitives import hashes, serialization
@@ -2850,7 +2850,6 @@ def build_synora_report_msg(period: str = "today") -> str:
         key = now.strftime("%Y-%m")
         filtered = [r for r in all_trades if r.get("closed_at", "")[:7] == key]
     elif period == "yesterday":
-        from datetime import timedelta
         yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
         label = f"Tages-Report {(now - timedelta(days=1)).strftime('%d.%m.%Y')}"
         filtered = [r for r in all_trades if r.get("closed_at", "")[:10] == yesterday]
@@ -3020,6 +3019,97 @@ async def check_auto_daily_report() -> None:
 # TELETHON — BOT/KANAL-LISTENER
 # ═══════════════════════════════════════════════════════════════
 
+async def catchup_missed_messages(client, source, lookback_seconds: int = 300) -> None:
+    """
+    Liest beim Startup die letzten `lookback_seconds` Sekunden (Default: 5 Min) des Synora-Kanals
+    und führt verpasste Signale/Updates/Closes sofort aus.
+
+    Reihenfolge: chronologisch (älteste zuerst), damit DCA-Updates nach dem
+    Signal ankommen falls beide im Fenster liegen.
+
+    Schutz gegen Doppel-Entry:
+      - Signal:  nur ausführen wenn Symbol NICHT bereits im State
+      - Update:  nur ausführen wenn Symbol bereits im State
+      - Close:   nur ausführen wenn Symbol bereits im State
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=lookback_seconds)
+
+    try:
+        missed: list = []
+        async for msg in client.iter_messages(source, limit=30):
+            if not msg.date:
+                continue
+            msg_date = msg.date.replace(tzinfo=_tz.utc) if msg.date.tzinfo is None else msg.date
+            if msg_date < cutoff:
+                break
+            missed.append((msg_date, msg.message or ""))
+
+        if not missed:
+            log.info("Catchup: Keine Nachrichten in den letzten 60s — nichts nachzuholen.")
+            return
+
+        # Chronologisch verarbeiten (iter_messages liefert newest-first)
+        missed.reverse()
+        log.info(f"Catchup: {len(missed)} Nachricht(en) im 60s-Fenster gefunden → prüfe …")
+
+        executed: list[str] = []
+
+        for msg_date, text in missed:
+            if not text:
+                continue
+
+            # ── Signal ──
+            sig = parse_signal(text)
+            if sig:
+                symbol = sig.get("symbol", "?")
+                if symbol in _state.get("trades", {}):
+                    log.info(f"Catchup: Signal {symbol} bereits im State → übersprungen")
+                    continue
+                if _paused:
+                    log.info(f"Catchup: Bot pausiert — Signal {symbol} ignoriert")
+                    continue
+                log.info(f"Catchup: Signal {symbol} {sig.get('side')} wird nachgeholt …")
+                tg_system(
+                    f"⏱ <b>SYNORA Catchup</b>: Signal <b>{symbol}</b> "
+                    f"({sig.get('side')}) während Neustart verpasst — führe jetzt aus."
+                )
+                await execute_signal(sig)
+                executed.append(f"Signal {symbol} {sig.get('side')}")
+                continue
+
+            # ── Update (TP) ──
+            upd = parse_update(text)
+            if upd:
+                symbol = upd.get("symbol", "?")
+                if symbol not in _state.get("trades", {}):
+                    log.info(f"Catchup: Update {symbol} nicht im State → übersprungen")
+                    continue
+                log.info(f"Catchup: TP-Update {symbol} wird nachgeholt …")
+                await handle_update(upd)
+                executed.append(f"TP-Update {symbol}")
+                continue
+
+            # ── Close ──
+            close_sym = parse_close(text)
+            if close_sym:
+                if close_sym not in _state.get("trades", {}):
+                    log.info(f"Catchup: Close {close_sym} nicht im State → übersprungen")
+                    continue
+                log.info(f"Catchup: Close {close_sym} wird nachgeholt …")
+                await handle_close(close_sym, reason="SYNORA CANCEL (catchup)")
+                executed.append(f"Close {close_sym}")
+                continue
+
+        if executed:
+            log.info(f"Catchup abgeschlossen: {', '.join(executed)}")
+        else:
+            log.info("Catchup: Alle Nachrichten bereits verarbeitet oder nicht relevant — nichts nachgeholt.")
+
+    except Exception as e:
+        log.error(f"Catchup Fehler: {e}", exc_info=True)
+        tg_system(f"⚠️ <b>SYNORA Catchup Fehler</b>: {e}")
+
+
 async def main() -> None:
     global _main_loop
     _main_loop = asyncio.get_event_loop()
@@ -3100,6 +3190,9 @@ async def main() -> None:
             log.info(f"Close erkannt: {close_sym}")
             await handle_close(close_sym, reason="SYNORA CANCEL")
             return
+
+    # ── Startup-Catchup: verpasste Nachrichten der letzten 60s ──
+    await catchup_missed_messages(client, source, lookback_seconds=300)
 
     log.info("Warte auf Signale …")
     await client.run_until_disconnected()
