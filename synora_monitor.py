@@ -99,6 +99,9 @@ TELEGRAM_FORUM_GROUP_ID   = int(os.environ.get("TELEGRAM_FORUM_GROUP_ID",   "0")
 TELEGRAM_SYSTEM_TOPIC_ID  = int(os.environ.get("TELEGRAM_SYSTEM_TOPIC_ID",  "0") or "0")
 TELEGRAM_REPORTS_TOPIC_ID = int(os.environ.get("TELEGRAM_REPORTS_TOPIC_ID", "0") or "0")
 TELEGRAM_STATUS_TOPIC_ID  = int(os.environ.get("TELEGRAM_STATUS_TOPIC_ID",  "0") or "0")
+# Strategie-Emoji-Prefix für Coin-Topics (z.B. "🟡" → "🟡 BTCUSDT").
+# Ermöglicht Koexistenz mehrerer Strategien in derselben Telegram-Supergroup.
+STRATEGY_EMOJI            = os.environ.get("STRATEGY_EMOJI", "").strip()
 _FORUM_ENABLED = bool(TELEGRAM_FORUM_GROUP_ID)
 
 # Synora-spezifisch
@@ -420,9 +423,11 @@ def _open_coin_topic(symbol: str, side: str) -> int:
         _state.setdefault("telegram_topics", {})[symbol]["status"] = "open"
     else:
         # Neues Topic erstellen (lazy)
-        coin_name = symbol.replace("USDT", "").replace("PERP", "")
-        label     = f"{'📈' if side == 'LONG' else '📉'} {coin_name}"
-        tid       = _forum_create_topic(label, icon_color=color)
+        coin_name  = symbol.replace("USDT", "").replace("PERP", "")
+        dir_icon   = '📈' if side == 'LONG' else '📉'
+        prefix     = f"{STRATEGY_EMOJI} " if STRATEGY_EMOJI else ""
+        label      = f"{prefix}{dir_icon} {coin_name}"
+        tid        = _forum_create_topic(label, icon_color=color)
         if not tid:
             log.error(f"Forum: Topic konnte nicht erstellt werden für {symbol}")
             return 0
