@@ -602,6 +602,44 @@ def get_available_balance() -> float:
     return 0.0
 
 
+def fetch_bybit_balance_raw() -> float:
+    """Liest Bybit-Balance OHNE Cap und OHNE Cache — für /balance Befehl."""
+    res = bybit_get("/v5/account/wallet-balance", {"accountType": "UNIFIED"})
+    rc = res.get("retCode", -1) if res else -1
+    if not res or rc != 0:
+        return -1.0
+    try:
+        accounts = (res.get("result") or {}).get("list") or []
+        for account in accounts:
+            for coin in (account.get("coin") or []):
+                if coin.get("coin") == "USDT":
+                    return float(
+                        coin.get("availableToWithdraw") or
+                        coin.get("availableBalance") or
+                        coin.get("walletBalance") or 0
+                    )
+    except Exception:
+        pass
+    return -1.0
+
+
+def fetch_bingx_balance_raw() -> float:
+    """Liest BingX-Balance OHNE Cap und OHNE Cache — für /balance Befehl."""
+    if not BINGX_API_KEY:
+        return -2.0  # BingX nicht konfiguriert
+    res = bingx_get("/openApi/swap/v2/user/balance")
+    try:
+        data = res.get("data") or {}
+        return float(
+            data.get("availableMargin") or
+            data.get("available") or
+            data.get("balance") or 0
+        )
+    except Exception:
+        pass
+    return -1.0
+
+
 # ─── Precision-Caches ────────────────────────────────────────
 _price_dec_cache: dict = {}
 _qty_step_cache:  dict = {}
@@ -2883,10 +2921,38 @@ def handle_synora_command(text: str, chat_id) -> None:
         tg_reply(chat_id, msg)
         tg_status(msg)
 
+    elif cmd == "/balance":
+        bybit_raw  = fetch_bybit_balance_raw()
+        bingx_raw  = fetch_bingx_balance_raw()
+        cap        = SYNORA_BUDGET_CAP_USDT
+
+        def fmt_line(name: str, raw: float) -> str:
+            if raw == -2.0:
+                return f"• {name}: <i>nicht konfiguriert</i>"
+            if raw < 0:
+                return f"• {name}: ❌ Abruf fehlgeschlagen"
+            if cap > 0:
+                effective = min(raw, cap)
+                return (
+                    f"• {name}: <b>{raw:.2f} USDT</b> verfügbar\n"
+                    f"  └ Effektiv (nach Cap): <b>{effective:.2f} USDT</b>"
+                )
+            return f"• {name}: <b>{raw:.2f} USDT</b> verfügbar"
+
+        cap_info = f"Cap: {cap:.0f} USDT" if cap > 0 else "kein Cap"
+        msg = (
+            f"💰 <b>SYNORA Balance</b> ({cap_info})\n"
+            f"━━━━━━━━━━━━\n"
+            + fmt_line("Bybit Sub-Account", bybit_raw) + "\n"
+            + fmt_line("BingX", bingx_raw)
+        )
+        tg_reply(chat_id, msg)
+
     elif cmd == "/hilfe":
         tg_reply(chat_id,
             "🟣 <b>SYNORA Befehle</b>\n\n"
             "/status — offene Trades\n"
+            "/balance — verfügbare Balance (Bybit + BingX)\n"
             "/report — heutiger P&amp;L-Report\n"
             "/report monat — Monats-Report\n"
             "/pause — neue Signale pausieren\n"
