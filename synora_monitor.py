@@ -2933,6 +2933,184 @@ def build_verify_msg() -> str:
     return "\n".join(lines).rstrip()
 
 
+async def fix_trade(symbol: str) -> str:
+    """
+    Korrigiert einen offenen Trade auf Exchange-Niveau:
+      1. SL     → richtig für aktuelles Stadium (dynamic_levels_done)
+      2. DCAs   → fehlende re-platzieren (falls nicht gefüllt)
+      3. Modell → dynamic_model_active sicherstellen
+    Gibt einen Bericht-String (Telegram HTML) zurück.
+    """
+    trade = _state.get("trades", {}).get(symbol)
+    if not trade:
+        return f"❌ Kein offener Trade für <b>{symbol}</b> im State."
+
+    side     = trade.get("side", "LONG")
+    lev      = int(trade.get("lev", 1))
+    entry    = float(trade.get("entry", 0))
+    sl_orig  = float(trade.get("sl", 0))
+    dca1     = float(trade.get("dca1", 0))
+    dca2     = float(trade.get("dca2", 0))
+    qty_entry = float(trade.get("qty_entry", 0))
+    qty_dca1  = float(trade.get("qty_dca1", 0))
+    qty_dca2  = float(trade.get("qty_dca2", 0))
+    exchange  = trade.get("exchange", "bybit")
+    ex_sym    = trade.get("exchange_symbol", symbol)
+    levels_done = list(trade.get("dynamic_levels_done", []))
+    dca_notified = set(trade.get("dca_fills_notified", []))
+
+    fixes  = []
+    errors = []
+
+    # ── 1. Live-Position von Exchange holen ──────────────────────
+    pos_size  = 0.0
+    avg_price = entry  # Fallback: Signal-Entry
+    sl_live   = 0.0
+
+    if exchange == "bybit":
+        pos_res   = bybit_get("/v5/position/list", {"category": BYBIT_CATEGORY, "symbol": symbol})
+        pos_items = (pos_res.get("result") or {}).get("list") or []
+        for p in pos_items:
+            if p.get("symbol") == symbol and float(p.get("size", 0) or 0) > 0:
+                pos_size  = float(p.get("size", 0) or 0)
+                avg_price = float(p.get("avgPrice", entry) or entry)
+                sl_live   = float(p.get("stopLoss", 0) or 0)
+                break
+    else:
+        pos_size = bingx_get_position_size(ex_sym, side)
+        avg_price = entry   # BingX: avg aus State
+
+    if pos_size == 0:
+        return f"⚠️ <b>{symbol}</b>: Keine offene Position auf Exchange — nichts zu korrigieren."
+
+    # ── 2. Korrekten SL für aktuelles Stadium berechnen ──────────
+    # Finde höchsten sl_offset aus abgeschlossenen Stufen
+    correct_sl = sl_orig
+    for pct, _, sl_off in DYNAMIC_MODEL_LEVELS:
+        if pct not in levels_done:
+            continue
+        if sl_off is None:
+            continue
+        if sl_off == 0:
+            correct_sl = avg_price   # Break-Even = aktueller Avg
+        else:
+            correct_sl = calc_tp_price(side, avg_price, sl_off, lev)
+
+    # SL korrigieren falls Abweichung > 0.1%
+    sl_needs_fix = sl_live == 0 or (sl_orig > 0 and abs(sl_live - correct_sl) / correct_sl > 0.001)
+    if sl_needs_fix:
+        if exchange == "bybit":
+            res_sl = set_sl(symbol, side, correct_sl)
+            ok_sl  = bybit_ok(res_sl)
+        else:
+            res_sl = bingx_set_sl(ex_sym, side, correct_sl)
+            ok_sl  = bingx_ok(res_sl)
+        stage_label = f"Stufe {max(levels_done)}" if levels_done else "Original"
+        if ok_sl:
+            fixes.append(f"SL → {correct_sl:.6g} ({stage_label}) ✓")
+            _state["trades"][symbol]["sl"] = correct_sl
+        else:
+            err = (res_sl.get("retMsg") or res_sl.get("msg") or "?") if res_sl else "keine Antwort"
+            errors.append(f"SL-Fehler: {err}")
+    else:
+        fixes.append(f"SL: {sl_live:.6g} ✓ (korrekt)")
+
+    # ── 3. DCAs prüfen und re-platzieren ─────────────────────────
+    # Offene Orders holen
+    open_prices: set[float] = set()
+    if exchange == "bybit":
+        ord_res   = bybit_get("/v5/order/realtime", {"category": BYBIT_CATEGORY, "symbol": symbol})
+        ord_items = (ord_res.get("result") or {}).get("list") or []
+        for o in ord_items:
+            try:
+                open_prices.add(float(o.get("price", 0) or 0))
+            except (ValueError, TypeError):
+                pass
+    else:
+        ord_res   = bingx_get("/openApi/swap/v2/trade/openOrders", {"symbol": ex_sym})
+        ord_items = (ord_res.get("data") or {}).get("orders") or []
+        for o in ord_items:
+            try:
+                open_prices.add(float(o.get("price", 0) or 0))
+            except (ValueError, TypeError):
+                pass
+
+    def _price_present(target: float, tolerance: float = 0.003) -> bool:
+        """Prüft ob eine Order nahe am Zielpreis vorhanden ist."""
+        return any(abs(p - target) / target <= tolerance for p in open_prices if p > 0)
+
+    dca1_filled = "dca1" in dca_notified or pos_size >= qty_entry + qty_dca1 * 0.7
+    dca2_filled = "dca2" in dca_notified or pos_size >= qty_entry + qty_dca1 + qty_dca2 * 0.7
+
+    # DCA1 re-platzieren
+    if dca1 > 0 and qty_dca1 > 0 and not dca1_filled and not _price_present(dca1):
+        if exchange == "bybit":
+            res_dca1 = place_limit_order(symbol, side, qty_dca1, dca1)
+            ok_dca1  = bybit_ok(res_dca1)
+            new_id   = (res_dca1.get("result") or {}).get("orderId")
+        else:
+            res_dca1 = bingx_place_limit_order(ex_sym, side, qty_dca1, dca1)
+            ok_dca1  = bingx_ok(res_dca1)
+            new_id   = (res_dca1.get("data") or {}).get("orderId")
+        if ok_dca1:
+            fixes.append(f"DCA1 @ {dca1} re-platziert ✓")
+            if new_id:
+                _state["trades"][symbol]["dca1_order_id"] = new_id
+        else:
+            err = (res_dca1.get("retMsg") or res_dca1.get("msg") or "?") if res_dca1 else "?"
+            errors.append(f"DCA1-Fehler: {err}")
+    elif dca1_filled:
+        fixes.append(f"DCA1: gefüllt (übersprungen)")
+    else:
+        fixes.append(f"DCA1 @ {dca1} ✓ (vorhanden)")
+
+    # DCA2 re-platzieren
+    if dca2 > 0 and qty_dca2 > 0 and not dca2_filled and not _price_present(dca2):
+        if exchange == "bybit":
+            res_dca2 = place_limit_order(symbol, side, qty_dca2, dca2)
+            ok_dca2  = bybit_ok(res_dca2)
+            new_id   = (res_dca2.get("result") or {}).get("orderId")
+        else:
+            res_dca2 = bingx_place_limit_order(ex_sym, side, qty_dca2, dca2)
+            ok_dca2  = bingx_ok(res_dca2)
+            new_id   = (res_dca2.get("data") or {}).get("orderId")
+        if ok_dca2:
+            fixes.append(f"DCA2 @ {dca2} re-platziert ✓")
+            if new_id:
+                _state["trades"][symbol]["dca2_order_id"] = new_id
+        else:
+            err = (res_dca2.get("retMsg") or res_dca2.get("msg") or "?") if res_dca2 else "?"
+            errors.append(f"DCA2-Fehler: {err}")
+    elif dca2_filled:
+        fixes.append(f"DCA2: gefüllt (übersprungen)")
+    else:
+        fixes.append(f"DCA2 @ {dca2} ✓ (vorhanden)")
+
+    # ── 4. Modell-3-Status sicherstellen ─────────────────────────
+    if SYNORA_PROFIT_MODEL == 3 and not trade.get("dynamic_model_active"):
+        _state["trades"][symbol]["dynamic_model_active"] = True
+        fixes.append("Profit-Modell 3 aktiviert ✓")
+    else:
+        fixes.append("Profit-Modell 3: aktiv ✓")
+
+    save_state()
+
+    # ── Bericht zusammenstellen ───────────────────────────────────
+    icon    = "📈" if side == "LONG" else "📉"
+    stage   = f"{len(levels_done)}/6 Stufen" if levels_done else "0/6 Stufen"
+    lines   = [
+        f"🔧 <b>SYNORA Fix — {symbol}</b> {icon} {side} {lev}x",
+        f"Pos: {pos_size} | Avg: {avg_price:.6g} | {stage}",
+        "━━━━━━━━━━━━",
+    ]
+    for f in fixes:
+        lines.append(f"  ✅ {f}")
+    for e in errors:
+        lines.append(f"  ❌ {e}")
+
+    return "\n".join(lines)
+
+
 def build_synora_status_msg() -> str:
     """Erstellt die /status Nachricht aus dem aktuellen State."""
     trades = _state.get("trades", {})
@@ -3067,11 +3245,29 @@ def handle_synora_command(text: str, chat_id) -> None:
         msg = build_verify_msg()
         tg_reply(chat_id, msg)
 
+    elif cmd == "/fix":
+        parts = text.strip().split()
+        if len(parts) < 2:
+            open_syms = list(_state.get("trades", {}).keys())
+            if len(open_syms) == 1:
+                symbol = open_syms[0]
+            else:
+                tg_reply(chat_id, "⚠️ Bitte Symbol angeben: <code>/fix WLDUSDT</code>")
+                return
+        else:
+            symbol = parts[1].upper()
+            if not symbol.endswith("USDT"):
+                symbol += "USDT"
+        tg_reply(chat_id, f"🔧 Korrigiere <b>{symbol}</b> …")
+        msg = await fix_trade(symbol)
+        tg_reply(chat_id, msg)
+
     elif cmd == "/hilfe":
         tg_reply(chat_id,
             "🟣 <b>SYNORA Befehle</b>\n\n"
             "/status — offene Trades\n"
             "/verify — TP &amp; DCA live prüfen (Exchange)\n"
+            "/fix [SYMBOL] — SL/DCA/Modell korrigieren\n"
             "/balance — verfügbare Balance (Bybit + BingX)\n"
             "/report — heutiger P&amp;L-Report\n"
             "/report monat — Monats-Report\n"
