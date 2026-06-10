@@ -1496,6 +1496,7 @@ async def reconcile_trade_state(startup: bool = False) -> None:
                     cancel_open_orders(symbol)
                 else:
                     bingx_cancel_open_orders(ex_sym)
+                _state["trades"][symbol]["dca_cancelled"] = True
                 fixes.append(f"{symbol}: {len(dca_open)} DCA-Order(s) storniert ({reason})")
                 log.info(f"Reconcile: DCA storniert für {symbol} — {reason}")
                 tg_system(
@@ -1621,6 +1622,8 @@ async def _check_dynamic_profit_levels(symbol: str, trade: dict, pos_size: float
                 cancel_open_orders(symbol)
             else:
                 bingx_cancel_open_orders(ex_sym)
+            _state["trades"][symbol]["dca_cancelled"] = True
+            save_state()
 
         # SL-Anpassung
         sl_msg = ""
@@ -2333,11 +2336,11 @@ def dashboard():
     </div>
     <div style="background:#0f1117;border-radius:6px;padding:8px">
       <div style="color:#64748b;font-size:.68rem;margin-bottom:2px">DCA1 (25%)</div>
-      <div style="color:#94a3b8">{dca1:.6g} <small style="color:#475569">×{q_dca1:.4g}</small></div>
+      {"<div style='color:#374151;text-decoration:line-through'>" if tr.get('dca_cancelled') else "<div style='color:#94a3b8'>"}{dca1:.6g} <small style="color:#374151">×{q_dca1:.4g}</small>{"<span style='color:#6b7280;font-size:.65rem;margin-left:4px'>storniert</span>" if tr.get('dca_cancelled') else ""}</div>
     </div>
     <div style="background:#0f1117;border-radius:6px;padding:8px">
       <div style="color:#64748b;font-size:.68rem;margin-bottom:2px">DCA2 (65%)</div>
-      <div style="color:#94a3b8">{dca2:.6g} <small style="color:#475569">×{q_dca2:.4g}</small></div>
+      {"<div style='color:#374151;text-decoration:line-through'>" if tr.get('dca_cancelled') else "<div style='color:#94a3b8'>"}{dca2:.6g} <small style="color:#374151">×{q_dca2:.4g}</small>{"<span style='color:#6b7280;font-size:.65rem;margin-left:4px'>storniert</span>" if tr.get('dca_cancelled') else ""}</div>
     </div>
     <div style="background:#0f1117;border-radius:6px;padding:8px">
       <div style="color:#64748b;font-size:.68rem;margin-bottom:2px">TP / MAX</div>
