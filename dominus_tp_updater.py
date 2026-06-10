@@ -4165,7 +4165,7 @@ def set_sl_at_entry(symbol: str, direction: str, entry_price: float,
             sl_at_entry[symbol] = True
             save_state()
             cancel_all_orders_bybit(symbol)
-            telegram(
+            telegram_coin(symbol,
                 f"🔒🟣 <b>TP1 ausgelöst — {symbol}</b>\n"
                 f"SL → {sl_label} @ {sl_str} USDT (Bybit Break-even)\n"
                 f"✓ Orders storniert"
@@ -4231,7 +4231,7 @@ def set_sl_at_entry(symbol: str, direction: str, entry_price: float,
         else:
             size_str = "—"
         profit_str = f"+{tp1_profit:.2f} USDT" if tp1_profit > 0 else "—"
-        telegram(
+        telegram_coin(symbol,
             f"🔒 <b>TP1 ausgelöst — {symbol}</b>\n"
             f"SL → {sl_label} @ {sl_str} USDT (Break-even gesichert)\n"
             f"━━━━━━━━━━\n"
@@ -4362,7 +4362,7 @@ def set_sl_trailing(symbol: str, direction: str, sl_price: float, level: int,
             guaranteed_str = "—"
 
         log(f"  ✓ Trailing SL (Level {level}): SL → {sl_str} USDT")
-        telegram(
+        telegram_coin(symbol,
             f"📈 <b>{tp_label} ausgelöst — {symbol}</b>\n"
             f"SL → {sl_str} USDT ({prev_label} gesichert)\n"
             f"━━━━━━━━━━\n"
@@ -13009,7 +13009,9 @@ def main():
                         # einzigen Check korrekt eskaliert werden.
                         _size_changed = False
 
-                        if cur_size < _ref * 0.87 and not sl_at_entry.get(sym, False):
+                        if (cur_size < _ref * 0.87
+                                and not sl_at_entry.get(sym, False)
+                                and trailing_sl_level.get(sym, 0) < 1):   # v4.60 Doppelschutz: trailing_level verhindert Re-Trigger nach Restart
                             red = (_ref - cur_size) / _ref * 100
                             # v4.52 Option A: SL nach TP1 = cur_avg wenn DCAs gefüllt (echter Breakeven),
                             # sonst original Entry. _ref = peak_size (vor TP1), initial_size gespeichert
@@ -13043,7 +13045,7 @@ def main():
                             _qty_d2 = get_qty_decimals(sym)
                             _sl_now = get_sl_price(sym, _dir)
                             _sl_str = f"{_sl_now:.6f} USDT" if _sl_now > 0 else "Entry/Avg (unbewegt)"
-                            telegram(
+                            telegram_coin(sym,
                                 f"📈 <b>TP2 ausgelöst — {sym}</b>\n"
                                 f"SL bleibt bei {_sl_str}\n"
                                 f"━━━━━━━━━━\n"
