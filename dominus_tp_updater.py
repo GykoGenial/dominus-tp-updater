@@ -10283,10 +10283,15 @@ def poll_telegram_commands():
         elif cmd == "/hilfe" or cmd == "/start" or cmd == "/help":
             cmd_hilfe()
         else:
-            reply(
-                f"❓ Unbekannter Befehl: {cmd}\n"
-                "Sende /hilfe für alle Befehle."
-            )
+            # Stumm bleiben bei unbekannten Befehlen — in Multi-Bot-Gruppen
+            # antwortet sonst jeder Bot auf Befehle des anderen.
+            # Nur reagieren wenn der Bot explizit mit @BotName adressiert wurde.
+            _raw_cmd = parts[0].lower()
+            if "@" in _raw_cmd:
+                reply(
+                    f"❓ Unbekannter Befehl: {cmd}\n"
+                    "Sende /hilfe für alle Befehle."
+                )
 
 
 # ═══════════════════════════════════════════════════════════════

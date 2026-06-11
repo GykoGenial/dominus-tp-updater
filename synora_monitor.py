@@ -652,12 +652,11 @@ def fetch_bingx_balance_raw() -> float:
     if not BINGX_API_KEY:
         return -2.0  # BingX nicht konfiguriert
     res = bingx_get("/openApi/swap/v2/user/balance")
-    log.info(f"[DEBUG] BingX balance raw response: {res}")
     try:
         data = res.get("data") or {}
         return _parse_bingx_balance(data)
     except Exception as e:
-        log.error(f"[DEBUG] BingX balance parse error: {e}")
+        log.error(f"BingX balance parse error: {e}")
     return -1.0
 
 
@@ -3454,7 +3453,12 @@ def handle_synora_command(text: str, chat_id) -> None:
             "/hilfe — diese Hilfe"
         )
     else:
-        tg_reply(chat_id, f"❓ Unbekannter Befehl: <code>{cmd}</code>\nTippe /hilfe für alle Befehle.")
+        # Stumm bleiben bei unbekannten Befehlen — in Multi-Bot-Gruppen
+        # antwortet sonst jeder Bot auf Befehle des anderen.
+        # Nur reagieren wenn dieser Bot explizit mit @BotName adressiert wurde.
+        _raw_cmd = text.strip().split()[0].lower()
+        if "@" in _raw_cmd:
+            tg_reply(chat_id, f"❓ Unbekannter Befehl: <code>{cmd}</code>\nTippe /hilfe für alle Befehle.")
 
 
 async def poll_synora_commands() -> None:
