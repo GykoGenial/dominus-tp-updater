@@ -3675,17 +3675,40 @@ async def main() -> None:
     except ValueError:
         channel_id_raw = SYNORA_CHANNEL  # Einladungslink
 
+    # get_dialogs() füllt den Telethon-Entity-Cache — wichtig für frische Railway-Container
+    # damit get_entity() für User-IDs (PeerUser) danach funktioniert.
+    try:
+        log.info("Lade Dialogliste um Entity-Cache zu füllen …")
+        await client.get_dialogs(limit=50)
+    except Exception as _ge:
+        log.warning(f"get_dialogs fehlgeschlagen (unkritisch): {_ge}")
+
+    source        = None
+    source_id_int = channel_id_raw if isinstance(channel_id_raw, int) else None
     try:
         source = await client.get_entity(channel_id_raw)
         label = getattr(source, 'title', None) or getattr(source, 'username', None) or str(channel_id_raw)
         log.info(f"Source verbunden: {label}")
     except Exception:
-        # Fallback: direkt mit der rohen ID registrieren (klappt wenn Entity bereits im Session-Cache)
-        log.warning(f"get_entity fehlgeschlagen — nutze ID direkt: {channel_id_raw}")
-        source = channel_id_raw
+        log.warning(f"get_entity fehlgeschlagen — Fallback auf sender-ID-Filter: {channel_id_raw}")
 
-    @client.on(events.NewMessage(chats=source))
+    # Listener: wenn source aufgelöst → chats-Filter (präzise).
+    # Fallback: alle Nachrichten empfangen und per sender_id filtern (robust bei Entity-Fehler).
+    def _is_from_source(event) -> bool:
+        if source is not None:
+            return True  # chats-Filter erledigt das
+        if source_id_int is None:
+            return True  # kein Filter konfigurierbar → alle verarbeiten
+        sid = getattr(event.message, 'from_id', None) or getattr(event.message, 'peer_id', None)
+        peer_id = getattr(sid, 'user_id', None) or getattr(sid, 'channel_id', None) or getattr(sid, 'chat_id', None)
+        return peer_id == source_id_int
+
+    _chats_filter = [source] if source is not None else None
+
+    @client.on(events.NewMessage(chats=_chats_filter))
     async def on_message(event):
+        if not _is_from_source(event):
+            return
         text = event.message.message or ""
         log.info(f"Neue Nachricht ({len(text)} Zeichen):\n{text[:200]}")
 
@@ -3714,8 +3737,12 @@ async def main() -> None:
             await handle_close(close_sym, reason="SYNORA CANCEL")
             return
 
-    # ── Startup-Catchup: verpasste Nachrichten der letzten 60s ──
-    await catchup_missed_messages(client, source, lookback_seconds=SIGNAL_VALIDITY_SECONDS)
+    # ── Startup-Catchup: verpasste Nachrichten der letzten 2h ──
+    _catchup_src = source if source is not None else channel_id_raw
+    try:
+        await catchup_missed_messages(client, _catchup_src, lookback_seconds=SIGNAL_VALIDITY_SECONDS)
+    except Exception as _ce:
+        log.error(f"Catchup fehlgeschlagen (Signale ab jetzt live): {_ce}")
 
     log.info("Warte auf Signale …")
     await client.run_until_disconnected()
