@@ -1020,6 +1020,8 @@ POSITION_EVENTS_CSV = os.environ.get("POSITION_EVENTS_CSV", "/app/data/position_
 # v4.56: Coin-Silence-Detection
 COIN_SILENCE_FILE   = os.environ.get("COIN_SILENCE_FILE",   "/app/data/coin_signal_ts.json")
 MONITOR_STATE_FILE  = os.environ.get("MONITOR_STATE_FILE",  "/app/data/dominus_watchlist.json")  # gleicher Default wie Channel-Monitor
+# v4.60: Persistenter Startup-Catchup — Signal-Queue überlebt Container-Restart
+PENDING_SIGNALS_FILE = os.environ.get("PENDING_SIGNALS_FILE", "/app/data/pending_signals.json")
 
 
 # v4.13: Robuste Env-Parser — Railway-Variablen können "" statt fehlend sein,
@@ -1216,6 +1218,58 @@ def _save_coin_signal_ts() -> None:
             json.dump(_coin_signal_ts, f, indent=2)
     except Exception as e:
         log(f"[Silence] Speichern fehlgeschlagen: {e}")
+
+
+# ── v4.60: Persistenter Signal-Queue ──────────────────────────────────────────
+def _save_pending_signals() -> None:
+    """Serialisiert pending_entries auf Disk (atomic write).
+    Muss unter pending_entries_lock aufgerufen werden."""
+    try:
+        tmp = PENDING_SIGNALS_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(pending_entries, f)
+        os.replace(tmp, PENDING_SIGNALS_FILE)
+    except Exception as ex:
+        log(f"[pending_signals] Speichern fehlgeschlagen: {ex}")
+
+
+def _load_pending_signals() -> None:
+    """Beim Startup: liest persistierten Queue, re-queued Einträge < 1800s.
+    Löscht die Datei danach — flush_entries() schreibt bei Bedarf neu."""
+    if not os.path.exists(PENDING_SIGNALS_FILE):
+        return
+    try:
+        with open(PENDING_SIGNALS_FILE) as f:
+            saved: dict = json.load(f)
+    except Exception as ex:
+        log(f"[pending_signals] Laden fehlgeschlagen: {ex}")
+        return
+
+    now = time.time()
+    recovered = 0
+    skipped   = 0
+    for sig_key, entry in saved.items():
+        age = now - float(entry.get("ts", 0))
+        if age < 1800:
+            log(f"[pending_signals] Recovery: {sig_key} — {age:.0f}s alt → re-queued")
+            enqueue_entry(entry)
+            recovered += 1
+        else:
+            log(f"[pending_signals] Recovery: {sig_key} — {age:.0f}s alt → Signal abgelaufen, ignoriert")
+            skipped += 1
+
+    # Datei nach Recovery löschen — enqueue_entry() hat sie ggf. schon
+    # mit den gültigen Einträgen neu geschrieben; wir löschen nur falls
+    # KEIN Signal wiederhergestellt wurde (alles abgelaufen).
+    if recovered == 0:
+        try:
+            os.remove(PENDING_SIGNALS_FILE)
+        except FileNotFoundError:
+            pass
+
+    if recovered or skipped:
+        log(f"[pending_signals] Startup-Recovery: {recovered} wiederhergestellt, "
+            f"{skipped} abgelaufen")
 
 
 def _update_coin_signal_ts(symbol: str) -> None:
@@ -6442,6 +6496,7 @@ def enqueue_entry(entry: dict) -> None:
         else:
             entry["confirm_count"] = 1
         pending_entries[sig_key] = entry
+        _save_pending_signals()  # v4.60: auf Disk persistieren → überlebt Container-Restart
 
         timer_running = _entry_flush_timer is not None and _entry_flush_timer.is_alive()
         if not timer_running:
@@ -6465,6 +6520,13 @@ def flush_entries() -> None:
         batch = list(pending_entries.values())
         pending_entries.clear()
         _entry_flush_timer = None
+        # v4.60: Persistenz-Datei löschen — Signale werden jetzt verarbeitet
+        try:
+            os.remove(PENDING_SIGNALS_FILE)
+        except FileNotFoundError:
+            pass
+        except Exception as _ex:
+            log(f"[pending_signals] Löschen nach flush fehlgeschlagen: {_ex}")
 
     try:
         for e in batch:
@@ -12891,6 +12953,13 @@ def main():
 
     # v4.56: Coin-Silence-Timestamps laden
     _load_coin_signal_ts()
+
+    # v4.60: Persistenter Startup-Catchup — Signale der letzten 30 Min nachholen
+    # (TradingView-Webhooks gehen verloren wenn Container während 90s-Fenster stirbt)
+    try:
+        _load_pending_signals()
+    except Exception as _pex:
+        log(f"[pending_signals] Startup-Recovery fehlgeschlagen: {_pex}")
 
     # Webhook-Server in separatem Thread starten
     t = threading.Thread(target=start_webhook_server, daemon=True)
