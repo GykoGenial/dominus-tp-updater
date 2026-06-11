@@ -630,6 +630,23 @@ def fetch_bybit_balance_raw() -> float:
     return -1.0
 
 
+def _parse_bingx_balance(data: dict) -> float:
+    """Extrahiert verfügbare Margin aus BingX-Balance-Response.
+    BingX v2 nested: data["balance"]["availableMargin"]
+    Fallback: data["availableMargin"] (flache Struktur)."""
+    nested = data.get("balance")
+    if isinstance(nested, dict):
+        return float(
+            nested.get("availableMargin") or
+            nested.get("available") or
+            nested.get("balance") or 0
+        )
+    return float(
+        data.get("availableMargin") or
+        data.get("available") or 0
+    )
+
+
 def fetch_bingx_balance_raw() -> float:
     """Liest BingX-Balance OHNE Cap und OHNE Cache — für /balance Befehl."""
     if not BINGX_API_KEY:
@@ -637,11 +654,7 @@ def fetch_bingx_balance_raw() -> float:
     res = bingx_get("/openApi/swap/v2/user/balance")
     try:
         data = res.get("data") or {}
-        return float(
-            data.get("availableMargin") or
-            data.get("available") or
-            data.get("balance") or 0
-        )
+        return _parse_bingx_balance(data)
     except Exception:
         pass
     return -1.0
@@ -876,12 +889,7 @@ def get_bingx_balance() -> float:
     res = bingx_get("/openApi/swap/v2/user/balance")
     try:
         data = res.get("data") or {}
-        balance = float(
-            data.get("availableMargin") or
-            data.get("available") or
-            data.get("balance") or 0
-        )
-        log.info(f"BingX raw balance data: {data}")   # zum Debuggen der Feldnamen
+        balance = _parse_bingx_balance(data)
         if SYNORA_BUDGET_CAP_USDT > 0:
             balance = min(balance, SYNORA_BUDGET_CAP_USDT)
         log.info(f"BingX Balance: {balance:.2f} USDT")
