@@ -652,11 +652,12 @@ def fetch_bingx_balance_raw() -> float:
     if not BINGX_API_KEY:
         return -2.0  # BingX nicht konfiguriert
     res = bingx_get("/openApi/swap/v2/user/balance")
+    log.info(f"[DEBUG] BingX balance raw response: {res}")
     try:
         data = res.get("data") or {}
         return _parse_bingx_balance(data)
-    except Exception:
-        pass
+    except Exception as e:
+        log.error(f"[DEBUG] BingX balance parse error: {e}")
     return -1.0
 
 
