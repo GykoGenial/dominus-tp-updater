@@ -3369,7 +3369,9 @@ def handle_synora_command(text: str, chat_id) -> None:
         tg_reply(chat_id, "🔄 Lade State neu …")
         load_state()
         n = len(_state.get("trades", {}))
-        tg_reply(chat_id, f"✅ State neu geladen — {n} offene Trade(s).")
+        _refresh_msg = f"✅ <b>SYNORA Refresh</b> — State neu geladen ({n} offene Trade(s))."
+        tg_reply(chat_id, _refresh_msg)
+        tg_status(_refresh_msg)
 
     elif cmd == "/pause":
         _paused = True
@@ -3409,11 +3411,13 @@ def handle_synora_command(text: str, chat_id) -> None:
             + fmt_line("BingX", bingx_raw)
         )
         tg_reply(chat_id, msg)
+        tg_report(msg)
 
     elif cmd == "/verify":
         tg_reply(chat_id, "🔍 Prüfe live gegen Exchange …")
         msg = build_verify_msg()
         tg_reply(chat_id, msg)
+        tg_status(msg)
 
     elif cmd == "/fix":
         parts = text.strip().split()
@@ -3435,6 +3439,7 @@ def handle_synora_command(text: str, chat_id) -> None:
             tg_reply(chat_id, f"🔧 Korrigiere <b>{symbol}</b> …")
             msg = asyncio.run(fix_trade(symbol))
             tg_reply(chat_id, msg)
+            tg_system(msg)
         finally:
             _fix_lock.release()
 
