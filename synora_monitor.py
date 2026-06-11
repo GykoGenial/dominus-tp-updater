@@ -3453,12 +3453,7 @@ def handle_synora_command(text: str, chat_id) -> None:
             "/hilfe — diese Hilfe"
         )
     else:
-        # Stumm bleiben bei unbekannten Befehlen — in Multi-Bot-Gruppen
-        # antwortet sonst jeder Bot auf Befehle des anderen.
-        # Nur reagieren wenn dieser Bot explizit mit @BotName adressiert wurde.
-        _raw_cmd = text.strip().split()[0].lower()
-        if "@" in _raw_cmd:
-            tg_reply(chat_id, f"❓ Unbekannter Befehl: <code>{cmd}</code>\nTippe /hilfe für alle Befehle.")
+        pass  # Unbekannte Befehle stumm ignorieren (Multi-Bot-Gruppe)
 
 
 async def poll_synora_commands() -> None:
