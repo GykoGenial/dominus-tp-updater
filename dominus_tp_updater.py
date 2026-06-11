@@ -6350,7 +6350,8 @@ def score_entry(e: dict) -> dict:
     sugg      = e.get("sugg") or {}
     sl_pct    = float(sugg.get("sl_dist_pct", 0) or 0)
     leverage  = int(sugg.get("leverage", 0) or 0)
-    harsi_w   = int(e.get("harsi_warn", 0) or 0)
+    harsi_w   = int(e.get("harsi_warn",    0) or 0)
+    harsi_c   = int(e.get("harsi_caution", 0) or 0)  # v4.60: Vorsichtszone −10 bis −20
     elapsed_m = int(e.get("timing_elapsed_min", 0) or 0)
     symbol    = e.get("symbol", "")
 
@@ -6424,10 +6425,18 @@ def score_entry(e: dict) -> dict:
         else:
             breakdown.append(f"±0 WR n/a ({n_tr}T)")
 
-    # 6) HARSI-Divergenz-Flag (+5 / Warnung)
-    if harsi_w == 0:
+    # 6) HARSI-Qualität (+5 / −3 / Warnung)
+    # harsi_warn=1  → HARSI in Extremzone (Entry eigentlich blockiert, via HARSI_EXIT-Pfad)
+    # harsi_caution=1 → HARSI in Vorsichtszone (−10..−20): technisch ok, aber näher an
+    #   der Extremzone. Handbuch kennt nur binär (drin/draussen), dennoch sinnvoll als
+    #   leichter Qualitäts-Abzug. Kein Trade-Block, nur Ranking-Einfluss. (v4.60)
+    if harsi_w == 0 and harsi_c == 0:
         score += 5
-        breakdown.append("+5 kein HARSI-warn")
+        breakdown.append("+5 HARSI OK")
+    elif harsi_w == 0 and harsi_c == 1:
+        score -= 3
+        breakdown.append("−3 HARSI Vorsichtszone")
+        warnings.append("HARSI Vorsichtszone (nahe Extremzone)")
     else:
         warnings.append("HARSI-Divergenz aktiv")
 
@@ -11467,7 +11476,8 @@ def start_webhook_server():
                     "warn_line":          warn_line,
                     "timing_elapsed_min": elapsed_min or 0,
                     "sugg":                _sugg,
-                    "harsi_warn":         int(data.get("harsi_warn", 0) or 0),
+                    "harsi_warn":         int(data.get("harsi_warn",    0) or 0),
+                    "harsi_caution":      int(data.get("harsi_caution", 0) or 0),  # v4.60
                     "sling_sl":           data.get("sling_sl"),
                     "atr":                data.get("atr"),
                     "xinfo":              _xinfo,
@@ -11668,6 +11678,7 @@ def start_webhook_server():
                 "timing_elapsed_min": 0,
                 "sugg":               _sugg_q,
                 "harsi_warn":         0,
+                "harsi_caution":      int(data.get("harsi_caution", 0) or 0),  # v4.60
                 "sling_sl":           data.get("sling_sl"),
                 "atr":                data.get("atr"),
                 "xinfo":              _xinfo,
