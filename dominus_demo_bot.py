@@ -1,5 +1,5 @@
 """
-DOMINUS Demo-Bot v4.53 — PAPER TRADING
+DOMINUS Demo-Bot v4.54 — PAPER TRADING (PURE_SIM)
 ════════════════════════════════════
 Vollautomatisches Paper Trading auf Bitget Demo-Account.
 Kein echtes Kapital — identische Logik wie Live-Script.
@@ -972,6 +972,24 @@ def _track_watchlist_drop(reason: str, symbol: str, signal_type: str, direction:
         log(f"  🔇 Watchlist-Master: {n} Drops bisher (zuletzt: {signal_type} "
             f"{symbol} {dir_lbl} — {reason})")
 
+# ─── PURE_SIM Mode (v4.54) ──────────────────────────────────────────────────
+# PURE_SIM=1 (Default): alle Exchange-Write-Calls werden übersprungen.
+# Fills, TP- und SL-Hits werden intern via Mark-Price simuliert.
+# Read-only API-Calls (Mark Price) bleiben aktiv für realistische Preise.
+# PURE_SIM=0 (oder "false"/"no"/"off"): normaler Demo-API-Modus.
+PURE_SIM    = os.environ.get("PURE_SIM", "1").strip().lower() not in ("0", "false", "no", "off")
+SIM_BALANCE = float(os.environ.get("SIM_BALANCE", "10000"))  # virtuelles USDT-Kapital
+
+# Interner Sim-State (RAM-only, kein Bitget-API nötig)
+_sim: dict = {
+    "sizes":     {},   # sym → verbleibende offene Qty (float)
+    "tp_prices": {},   # sym → [tp1_price, tp2_price, tp3_price, tp4_price] (float)
+    "tp_filled": {},   # sym → set({0,1,2,...}) — bereits gefüllte TP-Indices
+    "sl_price":  {},   # sym → aktueller SL-Preis (float)
+    "pnl_log":   {},   # sym → [{"label","qty","price","pnl"}, ...]
+}
+# ─────────────────────────────────────────────────────────────────────────────
+
 BASE_URL = "https://api.bitget.com"
 
 # ═══════════════════════════════════════════════════════════════
@@ -1021,7 +1039,6 @@ H4_BUFFER_SEC  = _env_int("H4_BUFFER_SEC", 300)  # 5 Min
 harsi_warn_buffer:      list = []
 harsi_warn_buffer_lock  = __import__("threading").Lock()
 HARSI_WARN_BUFFER_SEC   = _env_int("HARSI_WARN_BUFFER_SEC", 60)  # 60s Sammelzeit
-HARSI_SCORE_PENALTY     = _env_int("HARSI_SCORE_PENALTY", 20)   # v4.53: Score-Malus wenn HARSI in Extremzone
 _harsi_warn_timer: object = None   # aktiver threading.Timer (oder None)
 
 trailing_sl_level: dict = {}  # {symbol: int} — 0=initial, 1=Entry, 2=TP1-Preis, 3=TP2-Preis
@@ -1908,6 +1925,8 @@ def _get_futures_balance_raw() -> float:
 
 def get_futures_balance() -> float:
     """Verfügbares USDT-Guthaben im Futures-Konto (mit 10s-Cache)."""
+    if PURE_SIM:
+        return SIM_BALANCE
     return _cached_read(
         "futures_balance",
         CACHE_TTL_BALANCE,
@@ -1921,6 +1940,21 @@ def get_futures_balance() -> float:
 
 def _get_all_positions_raw() -> list:
     """Alle offenen Futures-Positionen (ungecacht)."""
+    if PURE_SIM:
+        result = []
+        for sym, qty in list(_sim["sizes"].items()):
+            if qty <= 0:
+                continue
+            td = trade_data.get(sym, {})
+            result.append({
+                "symbol":       sym,
+                "holdSide":     td.get("direction", "long"),
+                "total":        str(qty),
+                "openPriceAvg": str(td.get("entry", 0)),
+                "leverage":     str(td.get("leverage", 1)),
+                "stopLossPrice": str(_sim["sl_price"].get(sym, 0)),
+            })
+        return result
     result = api_get("/api/v2/mix/position/all-position", {
         "productType": PRODUCT_TYPE,
         "marginCoin":  MARGIN_COIN,
@@ -2145,6 +2179,8 @@ def cancel_all_tp_orders(symbol: str, dom_only: bool = True):
     SL (loss_plan, pos_loss) und TP4 (pos_profit via place-pos-tpsl)
     werden NIE angefasst — diese werden per place-pos-tpsl ueberschrieben.
     """
+    if PURE_SIM:
+        return
     orders = _get_plan_orders(symbol)
     all_tp = [o for o in orders if o.get("planType") == "profit_plan"]
 
@@ -2274,6 +2310,19 @@ def place_tp_orders(symbol: str, avg: float, size: float,
     decimals = get_price_decimals(symbol)
     count    = 0
     prices   = []
+
+    # ── PURE_SIM: TP-Preise berechnen + speichern, keine API-Calls ──
+    if PURE_SIM:
+        tp_prices_sim = []
+        for roi in [TP1_ROI, TP2_ROI, TP3_ROI, TP4_ROI]:
+            tp_prices_sim.append(float(round_price(calc_tp_price(avg, roi, direction, leverage), decimals)))
+        _sim["tp_prices"][symbol] = tp_prices_sim
+        _sim["tp_filled"][symbol] = set()
+        lines = " | ".join(
+            f"TP{i+1}={p:.5f}" for i, p in enumerate(tp_prices_sim)
+        )
+        log(f"  [SIM] TP-Plan: {lines}")
+        return len(tp_prices_sim), tp_prices_sim
 
     # ── TP1–TP3: Teilschliessungen ───────────────────────────────
     partial_tps = [
@@ -2488,6 +2537,8 @@ def cancel_open_dca_orders(symbol: str, direction: str):
     Storniert alle noch offenen DCA Limit-Orders nach TP1.
     Nach SL auf Entry sind DCA-Nachkäufe nicht mehr gewünscht.
     """
+    if PURE_SIM:
+        return
     result = api_get("/api/v2/mix/order/orders-pending", {
         "symbol":      symbol,
         "productType": PRODUCT_TYPE,
@@ -2556,6 +2607,24 @@ def get_closed_pnl(symbol: str, since_ms: int) -> dict:
     Summiert ALLE Schliessungen (TP1, TP2, ... + SL) seit Trade-Eröffnung.
     So wird der echte Gesamt-P&L korrekt erfasst — auch bei Teiltrades.
     """
+    if PURE_SIM:
+        entries = _sim["pnl_log"].get(symbol, [])
+        if not entries:
+            return {}
+        total_pnl = sum(float(e.get("pnl", 0)) for e in entries)
+        prices    = [float(e["price"]) for e in entries if e.get("price")]
+        avg_close = sum(prices) / len(prices) if prices else 0
+        tp_closes = [{"size": e.get("qty", 0), "price": e.get("price", 0),
+                      "pnl": e.get("pnl", 0)} for e in entries]
+        return {
+            "realized_pnl": total_pnl,
+            "fee":          0.0,
+            "net_pnl":      total_pnl,
+            "close_price":  avg_close,
+            "num_closes":   len(entries),
+            "tp_closes":    tp_closes,
+            "hold_time":    0,
+        }
     result = api_get("/api/v2/mix/order/fill-history", {
         "symbol":      symbol,
         "productType": PRODUCT_TYPE,
@@ -2990,7 +3059,12 @@ def set_sl_at_entry(symbol: str, direction: str, entry_price: float,
         body_sl["stopSurplusTriggerType"]  = "mark_price"
         log(f"  TP4 @ {existing_tp4} wird mitgeführt")
 
-    result = api_post("/api/v2/mix/order/place-pos-tpsl", body_sl)
+    if PURE_SIM:
+        _sim["sl_price"][symbol] = entry_price
+        result = {"code": "00000"}
+        log(f"  [SIM] SL auf {sl_label} gesetzt: {sl_str} USDT ({symbol})")
+    else:
+        result = api_post("/api/v2/mix/order/place-pos-tpsl", body_sl)
 
     if result.get("code") == "00000":
         log(f"  ✓ SL auf {sl_label} gesetzt: {sl_str} USDT ({symbol})")
@@ -3085,7 +3159,12 @@ def set_sl_trailing(symbol: str, direction: str, sl_price: float, level: int,
     tp_label   = {2: "TP2", 3: "TP3"}.get(level, "?")
     prev_label = {2: "TP1 (10% ROI)", 3: "TP2 (20% ROI)"}.get(level, "?")
 
-    result = api_post("/api/v2/mix/order/place-pos-tpsl", body_sl)
+    if PURE_SIM:
+        _sim["sl_price"][symbol] = sl_price
+        result = {"code": "00000"}
+        log(f"  [SIM] Trailing-SL Level {level} gesetzt: {sl_str} ({symbol})")
+    else:
+        result = api_post("/api/v2/mix/order/place-pos-tpsl", body_sl)
     if result.get("code") == "00000":
         trailing_sl_level[symbol] = level
         sl_set_ts[symbol]         = time.time()
@@ -3151,7 +3230,12 @@ def set_sl_harsi(symbol: str, direction: str, harsi_price: float, cur_size: floa
         body_sl["stopSurplusTriggerPrice"] = round_price(existing_tp4, decimals)
         body_sl["stopSurplusTriggerType"]  = "mark_price"
 
-    result = api_post("/api/v2/mix/order/place-pos-tpsl", body_sl)
+    if PURE_SIM:
+        _sim["sl_price"][symbol] = harsi_price
+        result = {"code": "00000"}
+        log(f"  [SIM] HARSI-SL gesetzt: {sl_str} ({symbol})")
+    else:
+        result = api_post("/api/v2/mix/order/place-pos-tpsl", body_sl)
     if result.get("code") == "00000":
         _log_pos_event(symbol, direction, "SL_HARSI",
                        old_sl=f"{current_sl:.5f}" if current_sl else "",
@@ -3515,6 +3599,9 @@ def set_leverage_on_bitget(symbol: str, direction: str, leverage: int) -> dict:
 
     Returns: Response-Dict von Bitget (code, msg, data).
     """
+    if PURE_SIM:
+        log(f"  [SIM] Hebel {leverage}x gesetzt ({symbol} {direction})")
+        return {"code": "00000"}
     res = api_post("/api/v2/mix/account/set-leverage", {
         "symbol":      symbol,
         "productType": PRODUCT_TYPE,
@@ -3626,6 +3713,25 @@ def execute_trade_order(symbol: str, direction: str, leverage: int,
     log(f"  {direction.upper()} | Entry={entry} | SL={sl} | Hebel={leverage}x")
     log(f"  Initial-Margin: {initial_margin:.2f} USDT | Qty: {qty_str} | "
         f"Notional: {notional:.2f} USDT")
+
+    # ── 3. PURE_SIM: Direkte Simulation ohne Exchange-Calls ─────────────
+    if PURE_SIM:
+        _sim["sizes"][symbol]    = qty
+        _sim["tp_filled"][symbol] = set()
+        _sim["pnl_log"][symbol]  = []
+        _sim["sl_price"][symbol] = sl
+        log(f"  [SIM] ✓ Trade eröffnet: {symbol} {direction.upper()} "
+            f"Qty={qty_str} Entry={entry} SL={sl} Hebel={leverage}x")
+        return {
+            "ok":             True,
+            "orderId":        f"SIM-{symbol}-{int(time.time())}",
+            "qty":            qty_str,
+            "leverage":       leverage,
+            "entry":          entry,
+            "sl":             str(round(sl, 8)),
+            "initial_margin": round(initial_margin, 2),
+            "notional":       round(notional, 2),
+        }
 
     # ── 3. Hebel auf Bitget setzen (mit Auto-Fallback auf Bitget-Max) ──
     lev_res = set_leverage_on_bitget(symbol, direction, leverage)
@@ -4894,15 +5000,12 @@ def score_entry(e: dict) -> dict:
         else:
             breakdown.append(f"±0 WR n/a ({n_tr}T)")
 
-    # 6) HARSI-Divergenz-Flag (+5 / Malus) — v4.53 Option B
+    # 6) HARSI-Divergenz-Flag (+5 / Warnung)
     if harsi_w == 0:
         score += 5
         breakdown.append("+5 kein HARSI-warn")
     else:
-        _penalty = min(int(HARSI_SCORE_PENALTY), 30)
-        score -= _penalty
-        breakdown.append(f"\u2212{_penalty} HARSI in Extremzone")
-        warnings.append("HARSI noch in Extremzone \u2014 Score reduziert")
+        warnings.append("HARSI-Divergenz aktiv")
 
     # 7) Timing-Frische (+5 bis 0)
     if elapsed_m <= 30:
@@ -9324,18 +9427,8 @@ def start_webhook_server():
             btc_t2_txt = "BTC + Total2 gleiche Richtung ✓"
         premium_txt  = "Premium-Setup (dunkelgrün/-rot)"   if premium_val     == 1 else "Kein Premium (höheres Risiko)"
 
-        # v4.53 Option B: harsi_warn=1 → Queue mit Score-Malus
+        # v4.38: harsi_warn=1 → Signale bündeln statt einzeln senden
         if harsi_warn_val != 0:
-            if ENTRY_QUEUE_ENABLED:
-                _sugg_hw = build_trade_suggestion(symbol, direction, entry, data.get("sling_sl"), data.get("atr"))
-                enqueue_entry({"symbol": symbol, "direction": direction, "entry": entry, "warn_line": "\u26a0\ufe0f HARSI noch in Extremzone \u2014 Score reduziert", "timing_elapsed_min": 0, "sugg": _sugg_hw, "harsi_warn": 1, "sling_sl": data.get("sling_sl"), "atr": data.get("atr"), "xinfo": _xinfo, "source": "H2_SIGNAL_HARSI_WARN", "ts": __import__("time").time()})
-                if f"{symbol}_{direction}" in last_h2_signal_time:
-                    del last_h2_signal_time[f"{symbol}_{direction}"]
-                    save_state()
-                log(f"HARSI-Warn-Queue: {symbol} {direction} eingereiht (Score-Malus {HARSI_SCORE_PENALTY}pt)")
-                return
-            # Fallback: alter Buffer-Pfad wenn Queue disabled
-        if False and harsi_warn_val != 0:  # dead code — nur Queue-disabled Fallback
             _h2_ts      = _ensure_aware_utc(last_h2_signal_time.get(
                 f"{symbol}_{direction}", datetime.now(timezone.utc)))
             _expiry_utc = _h2_ts + timedelta(minutes=30)
@@ -9416,7 +9509,7 @@ def start_webhook_server():
     @app.route("/", methods=["GET"])
     @app.route("/health", methods=["GET"])
     def health():
-        return jsonify({"status": "running", "version": "v4.53", "mode": "DEMO"}), 200
+        return jsonify({"status": "running", "version": "v4.46", "mode": "DEMO"}), 200
 
     @app.route("/dashboard", methods=["GET"])
     def dashboard():
@@ -9760,6 +9853,10 @@ def check_and_repair_position(pos: dict):
       4. TP1 done → DCAs stornieren, fertig.
       5. Noch kein TP → 2 DCA Limit-Orders prüfen, fehlende nachsetzen.
     """
+    if PURE_SIM:
+        log(f"  [SIM] check_and_repair_position übersprungen (PURE_SIM-Modus)")
+        return
+
     symbol    = pos.get("symbol", "?")
     direction = pos.get("holdSide", "long")
     avg       = float(pos.get("openPriceAvg", 0))
@@ -10422,16 +10519,103 @@ def report_position_startup(pos: dict):
         log(f"  ✓ Kein Handlungsbedarf erkannt")
 
 
-def main():
-    if not API_KEY or not SECRET_KEY or not PASSPHRASE:
-        log("FEHLER: DEMO_API_KEY, DEMO_SECRET_KEY oder DEMO_PASSPHRASE fehlen!")
-        log("In Railway → Variables eintragen (Demo-Keys aus Bitget Demo-Konto).")
-        log("  → Bitget: Futures → Klassisches Demo-Trading → API-Keys erstellen")
-        return
+def _sim_check_tp_sl():
+    """
+    PURE_SIM: Prüft alle offenen Sim-Positionen gegen TP- und SL-Preise
+    über die (read-only) Mark-Price-API. Wird jeden Poll-Zyklus aufgerufen.
+    """
+    for sym in list(_sim["sizes"].keys()):
+        qty = _sim["sizes"].get(sym, 0)
+        if qty <= 0:
+            continue
 
-    log("DOMINUS Demo-Bot v4.53 gestartet [DEMO-MODUS — Paper Trading]")
-    log("  Bitget Demo-Account Keys aktiv (DEMO_API_KEY / DEMO_SECRET_KEY)")
-    log("  Kein paperId-Header — Demo-Routing via separate API-Credentials")
+        mark = get_mark_price(sym)
+        if mark <= 0:
+            continue
+
+        td        = trade_data.get(sym, {})
+        direction = td.get("direction", "long")
+        entry     = float(td.get("entry", 0))
+        leverage  = int(td.get("leverage", 1))
+
+        # ── SL check ─────────────────────────────────────────
+        sl = _sim["sl_price"].get(sym, 0)
+        if sl > 0:
+            sl_hit = (direction == "long"  and mark <= sl) or                      (direction == "short" and mark >= sl)
+            if sl_hit:
+                pnl = qty * (mark - entry if direction == "long" else entry - mark)
+                _sim["pnl_log"].setdefault(sym, []).append(
+                    {"label": "SL", "qty": qty, "price": mark, "pnl": pnl}
+                )
+                _sim["sizes"][sym] = 0
+                log(f"  [SIM] ⛔ SL @ {mark:.5f} ({sym}) | PnL {pnl:+.2f} USDT")
+                # Trigger normal close-handling so Telegram report fires
+                try:
+                    handle_position_closed(sym, "SIM-SL")
+                except Exception as _e:
+                    log(f"  [SIM] handle_position_closed Fehler: {_e}")
+                continue
+
+        # ── TP check ─────────────────────────────────────────
+        tp_prices = _sim["tp_prices"].get(sym, [])
+        filled    = _sim["tp_filled"].get(sym, set())
+
+        for i, (tp, pct) in enumerate(zip(tp_prices, TP_CLOSE_PCTS)):
+            if i in filled:
+                continue
+            tp_hit = (direction == "long"  and mark >= tp) or                      (direction == "short" and mark <= tp)
+            if not tp_hit:
+                continue
+
+            # Last TP: close everything remaining
+            if i == len(tp_prices) - 1:
+                close_qty = _sim["sizes"].get(sym, 0)
+            else:
+                close_qty = snap_qty(sym, _sim["sizes"].get(sym, 0) * pct)
+                close_qty = min(close_qty, _sim["sizes"].get(sym, 0))
+
+            if close_qty <= 0:
+                filled.add(i)
+                continue
+
+            pnl = close_qty * (mark - entry if direction == "long" else entry - mark)
+            _sim["pnl_log"].setdefault(sym, []).append(
+                {"label": f"TP{i+1}", "qty": close_qty, "price": mark, "pnl": pnl}
+            )
+            _sim["sizes"][sym] = max(0.0, _sim["sizes"].get(sym, 0) - close_qty)
+            filled.add(i)
+            _sim["tp_filled"][sym] = filled
+            log(f"  [SIM] ✅ TP{i+1} @ {mark:.5f} ({sym}) | "
+                f"-{close_qty} Ktr | PnL {pnl:+.2f} USDT | "
+                f"Rest: {_sim['sizes'][sym]:.4f}")
+
+            # Simulate downstream SL actions (like trailing after TP1)
+            # The main loop already calls set_sl_at_entry / set_sl_trailing
+            # based on size-ratio detection from _get_all_positions_raw().
+
+            if _sim["sizes"][sym] <= 0:
+                log(f"  [SIM] Position vollständig geschlossen: {sym}")
+                try:
+                    handle_position_closed(sym, f"SIM-TP{i+1}")
+                except Exception as _e:
+                    log(f"  [SIM] handle_position_closed Fehler: {_e}")
+                break
+
+
+def main():
+    if PURE_SIM:
+        log("DOMINUS Demo-Bot v4.54 gestartet [PURE_SIM — kein Exchange benötigt]")
+        log(f"  Virtuelles Kapital: {SIM_BALANCE:.2f} USDT")
+        log("  Alle Exchange-Writes simuliert | Mark-Price (read-only) aktiv")
+    else:
+        if not API_KEY or not SECRET_KEY or not PASSPHRASE:
+            log("FEHLER: DEMO_API_KEY, DEMO_SECRET_KEY oder DEMO_PASSPHRASE fehlen!")
+            log("In Railway → Variables eintragen (Demo-Keys aus Bitget Demo-Konto).")
+            log("  → Bitget: Futures → Klassisches Demo-Trading → API-Keys erstellen")
+            return
+        log("DOMINUS Demo-Bot v4.54 gestartet [DEMO-MODUS — Paper Trading]")
+        log("  Bitget Demo-Account Keys aktiv (DEMO_API_KEY / DEMO_SECRET_KEY)")
+        log("  Kein paperId-Header — Demo-Routing via separate API-Credentials")
     log(f"  Telegram Demo-Kanal: {TELEGRAM_CHAT_ID}")
     log("  Demo-Trades werden in demo_trades.json gespeichert")
     log(f"Intervall: {POLL_INTERVAL}s")
@@ -10503,6 +10687,10 @@ def main():
         try:
             # ── 0. Telegram-Befehle prüfen ─────────────────
             poll_telegram_commands()
+
+            # ── 0-SIM. Sim-Positionen auf TP/SL prüfen ─────
+            if PURE_SIM:
+                _sim_check_tp_sl()
 
             # ── 0a. Auto Daily Report um 23:59 ─────────────
             global daily_report_sent_date, weekly_report_sent_week
