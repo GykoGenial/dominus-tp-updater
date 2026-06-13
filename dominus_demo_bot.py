@@ -9561,7 +9561,34 @@ def start_webhook_server():
     @app.route("/", methods=["GET"])
     @app.route("/health", methods=["GET"])
     def health():
-        return jsonify({"status": "running", "version": "v4.46", "mode": "DEMO"}), 200
+        return jsonify({"status": "running", "version": "v4.60", "mode": "DEMO"}), 200
+
+    @app.route("/state/<symbol>", methods=["GET"])
+    def symbol_state(symbol: str):
+        """v4.60 Demo: H4-Trigger-State + Positions-Info für TradingView request.json()."""
+        sym         = symbol.upper().strip()
+        long_state  = h4_trigger_state.get(f"{sym}_long",  {})
+        short_state = h4_trigger_state.get(f"{sym}_short", {})
+        td          = trade_data.get(sym, {})
+        has_pos     = sym in last_known_avg and float(last_known_avg.get(sym, 0)) > 0
+        pos_entry   = float(last_known_avg.get(sym, 0))
+        pos_size    = float(last_known_size.get(sym, 0))
+        leverage    = int(td.get("leverage", 0)) if td.get("leverage") else 0
+        return jsonify({
+            "symbol":           sym,
+            "mode":             "DEMO",
+            "h4_long_active":   bool(long_state.get("active", False)),
+            "h4_short_active":  bool(short_state.get("active", False)),
+            "h4_long_entry":    round(float(long_state["entry"]),  8) if long_state.get("entry")  else None,
+            "h4_short_entry":   round(float(short_state["entry"]), 8) if short_state.get("entry") else None,
+            "h4_long_age_min":  round((time.time() - float(long_state["ts"]))  / 60, 1) if long_state.get("ts")  else None,
+            "h4_short_age_min": round((time.time() - float(short_state["ts"])) / 60, 1) if short_state.get("ts") else None,
+            "has_position":     has_pos,
+            "position_side":    td.get("direction", ""),
+            "position_entry":   round(pos_entry, 8) if pos_entry else None,
+            "position_size":    round(pos_size,  4) if pos_size  else None,
+            "leverage":         leverage,
+        }), 200
 
     @app.route("/dashboard", methods=["GET"])
     def dashboard():
