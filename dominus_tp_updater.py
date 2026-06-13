@@ -11935,7 +11935,52 @@ def start_webhook_server():
     @app.route("/", methods=["GET"])
     @app.route("/health", methods=["GET"])
     def health():
-        return jsonify({"status": "running", "version": "v4.46"}), 200
+        return jsonify({"status": "running", "version": "v4.60"}), 200
+
+    # ─── v4.60: Öffentlicher Read-Endpoint für TradingView request.json() ────
+    # Pine Script (DOM-LIQ v2.0) ruft diesen Endpoint ab, um:
+    #   • Aktuellen Hebel (Kelly-berechnet) anzuzeigen
+    #   • Autoritativen H4-Trigger-State (nicht request.security Approximation)
+    #   • Ob bereits eine offene Position existiert (verhindert Doppeleinstieg)
+    #
+    # Aufruf in Pine: request.json("https://DEIN-BOT.railway.app/state/ETHUSDT")
+    # Kein Auth nötig — nur Lese-Zugriff auf öffentliche State-Daten.
+    # Refresh: nur bei Bar-Close (Pine-Limitation).
+    @app.route("/state/<symbol>", methods=["GET"])
+    def symbol_state(symbol: str):
+        """Gibt H4-Trigger-State + Positions-Info für ein Symbol zurück."""
+        sym = symbol.upper().strip()
+
+        # H4-Trigger State (von DOM-LIQ v2.0 gesetzt)
+        long_state  = h4_trigger_state.get(f"{sym}_long",  {})
+        short_state = h4_trigger_state.get(f"{sym}_short", {})
+
+        # Offene Position aus trade_data
+        td = trade_data.get(sym, {})
+        has_pos    = sym in last_known_avg and float(last_known_avg.get(sym, 0)) > 0
+        pos_side   = td.get("direction", "")
+        pos_entry  = float(last_known_avg.get(sym, 0))
+        pos_size   = float(last_known_size.get(sym, 0))
+
+        # Letzter Hebel (aus trade_data, falls vorhanden)
+        leverage   = int(td.get("leverage", 0)) if td.get("leverage") else 0
+
+        return jsonify({
+            "symbol":           sym,
+            # H4-Trigger (Railway-Gate autoritativ)
+            "h4_long_active":   bool(long_state.get("active", False)),
+            "h4_short_active":  bool(short_state.get("active", False)),
+            "h4_long_entry":    round(float(long_state["entry"]),  8) if long_state.get("entry")  else None,
+            "h4_short_entry":   round(float(short_state["entry"]), 8) if short_state.get("entry") else None,
+            "h4_long_age_min":  round((time.time() - float(long_state["ts"]))  / 60, 1) if long_state.get("ts")  else None,
+            "h4_short_age_min": round((time.time() - float(short_state["ts"])) / 60, 1) if short_state.get("ts") else None,
+            # Position
+            "has_position":     has_pos,
+            "position_side":    pos_side,
+            "position_entry":   round(pos_entry, 8) if pos_entry else None,
+            "position_size":    round(pos_size,  4) if pos_size  else None,
+            "leverage":         leverage,
+        }), 200
 
     @app.route("/dashboard", methods=["GET"])
     def dashboard():
