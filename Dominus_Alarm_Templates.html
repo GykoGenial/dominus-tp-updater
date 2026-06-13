@@ -149,7 +149,7 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#111114;color:#de
 <div class="wrap">
 
 <div class="page-title">DOMINUS Alarm-Templates</div>
-<div class="page-sub">TradingView &rarr; Railway Webhook &rarr; Telegram &middot; DOM-ORC v2.5 &middot; Railway v4.36 &mdash; Dark Mode &mdash; Stand Mai 2026</div>
+<div class="page-sub">TradingView &rarr; Railway Webhook &rarr; Telegram &middot; DOM-ORC v3.0 &middot; Railway v4.60 &mdash; Dark Mode &mdash; Stand Juni 2026</div>
 
 <!-- ======================================== -->
 <!-- 1. EINSTELLUNGEN / SETUP                  -->
@@ -195,7 +195,7 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#111114;color:#de
       <div style="background:#0d1a0d;border:1px solid #2a4a2a;border-radius:10px;padding:10px 12px">
         <div style="font-size:11px;font-weight:700;color:#5EC45E;text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px">&#x2705; Pine-basiert &mdash; Token automatisch</div>
         <div style="font-size:12px;color:#B8B8C0;line-height:1.55">
-          Alarme vom Typ <code>Any alert() function call</code> (z.&#8239;B. <b>4c</b>, <b>5c</b>, <b>Sling-SL Universal</b>): Der Token steht im <b>Indikator-Setting</b> <code>webhook_token</code> des <code>Dominus_Orchestrator_v2.5</code> und wird bei jedem Pine-<code>alert()</code>-Aufruf automatisch mitgesendet.
+          Alarme vom Typ <code>Any alert() function call</code> (z.&#8239;B. <b>4c</b>, <b>5c</b>, <b>Sling-SL Universal</b>): Der Token steht im <b>Indikator-Setting</b> <code>webhook_token</code> des <code>Dominus_Orchestrator_v3.0</code> und wird bei jedem Pine-<code>alert()</code>-Aufruf automatisch mitgesendet.
         </div>
         <div style="margin-top:6px;font-size:11px;color:#5EC45E">&rarr; Message-Feld in TV: <b>leer lassen</b>. Nichts zu tun.</div>
       </div>
@@ -214,9 +214,9 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#111114;color:#de
   <div class="field">
     <div class="field-label"><span>&#x1F4D6; Pine-Setup (einmalig, im TradingView-Indikator)</span></div>
     <div style="background:#0d1f2d;border:1px solid rgba(123,184,245,0.25);border-radius:10px;padding:12px 14px;font-size:12px;line-height:1.65;color:#B8B8C0">
-      F&uuml;r alle Pine-basierten Alarme (<code>Any alert() function call</code>) muss der Token einmalig im <b>DOM-ORC v2.5</b>-Indikator gesetzt werden:
+      F&uuml;r alle Pine-basierten Alarme (<code>Any alert() function call</code>) muss der Token einmalig im <b>DOM-ORC v3.0</b>-Indikator gesetzt werden:
       <ol style="margin:8px 0 0 20px;padding:0;color:#deded8;font-size:12px;line-height:1.8">
-        <li>TradingView-Chart &rarr; Indikator <b>Dominus Orchestrator v2.5</b> &rarr; Zahnrad-Icon &rarr; <b>Einstellungen</b></li>
+        <li>TradingView-Chart &rarr; Indikator <b>Dominus Orchestrator v3.0</b> &rarr; Zahnrad-Icon &rarr; <b>Einstellungen</b></li>
         <li>Feld <code>Webhook-Token (aus Railway)</code> &rarr; deinen echten <code>WEBHOOK_SECRET</code> einf&uuml;gen</li>
         <li>Mit <b>OK</b> best&auml;tigen &mdash; der Token wird in jedem Pine-<code>alert()</code> automatisch mitgeschickt</li>
       </ol>
@@ -239,10 +239,13 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#111114;color:#de
       <div style="background:#0e1f33;border-radius:6px;padding:7px 10px;font-size:11.5px;border:0.5px solid rgba(123,184,245,0.2)"><code style="color:#7BB8F5">FUNDING_WARN_THRESHOLD</code> <span style="color:#666">= -0.0005</span></div>
       <div style="background:#1a1a1e;border-radius:6px;padding:7px 10px;font-size:11.5px"><code style="color:#888">USE_LIMIT_TP</code> <span style="color:#666">= 0 (optional: 1)</span></div>
       <div style="background:#1a1a1e;border-radius:6px;padding:7px 10px;font-size:11.5px"><code style="color:#888">ORDER_PREFIX</code> <span style="color:#666">= DOM_ (eigene Orders)</span></div>
+      <div style="background:#1a1200;border-radius:6px;padding:7px 10px;font-size:11.5px;border:0.5px solid rgba(224,144,64,0.3)"><code style="color:#E09040">BYBIT_API_KEY</code> / <code style="color:#E09040">BYBIT_SECRET</code> <span style="color:#666">&mdash; Bybit API-Zugang</span></div>
+      <div style="background:#1a1200;border-radius:6px;padding:7px 10px;font-size:11.5px;border:0.5px solid rgba(224,144,64,0.3)"><code style="color:#E09040">PENDING_SIGNALS_FILE</code> <span style="color:#666">= /app/data/pending_signals.json</span></div>
     </div>
     <div style="margin-top:7px;font-size:11px;color:#666;line-height:1.5">
-      <span style="color:#5EC45E">&#x25CF;</span> Grün = neu in v4.36 &mdash; zwingend für Vollautomatik &nbsp;|&nbsp;
-      <span style="color:#7BB8F5">&#x25CF;</span> Blau = neue Finanz-Fixes &nbsp;|&nbsp;
+      <span style="color:#5EC45E">&#x25CF;</span> Grün = Vollautomatik &nbsp;|&nbsp;
+      <span style="color:#7BB8F5">&#x25CF;</span> Blau = Finanz-Fixes &nbsp;|&nbsp;
+      <span style="color:#E09040">&#x25CF;</span> Orange = neu in v4.57–v4.60 &nbsp;|&nbsp;
       <span style="color:#888">&#x25CF;</span> Grau = optional
     </div>
   </div>
@@ -349,7 +352,7 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#111114;color:#de
     <div style="font-size:11px;color:#555;letter-spacing:.05em;text-transform:uppercase;margin-bottom:7px">Sektionen</div>
     <div style="display:flex;flex-wrap:wrap;gap:6px">
       <a href="#sec-setup"    style="font-size:12px;padding:4px 10px;border-radius:6px;background:#0d2820;color:#4ECBA0;text-decoration:none;border:0.5px solid rgba(78,203,160,0.25)">&#x2699; Einstellungen &amp; Token</a>
-      <a href="#sec-whatsnew" style="font-size:12px;padding:4px 10px;border-radius:6px;background:#2a1b3d;color:#C28AF5;text-decoration:none;border:0.5px solid rgba(194,138,245,0.25)">&#x2728; Was ist neu (v4.31&ndash;v4.36 + ORC v2.5)</a>
+      <a href="#sec-whatsnew" style="font-size:12px;padding:4px 10px;border-radius:6px;background:#2a1b3d;color:#C28AF5;text-decoration:none;border:0.5px solid rgba(194,138,245,0.25)">&#x2728; Was ist neu (v4.55&ndash;v4.60 + ORC v3.0)</a>
       <a href="#sec-harsi"    style="font-size:12px;padding:4px 10px;border-radius:6px;background:#252528;color:#909090;text-decoration:none;border:0.5px solid rgba(0,0,0,0.09)">&#x26A0; HARSI-Konzept</a>
       <a href="#sec-alarm2"   style="font-size:12px;padding:4px 10px;border-radius:6px;background:#162a16;color:#5EC45E;text-decoration:none;border:0.5px solid rgba(0,0,0,0.06)">2 Long Entry</a>
       <a href="#sec-alarm2b"  style="font-size:12px;padding:4px 10px;border-radius:6px;background:#2e1616;color:#F07070;text-decoration:none;border:0.5px solid rgba(0,0,0,0.06)">2b Short Entry</a>
@@ -386,76 +389,80 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#111114;color:#de
   <div class="card-head">
     <div class="step-badge" style="background:#2a1b3d;color:#C28AF5">&#x2728;</div>
     <div>
-      <div class="h2">Was ist neu in v4.31 &ndash; v4.36 + DOM-ORC v2.5</div>
-      <div class="sub">Alle &Auml;nderungen seit der letzten Doku-Revision (v4.30)</div>
+      <div class="h2">Was ist neu in v4.55 &ndash; v4.60 + DOM-ORC v3.0</div>
+      <div class="sub">Alle &Auml;nderungen seit der letzten Doku-Revision (v4.36 / DOM-ORC v2.5)</div>
     </div>
   </div>
 
   <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
 
-    <!-- ORC v2.5 -->
+    <!-- DOM-ORC v3.0 -->
     <div style="background:#0e1f33;border:1px solid rgba(123,184,245,0.35);border-radius:10px;padding:10px 12px">
-      <div style="font-size:11px;font-weight:700;color:#7BB8F5;text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px">DOM-ORC v2.5 &middot; Jochen-Fix</div>
+      <div style="font-size:11px;font-weight:700;color:#7BB8F5;text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px">DOM-ORC v3.0 &middot; H2 Entry-Linien</div>
       <div style="font-size:12px;color:#B8B8C0;line-height:1.6">
-        <strong style="color:#deded8">FIX 1 — Simultaner H4+H2 &rarr; Trigger verwerfen:</strong> War H4-Trigger und H2-Signal auf derselben Bar, blieb <code>h4_long_active = true</code> &rarr; n&auml;chster H2 wurde f&auml;lschlich als valid gewertet. Jetzt: simultaner Schluss &rarr; Trigger komplett verworfen, neuer H4 n&ouml;tig (Jochen: &ldquo;Dann wartest du auf den n&auml;chsten H4 Tr&auml;ger.&rdquo;)<br><br>
-        <strong style="color:#deded8">FIX 2 — HARSI-Fenster konfigurierbar:</strong> War hardcoded auf 1 H2-Bar (2h). Jetzt: neuer Input <code>harsi_wait_bars</code> (Standard 15 = 30h). Tabelle zeigt <strong>&ldquo;VERWORFEN&rdquo;</strong> bei simultanem Schluss.
+        <strong style="color:#deded8">H2 Entry-Linie (gestrichelt):</strong> Nach dem H4-Richtungssignal zeigt eine gestrichelte Vertikallinie den letzten g&uuml;ltigen H2-Entry &mdash; <span style="color:#69F0AE">hellgr&uuml;n #69F0AE</span> f&uuml;r LONG, <span style="color:#FF6D00">orange #FF6D00</span> f&uuml;r SHORT, 2&nbsp;px. Erlaubt visuelle Kontrolle ob Alarm 2/2b korrekt ausgel&ouml;st hat.<br><br>
+        <strong style="color:#deded8">Neue Inputs:</strong> <code>show_h2_vline</code> (an/aus), <code>h2_vline_width</code> (1–4&nbsp;px). Kombiniert mit den H4-Linien aus v2.9 (solide, 4&nbsp;px, #00C853&#x2F;#D50000) vollst&auml;ndige visuelle Pipeline.
       </div>
     </div>
 
-    <!-- v4.36 Finanz-Fixes -->
-    <div style="background:#0d1f0d;border:1px solid rgba(94,196,94,0.30);border-radius:10px;padding:10px 12px">
-      <div style="font-size:11px;font-weight:700;color:#5EC45E;text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px">v4.36 &middot; 8 Finanz-Fixes</div>
+    <!-- DOM-ORC v2.9 -->
+    <div style="background:#0e1f33;border:1px solid rgba(123,184,245,0.25);border-radius:10px;padding:10px 12px">
+      <div style="font-size:11px;font-weight:700;color:#7BB8F5;text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px">DOM-ORC v2.9 &middot; HARSI_SL built-in + H4-Linien</div>
       <div style="font-size:12px;color:#B8B8C0;line-height:1.6">
-        <b>FIX 4</b> Taker-Fee in <code>calc_tp_price()</code> eingerechnet (<code>TAKER_FEE=0.0006</code>) &mdash; TP-Preise ber&uuml;cksichtigen jetzt Entry+Exit-Geb&uuml;hren.<br>
-        <b>FIX 3</b> Race-Condition geschlossen: neue TPs werden ZUERST platziert, dann alte storniert.<br>
-        <b>FIX 12</b> Debounce-Lock verhindert Doppel-Aufrufe bei gleichzeitigen DCA-Fills.<br>
-        <b>FIX 11</b> <code>cancel_all_tp_orders(dom_only=True)</code>: nur <code>DOM_</code>-eigene Orders storniert.<br>
-        <b>FIX 10</b> TP-Verifikation 3s nach Platzierung mit Telegram-Alarm bei Fehler.<br>
-        <b>FIX 9</b> Timestamp-L&uuml;cke im Main-Loop: <code>fetch_time</code> vor API-Call gesetzt.<br>
-        <b>FIX 6</b> <code>USE_LIMIT_TP</code> optional: Limit-Order statt Market bei TPs.<br>
-        <b>FIX 5</b> Funding Rate Warnung nach DCA-Update.
+        <strong style="color:#deded8">HARSI_SL jetzt direkt in DOM-ORC:</strong> Der v4.11-Pine-Snippet ist <strong style="color:#5EC45E">nicht mehr n&ouml;tig</strong> &mdash; DOM-ORC v2.9+ sendet HARSI_SL-Signale automatisch via <code>alert()</code>.<br><br>
+        <strong style="color:#deded8">H4-Vertikallinie:</strong> Solide Linie (4&nbsp;px) beim letzten H4-Richtungswechsel &mdash; gr&uuml;n #00C853 (Long) / rot #D50000 (Short). Erlaubt sofortige Sichtkontrolle.
       </div>
     </div>
 
-    <!-- v4.36 Vollautomatik -->
+    <!-- DOM-ORC v2.8 -->
+    <div style="background:#252528;border:1px solid rgba(255,255,255,0.08);border-radius:10px;padding:10px 12px">
+      <div style="font-size:11px;font-weight:700;color:#888;text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px">DOM-ORC v2.8 &middot; exchange-Feld in allen Alerts</div>
+      <div style="font-size:12px;color:#B8B8C0;line-height:1.6">
+        Alle <code>alert()</code>-Calls (H2_SIGNAL, HARSI_EXIT, HARSI_SL, SLING_SL) enthalten jetzt ein <code>"exchange"</code>-Feld. Mögliche Werte: <code>"bitget"</code> (Standard) oder <code>"bybit"</code>. Railway verwendet diesen Wert für das Routing zur richtigen Exchange-API.
+      </div>
+    </div>
+
+    <!-- v4.60 Persistenter Startup-Catchup -->
     <div style="background:#0d1f0d;border:1px solid rgba(78,203,160,0.35);border-radius:10px;padding:10px 12px">
-      <div style="font-size:11px;font-weight:700;color:#4ECBA0;text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px">v4.36 &middot; &#x1F916; Vollautomatik</div>
+      <div style="font-size:11px;font-weight:700;color:#4ECBA0;text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px">v4.60 &middot; Persistenter Startup-Catchup</div>
       <div style="font-size:12px;color:#B8B8C0;line-height:1.6">
-        Nach dem Slot-Flush wird <strong style="color:#deded8"><code>ranked[0]</code> (Top-Scorer) sofort ohne Button-Tap</strong> via <code>execute_trade_order()</code> ausgef&uuml;hrt wenn <code>AUTO_TRADE_ENABLED=1</code>. Two-Tap-Confirm entf&auml;llt.<br><br>
-        Telegram-Flow: <em>Slot-Overview wie bisher</em> &rarr; <em>&#x1F916; Auto-Execute &mdash; Top-Score</em> (mit Symbol/Score/Entry/SL) &rarr; <em>&#x2705; Order platziert</em> oder <em>&#x274C; Fehlgeschlagen</em>.<br><br>
-        Optional: <code>MAX_AUTO_TRADE_USDT</code> setzt Hard-Cap pro Trade (empfohlen w&auml;hrend Testphase).
+        <strong style="color:#deded8">Problem:</strong> Container-Restart w&auml;hrend des 90s-Flush-Fensters vernichtete alle pending Signale (PEPE-Incident).<br><br>
+        <strong style="color:#deded8">Fix:</strong> <code>pending_entries</code> wird bei jedem Signal atomar auf <code>/app/data/pending_signals.json</code> gespeichert. Beim Startup werden Signale &lt;&nbsp;1800s (30&nbsp;Min) wiederhergestellt. Neue Railway Variable: <code>PENDING_SIGNALS_FILE</code>.
       </div>
     </div>
 
-    <!-- v4.36 channel_post Fix -->
-    <div style="background:#252528;border:1px solid rgba(255,255,255,0.08);border-radius:10px;padding:10px 12px">
-      <div style="font-size:11px;font-weight:700;color:#888;text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px">v4.36 &middot; Telegram Kanal-Fix</div>
+    <!-- v4.60 harsi_caution Score-Malus -->
+    <div style="background:#1a1200;border:1px solid rgba(224,144,64,0.30);border-radius:10px;padding:10px 12px">
+      <div style="font-size:11px;font-weight:700;color:#E09040;text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px">v4.60 &middot; harsi_caution &minus;3 Score-Malus</div>
       <div style="font-size:12px;color:#B8B8C0;line-height:1.6">
-        Telegram unterscheidet zwischen <strong style="color:#deded8">Gruppen</strong> (<code>update.message</code>) und <strong style="color:#deded8">Kan&auml;len</strong> (<code>update.channel_post</code>). Der Bot pr&uuml;fte nur <code>message</code> &rarr; Befehle in Kan&auml;len wurden stillschweigend ignoriert.<br><br>
-        Fix: <code>msg = update.get("message") or update.get("channel_post")</code> &mdash; /status, /berechnen etc. funktionieren jetzt sowohl in Gruppen als auch in Kan&auml;len.
+        <strong style="color:#deded8">Neues Signal-Feld:</strong> <code>harsi_caution</code> kennzeichnet die HARSI-Vorsichtszone (&minus;10 bis &minus;20), die bisher vom Railway-Script komplett ignoriert wurde.<br><br>
+        <strong style="color:#deded8">Score-Logik:</strong> harsi_warn=0 &amp; caution=0 → <span style="color:#5EC45E">+5</span> &middot; harsi_warn=0 &amp; caution=1 → <span style="color:#E09040">&minus;3</span> mit Warnung &middot; harsi_warn=1 → wie bisher (Extremzone). <strong>Alarm 2/2b JSON wurde um <code>harsi_caution</code> erweitert.</strong>
       </div>
     </div>
 
-    <!-- v4.35 -->
-    <div style="background:#252528;border:1px solid rgba(255,255,255,0.08);border-radius:10px;padding:10px 12px">
-      <div style="font-size:11px;font-weight:700;color:#888;text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px">v4.35 &middot; DCA + Forensik</div>
+    <!-- v4.57 Bybit-Integration -->
+    <div style="background:#0d1f0d;border:1px solid rgba(94,196,94,0.30);border-radius:10px;padding:10px 12px">
+      <div style="font-size:11px;font-weight:700;color:#5EC45E;text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px">v4.57 &middot; Bybit-Integration</div>
       <div style="font-size:12px;color:#B8B8C0;line-height:1.6">
-        DCA Auto-Void Bug-Fix: <code>_void_passed_dcas()</code> fragte vorher den falschen Bitget-Endpoint ab &rarr; DCA-Orders unterhalb des neuen SL blieben aktiv. Forensik-Dump vor Auto-SL-Fallback. Min-Qty Edge-Case bei <code>place_tp_orders()</code> verbessert.
+        <strong style="color:#deded8">26 neue Bybit-Funktionen:</strong> Vollst&auml;ndige USDT-Perpetual-API analog zu Bitget (Positionen, Orders, TPs, SL, DCA).<br><br>
+        <strong style="color:#deded8">Signal-Routing:</strong> <code>exchange</code>-Feld im JSON bestimmt die Ziel-Exchange. Standard Bitget, Bybit via <code>"exchange":"bybit"</code>.<br><br>
+        <strong style="color:#deded8">Quarter-Kelly:</strong> Bybit-Trades verwenden 25% Kelly (statt 50%) w&auml;hrend der Einlernphase. <strong style="color:#deded8">Circuit-Breaker:</strong> 3 Verluste in Folge pausieren den Auto-Trade.
       </div>
     </div>
 
-    <!-- v4.34 -->
-    <div style="background:#252528;border:1px solid rgba(255,255,255,0.08);border-radius:10px;padding:10px 12px">
-      <div style="font-size:11px;font-weight:700;color:#888;text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px">v4.34 &middot; trades.csv via Telegram</div>
+    <!-- SYNORA Modell 3 -->
+    <div style="background:#1a0d2e;border:1px solid rgba(168,159,245,0.35);border-radius:10px;padding:10px 12px">
+      <div style="font-size:11px;font-weight:700;color:#A89FF5;text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px">v4.55&ndash;v4.58 &middot; SYNORA Modell 3</div>
       <div style="font-size:12px;color:#B8B8C0;line-height:1.6">
-        <code>/trades</code> sendet die aktuelle <code>trades.csv</code> als Telegram-Dokument (kein Railway File-Browser mehr n&ouml;tig). <code>/restore_trades</code> l&auml;dt eine bereinigte CSV via Telegram-Anhang zur&uuml;ck aufs Volume.
+        <strong style="color:#deded8">6 TP-Levels statt 4:</strong> TP1&ndash;TP5 Teilschliessungen + TP6 Full Close. Aufteilung: 25 / 12.5 / 25 / 12.5 / 12.5 / 12.5% bei 10 / 15 / 20 / 30 / 40 / 50% ROI.<br><br>
+        <strong style="color:#deded8">Neues SL-Trailing (v4.55):</strong> TP2 zieht SL <em>nicht</em> mehr nach (Stop-Hunt-Fix). TP3 setzt SL auf <code>max(TP1-Preis, Sling-Pivot)</code>. Sling-SL l&auml;uft durchgehend &mdash; Option-B-Cutoff entfernt.
       </div>
     </div>
 
   </div>
 
   <div class="info" style="margin-top:12px">
-    <strong>&#x1F4A1; Praxis:</strong> TradingView-Alarm-Templates sind seit v4.21 stabil &mdash; nichts umzukonfigurieren. Alle Neuerungen sind script-seitig oder in Telegram. F&uuml;r Vollautomatik: <code>AUTO_TRADE_ENABLED=1</code> + <code>MAX_AUTO_TRADE_USDT=20</code> in Railway &rarr; Variables setzen. DOM-ORC v2.5 durch v2.5 ersetzen (Jochen-Fix + HARSI-Fenster).
+    <strong>&#x1F4A1; Praxis:</strong> TradingView-Alarm-Templates wurden in v4.60 aktualisiert &mdash; <strong>Alarm 2/2b JSON neu kopieren</strong> (enth&auml;lt jetzt <code>harsi_caution</code>). F&uuml;r Bybit: <code>BYBIT_API_KEY</code> + <code>BYBIT_SECRET</code> in Railway &rarr; Variables setzen + <code>exchange</code>-Feld in DOM-ORC v3.0-Einstellungen auf <code>bybit</code> setzen. DOM-ORC auf v3.0 updaten (H4+H2-Linien, HARSI_SL built-in).
   </div>
 </div>
 
@@ -521,6 +528,20 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#111114;color:#de
   <div style="background:#1a1a1e;border-radius:8px;padding:8px 12px;font-size:11px;color:#666;line-height:1.6">
     <strong style="color:#888">Merkhilfe:</strong> Bei harsi_warn 0 tickt die Uhr f&uuml;r den <em>Einstieg</em> &mdash; bei harsi_warn 1 tickt die Uhr f&uuml;r den <em>HARSI-Exit</em>. In beiden F&auml;llen: 30 Min &uuml;berschritten = Setup weg.<br>
     <strong style="color:#888">Technischer Timeout in DOM-ORC:</strong> 15 H2-Bars (30h, konfigurierbar via <code>harsi_wait_bars</code>) &mdash; die 30-Min-Trader-Regel hat Vorrang &mdash; manuellen Timer stellen!
+  </div>
+
+  <!-- harsi_caution v4.60 -->
+  <div style="background:#1a1200;border:1px solid rgba(224,144,64,0.3);border-radius:8px;padding:10px 12px;margin-top:10px;font-size:12px;line-height:1.65">
+    <strong style="color:#E09040">&#x26A0; harsi_caution: 1 &mdash; Vorsichtszone (&minus;10 bis &minus;20) <span style="background:#2a1b3d;color:#C28AF5;font-size:10px;font-weight:600;padding:1px 6px;border-radius:4px;letter-spacing:.03em;margin-left:6px">NEU v4.60</span></strong><br>
+    <span style="color:#B8B8C0">
+      Neben <code>harsi_warn</code> gibt es seit DOM-ORC v3.0 das Feld <code>harsi_caution</code>.<br>
+      Es ist <code>1</code> wenn der HARSI RSI-Overlay im Bereich <strong>&minus;10 bis &minus;20</strong> liegt &mdash; also nahe der Extremzone aber noch nicht drin.<br><br>
+      <strong style="color:#deded8">Railway Score-Effekt:</strong><br>
+      &nbsp;&nbsp;<code>harsi_warn=0, harsi_caution=0</code> &rarr; <span style="color:#5EC45E"><b>+5</b> HARSI OK</span><br>
+      &nbsp;&nbsp;<code>harsi_warn=0, harsi_caution=1</code> &rarr; <span style="color:#E09040"><b>&minus;3</b> HARSI Vorsichtszone</span> + Warnung im Telegram<br>
+      &nbsp;&nbsp;<code>harsi_warn=1</code> &rarr; wie bisher: Extremzone, kein Score-Bonus<br><br>
+      <strong style="color:#deded8">Action:</strong> Bei <code>harsi_caution=1</code> nicht zwingend warten &mdash; Setup l&auml;uft, aber Score ist tiefer. Der Slot erscheint weiter unten in der Rangliste.
+    </span>
   </div>
 </div>
 
@@ -1012,12 +1033,13 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#111114;color:#de
     <div class="field-label"><span>Message-Feld in TradingView</span>
       <button class="copy-btn" onclick="copyField('h2-long',this)">Kopieren</button>
     </div>
-    <div class="field-value mono" id="h2-long">{"token":"DEIN_WEBHOOK_SECRET","symbol":"{{ticker}}","side":"long","entry":{{close}},"timeframe":"{{interval}}","signal":"H2_SIGNAL","premium":{{plot("Premium Long")}},"harsi_warn":{{plot("Long HARSI Warnung")}},"btc_t2_warn":{{plot("Long BTC/Total2 Warn")}}}</div>
+    <div class="field-value mono" id="h2-long">{"token":"DEIN_WEBHOOK_SECRET","symbol":"{{ticker}}","side":"long","entry":{{close}},"timeframe":"{{interval}}","signal":"H2_SIGNAL","premium":{{plot("Premium Long")}},"harsi_warn":{{plot("Long HARSI Warnung")}},"harsi_caution":{{plot("Long HARSI Caution")}},"btc_t2_warn":{{plot("Long BTC/Total2 Warn")}}}</div>
     <div class="hint" style="margin-top:6px;font-size:11.5px"><strong>&#x1F511; Token:</strong> Vor dem Kopieren <code>DEIN_WEBHOOK_SECRET</code> durch den echten Token aus Railway &rarr; Variables &rarr; <code>WEBHOOK_SECRET</code> ersetzen. Kein Pine-Zugriff &mdash; dieser Alarm l&auml;uft standalone.</div>
   </div>
   <div class="success">
     <strong>harsi_warn: 0</strong> = HARSI OK &rarr; ✅ sofort einsteigen<br>
     <strong>harsi_warn: 1</strong> = HARSI in Extremzone &rarr; ⚠️ Alarm 3 erstellen, 30-Min-Timer starten<br>
+    <strong>harsi_caution: 1</strong> = HARSI Vorsichtszone (&minus;10 bis &minus;20) &rarr; &minus;3 Score-Malus, Warnung in Telegram <span style="background:#2a1b3d;color:#C28AF5;font-size:10px;padding:1px 5px;border-radius:3px">v4.60</span><br>
     <strong>btc_t2_warn: 0</strong> = BTC + Total2 gleiche Richtung &rarr; ✅<br>
     <strong>btc_t2_warn: 1</strong> = BTC/Total2 Abweichung &rarr; ⚠️ kein Trade<br>
     <strong>premium: 1</strong> = Impuls im Premium-Bereich &rarr; ⭐ Qualit&auml;ts-Setup
@@ -1074,12 +1096,13 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#111114;color:#de
     <div class="field-label"><span>Message-Feld in TradingView</span>
       <button class="copy-btn" onclick="copyField('h2-short',this)">Kopieren</button>
     </div>
-    <div class="field-value mono" id="h2-short">{"token":"DEIN_WEBHOOK_SECRET","symbol":"{{ticker}}","side":"short","entry":{{close}},"timeframe":"{{interval}}","signal":"H2_SIGNAL","premium":{{plot("Premium Short")}},"harsi_warn":{{plot("Short HARSI Warnung")}},"btc_t2_warn":{{plot("Short BTC/Total2 Warn")}}}</div>
+    <div class="field-value mono" id="h2-short">{"token":"DEIN_WEBHOOK_SECRET","symbol":"{{ticker}}","side":"short","entry":{{close}},"timeframe":"{{interval}}","signal":"H2_SIGNAL","premium":{{plot("Premium Short")}},"harsi_warn":{{plot("Short HARSI Warnung")}},"harsi_caution":{{plot("Short HARSI Caution")}},"btc_t2_warn":{{plot("Short BTC/Total2 Warn")}}}</div>
     <div class="hint" style="margin-top:6px;font-size:11.5px"><strong>&#x1F511; Token:</strong> Vor dem Kopieren <code>DEIN_WEBHOOK_SECRET</code> durch den echten Token aus Railway &rarr; Variables &rarr; <code>WEBHOOK_SECRET</code> ersetzen. Kein Pine-Zugriff &mdash; dieser Alarm l&auml;uft standalone.</div>
   </div>
   <div class="success">
     <strong>harsi_warn: 0</strong> = HARSI OK &rarr; ✅ sofort einsteigen<br>
     <strong>harsi_warn: 1</strong> = HARSI in Extremzone &rarr; ⚠️ Alarm 3b erstellen, 30-Min-Timer starten<br>
+    <strong>harsi_caution: 1</strong> = HARSI Vorsichtszone (&minus;10 bis &minus;20) &rarr; &minus;3 Score-Malus, Warnung in Telegram <span style="background:#2a1b3d;color:#C28AF5;font-size:10px;padding:1px 5px;border-radius:3px">v4.60</span><br>
     <strong>btc_t2_warn: 0</strong> = BTC + Total2 gleiche Richtung &rarr; ✅<br>
     <strong>btc_t2_warn: 1</strong> = BTC/Total2 Abweichung &rarr; ⚠️ kein Trade<br>
     <strong>premium: 1</strong> = Impuls im Premium-Bereich &rarr; ⭐ Qualit&auml;ts-Setup
@@ -1356,10 +1379,16 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#111114;color:#de
     <span style="color:#B8B8C0">Statt Alarm 4 (Long) + Alarm 4b (Short) pro Symbol manuell einzurichten, gen&uuml;gt <strong>1 einziger</strong> Watchlist-Alarm vom Typ <code>Any alert() function call</code>. Die Pine feuert bei jedem H2-Close mit HARSI-Kreuzung und embedded den Preis direkt im JSON-Body &mdash; das bekannte <code>{{plot(...)}}</code>-Problem bei Watchlist-Alarmen ist umgangen. Railway filtert stumm alle Symbole ohne offene Position.</span>
   </div>
 
-  <!-- Voraussetzung: Pine-Snippet -->
+  <!-- v3.0 HARSI_SL built-in note -->
+  <div style="background:#0d2820;border:1px solid rgba(78,203,160,0.3);border-radius:8px;padding:10px 12px;margin-bottom:10px;font-size:12px;line-height:1.6">
+    <strong style="color:#4ECBA0">&#x2705; DOM-ORC v3.0: Kein Pine-Snippet mehr n&ouml;tig!</strong><br>
+    <span style="color:#B8B8C0">Ab DOM-ORC v2.9 ist HARSI_SL direkt eingebaut &mdash; der Alarm 4c funktioniert automatisch ohne zus&auml;tzlichen Code. Das Snippet unten ist nur f&uuml;r &auml;ltere Versionen (&lt;&nbsp;v2.9) dokumentiert.</span>
+  </div>
+
+  <!-- Voraussetzung: Pine-Snippet (legacy < v2.9) -->
   <div style="background:#0d1f2d;border:1px solid rgba(123,184,245,0.25);border-radius:8px;padding:12px 14px;margin-bottom:14px;font-size:12px;line-height:1.65">
-    <strong style="color:#7BB8F5">&#x26A0; Voraussetzung: Pine-Snippet einf&uuml;gen</strong><br>
-    <span style="color:#B8B8C0">Im <b>DOMINUS Orchestrator</b> Pine am Ende (nach den bestehenden alertcondition-Zeilen) folgenden Code einf&uuml;gen:</span>
+    <strong style="color:#7BB8F5">&#x1F4CC; Legacy-Snippet (DOM-ORC &lt; v2.9): Pine-Code einf&uuml;gen</strong><br>
+    <span style="color:#B8B8C0">F&uuml;r &auml;ltere DOM-ORC-Versionen: Im <b>DOMINUS Orchestrator</b> Pine am Ende (nach den bestehenden alertcondition-Zeilen) folgenden Code einf&uuml;gen:</span>
     <div style="background:#0a0a0e;border-radius:6px;padding:10px 12px;margin-top:8px;font-family:'SF Mono','Fira Mono',monospace;font-size:11px;color:#e0e0e0;line-height:1.6;overflow-x:auto">
 <pre style="margin:0;white-space:pre-wrap">// v4.11 HARSI_SL Universal-Emitter &mdash; feuert direkt via alert()
 // HARSI ist rsi_overlay (RSI Overlay plot). Ausstiegslinien &plusmn;20.
@@ -1467,9 +1496,9 @@ if barstate.isconfirmed
   <!-- Voraussetzung: Pine-Snippet -->
   <div style="background:#0d1f2d;border:1px solid rgba(123,184,245,0.25);border-radius:8px;padding:12px 14px;margin-bottom:14px;font-size:12px;line-height:1.65">
     <strong style="color:#7BB8F5">&#x26A0; Voraussetzung: DOM-ORC v2.5 im Chart</strong><br>
-    <span style="color:#B8B8C0">Der Sling-SL-Emitter ist bereits <b>fester Bestandteil</b> der <code>Dominus_Orchestrator_v2.5.pine</code>. Kein zus&auml;tzliches Snippet n&ouml;tig &mdash; einfach die neue Pine-Version laden und den bestehenden DOM-ORC im Chart ersetzen.</span>
+    <span style="color:#B8B8C0">Der Sling-SL-Emitter ist bereits <b>fester Bestandteil</b> der <code>Dominus_Orchestrator_v3.0.pine</code>. Kein zus&auml;tzliches Snippet n&ouml;tig &mdash; einfach die neue Pine-Version laden und den bestehenden DOM-ORC im Chart ersetzen.</span>
     <div style="background:#0a0a0e;border-radius:6px;padding:10px 12px;margin-top:8px;font-family:'SF Mono','Fira Mono',monospace;font-size:11px;color:#e0e0e0;line-height:1.6;overflow-x:auto">
-<pre style="margin:0;white-space:pre-wrap">// v2.5 Sling-SL Emitter (bereits in Dominus_Orchestrator_v2.5 enthalten)
+<pre style="margin:0;white-space:pre-wrap">// v2.5 Sling-SL Emitter (bereits in Dominus_Orchestrator_v3.0 enthalten)
 ph = ta.pivothigh(high, sling_left, sling_right)   // Sling-High (Short-SL)
 pl = ta.pivotlow (low,  sling_left, sling_right)   // Sling-Low  (Long-SL)
 atr_val = ta.atr(sling_atr_len)
@@ -1839,14 +1868,14 @@ if barstate.isconfirmed and not na(pl)
     </div>
   </div>
   <div class="trailing-flow">
-    <div class="trailing-box t1"><strong>TP1 ausgel&ouml;st</strong><br>&#x2193;<br>SL auf Entry<br><span style="font-size:11px;opacity:.7">Break-even gesichert</span></div>
+    <div class="trailing-box t1"><strong>TP1 ausgel&ouml;st</strong><br>&#x2193;<br>SL auf Entry/Avg<br><span style="font-size:11px;opacity:.7">Break-even gesichert</span></div>
     <div class="trailing-arrow">&#x2192;</div>
-    <div class="trailing-box t2"><strong>TP2 ausgel&ouml;st</strong><br>&#x2193;<br>SL auf TP1-Preis<br><span style="font-size:11px;opacity:.7">TP1-Gewinn gesichert</span></div>
+    <div class="trailing-box t2"><strong>TP2 ausgel&ouml;st</strong><br>&#x2193;<br>Kein SL-Nachzug<br><span style="font-size:11px;opacity:.7">SL bleibt auf Entry/Avg</span></div>
     <div class="trailing-arrow">&#x2192;</div>
-    <div class="trailing-box t3"><strong>TP3 ausgel&ouml;st</strong><br>&#x2193;<br>SL auf TP2-Preis<br><span style="font-size:11px;opacity:.7">TP2-Gewinn gesichert</span></div>
+    <div class="trailing-box t3"><strong>TP3 ausgel&ouml;st</strong><br>&#x2193;<br>SL auf max(TP1, Sling)<br><span style="font-size:11px;opacity:.7">TP1-Gewinn gesichert</span></div>
   </div>
   <div style="font-size:13px;color:#b0b0a8;line-height:1.6;margin-top:12px">
-    Nach jedem ausgel&ouml;sten TP wird der SL automatisch auf das Niveau des vorherigen TPs nachgezogen. So ist bei jedem neuen TP-Level der gesamte Gewinn bis dahin auf der Restposition gesichert.
+    <strong style="color:#deded8">SYNORA Modell 3</strong> &mdash; 6 TP-Levels mit progressivem Kapitalschutz: TP1 sichert Break-even, TP2 zieht den SL <em>nicht</em> nach (Schutz vor Liquidit&auml;ts-Pool Stop-Hunts), ab TP3 wird der SL auf <code>max(TP1-Preis, letzter Sling-Pivot)</code> gesetzt. Sling-SL l&auml;uft durchgehend als protective Trail ab TP1.
   </div>
   <div style="margin-top:14px;overflow-x:auto">
     <table style="width:100%;border-collapse:collapse;font-size:12px">
@@ -1855,27 +1884,45 @@ if barstate.isconfirmed and not na(pl)
           <th style="padding:8px 10px;text-align:left;font-weight:600;color:#909090;font-size:11px;text-transform:uppercase;letter-spacing:.04em">Level</th>
           <th style="padding:8px 10px;text-align:left;font-weight:600;color:#909090;font-size:11px;text-transform:uppercase;letter-spacing:.04em">Ausl&ouml;ser</th>
           <th style="padding:8px 10px;text-align:left;font-weight:600;color:#909090;font-size:11px;text-transform:uppercase;letter-spacing:.04em">SL wird gesetzt auf</th>
-          <th style="padding:8px 10px;text-align:left;font-weight:600;color:#909090;font-size:11px;text-transform:uppercase;letter-spacing:.04em">Gesicherter Mindestgewinn</th>
+          <th style="padding:8px 10px;text-align:left;font-weight:600;color:#909090;font-size:11px;text-transform:uppercase;letter-spacing:.04em">Ergebnis / gesicherter Mindestgewinn</th>
         </tr>
       </thead>
       <tbody>
         <tr style="border-bottom:0.5px solid rgba(255,255,255,0.05)">
-          <td style="padding:8px 10px"><span class="pill p-green">1</span></td>
-          <td style="padding:8px 10px;color:#deded8">TP1 (10% ROI, 15% geschlossen)</td>
-          <td style="padding:8px 10px;color:#deded8;font-weight:500">Entry-Preis</td>
+          <td style="padding:8px 10px"><span class="pill p-green">TP1</span></td>
+          <td style="padding:8px 10px;color:#deded8">10% ROI &middot; 25% geschlossen</td>
+          <td style="padding:8px 10px;color:#deded8;font-weight:500">Entry-Preis (Avg bei DCAs)</td>
           <td style="padding:8px 10px;color:#5EC45E">Break-even (0 USDT)</td>
         </tr>
         <tr style="border-bottom:0.5px solid rgba(255,255,255,0.05)">
-          <td style="padding:8px 10px"><span class="pill p-teal">2</span></td>
-          <td style="padding:8px 10px;color:#deded8">TP2 (20% ROI, +20% geschlossen)</td>
-          <td style="padding:8px 10px;color:#deded8;font-weight:500">TP1-Preis</td>
+          <td style="padding:8px 10px"><span class="pill p-teal">TP2</span></td>
+          <td style="padding:8px 10px;color:#deded8">15% ROI &middot; 12.5% geschlossen</td>
+          <td style="padding:8px 10px;color:#E09040;font-weight:500">Kein Nachzug &#x26A0;</td>
+          <td style="padding:8px 10px;color:#b0b0a8">SL bleibt auf Entry/Avg</td>
+        </tr>
+        <tr style="border-bottom:0.5px solid rgba(255,255,255,0.05)">
+          <td style="padding:8px 10px"><span class="pill p-blue">TP3</span></td>
+          <td style="padding:8px 10px;color:#deded8">20% ROI &middot; 25% geschlossen</td>
+          <td style="padding:8px 10px;color:#deded8;font-weight:500">max(TP1-Preis, Sling-Pivot)</td>
           <td style="padding:8px 10px;color:#5EC45E">TP1-Gewinn auf Restposition</td>
         </tr>
+        <tr style="border-bottom:0.5px solid rgba(255,255,255,0.05)">
+          <td style="padding:8px 10px"><span class="pill p-blue">TP4</span></td>
+          <td style="padding:8px 10px;color:#deded8">30% ROI &middot; 12.5% geschlossen</td>
+          <td style="padding:8px 10px;color:#deded8;font-weight:500">Sling-SL weiter aktiv</td>
+          <td style="padding:8px 10px;color:#5EC45E">TP3-Level auf Restposition</td>
+        </tr>
+        <tr style="border-bottom:0.5px solid rgba(255,255,255,0.05)">
+          <td style="padding:8px 10px"><span class="pill p-purple">TP5</span></td>
+          <td style="padding:8px 10px;color:#deded8">40% ROI &middot; 12.5% geschlossen</td>
+          <td style="padding:8px 10px;color:#deded8;font-weight:500">Sling-SL weiter aktiv</td>
+          <td style="padding:8px 10px;color:#5EC45E">TP4-Level auf Restposition</td>
+        </tr>
         <tr>
-          <td style="padding:8px 10px"><span class="pill p-blue">3</span></td>
-          <td style="padding:8px 10px;color:#deded8">TP3 (30% ROI, +25% geschlossen)</td>
-          <td style="padding:8px 10px;color:#deded8;font-weight:500">TP2-Preis</td>
-          <td style="padding:8px 10px;color:#5EC45E">TP2-Gewinn auf Restposition</td>
+          <td style="padding:8px 10px"><span class="pill p-red">TP6</span></td>
+          <td style="padding:8px 10px;color:#deded8">50% ROI &middot; 12.5% &rarr; <strong>Full Close</strong></td>
+          <td style="padding:8px 10px;color:#F07070;font-weight:500">Full Close (Position schliesst)</td>
+          <td style="padding:8px 10px;color:#5EC45E">Gesamtgewinn realisiert</td>
         </tr>
       </tbody>
     </table>
@@ -1884,28 +1931,15 @@ if barstate.isconfirmed and not na(pl)
   <div class="hint" style="margin-top:6px"><strong>Erkennungssystem:</strong> Fill-basiert (prim&auml;r, 48h) + Gr&ouml;ssenbasiert (Fallback bei &auml;lteren Trades)</div>
 
   <div style="margin-top:16px;border-top:0.5px solid rgba(255,255,255,0.07);padding-top:14px">
-    <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
-      <span style="background:#22203e;color:#A89FF5;font-size:10px;font-weight:600;padding:2px 8px;border-radius:4px;letter-spacing:.03em">NEU v4.49</span>
-      <span style="font-size:14px;font-weight:500;color:#deded8">Option B &mdash; HARSI-Trail ab TP2</span>
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+      <span style="background:#0d1f0d;color:#4ECBA0;font-size:10px;font-weight:600;padding:2px 8px;border-radius:4px;letter-spacing:.03em">v4.55 S3</span>
+      <span style="font-size:14px;font-weight:500;color:#deded8">Sling-SL l&auml;uft durchgehend aktiv</span>
     </div>
     <div style="font-size:13px;color:#b0b0a8;line-height:1.65">
-      Ab TP2 &uuml;bernimmt <strong style="color:#deded8">HARSI</strong> das Trailing &mdash; Sling-SL-Updates werden ab diesem Punkt ignoriert. Der HARSI-Exit-Alarm l&auml;uft weiter und gibt dem Trade deutlich mehr Spielraum als ein fixer Pivot-SL.
+      Bis v4.54 wurden Sling-SL-Updates ab TP2 komplett ignoriert (&bdquo;HARSI &uuml;bernimmt Trail ab TP2&ldquo; &mdash; Option B). Ab v4.55 l&auml;uft der Sling-SL <strong style="color:#deded8">durchgehend als protective Trail</strong> &mdash; kein harter Cut-off mehr. HARSI-Exit bleibt weiterhin der prim&auml;re Exit-Trigger.
     </div>
-    <div style="display:grid;grid-template-columns:1fr auto 1fr auto 1fr;gap:6px;align-items:center;margin-top:10px">
-      <div style="background:#162a16;border-radius:8px;padding:8px 10px;font-size:12px;text-align:center;line-height:1.4;color:#5EC45E">
-        <strong>TP1 erreicht</strong><br>&darr;<br>SL auf Entry<br><span style="font-size:11px;opacity:.7">Sling-SL aktiv</span>
-      </div>
-      <div style="font-size:16px;color:#b0b0a8;text-align:center">&rarr;</div>
-      <div style="background:#22203e;border-radius:8px;padding:8px 10px;font-size:12px;text-align:center;line-height:1.4;color:#A89FF5;border:0.5px solid rgba(168,159,245,0.3)">
-        <strong>TP2 erreicht</strong><br>&darr;<br>HARSI &uuml;bernimmt<br><span style="font-size:11px;opacity:.7">Sling-SL ignoriert</span>
-      </div>
-      <div style="font-size:16px;color:#b0b0a8;text-align:center">&rarr;</div>
-      <div style="background:#0e1f33;border-radius:8px;padding:8px 10px;font-size:12px;text-align:center;line-height:1.4;color:#7BB8F5">
-        <strong>HARSI-Exit</strong><br>&darr;<br>Position schliesst<br><span style="font-size:11px;opacity:.7">Maximum Spielraum</span>
-      </div>
-    </div>
-    <div style="background:#22203e;border-radius:8px;padding:9px 12px;font-size:12px;color:#A89FF5;margin-top:10px;line-height:1.55">
-      <strong>Warum?</strong> Ab TP2 ist der Mindestgewinn bereits gesichert. Ein fixer Pivot-SL w&uuml;rde den Trade bei normalen Schwankungen vorzeitig beenden. HARSI erkennt den echten Trendwechsel &mdash; der Trade l&auml;uft bis zum n&auml;chsten Exit-Signal.
+    <div style="background:#0d1f0d;border-radius:8px;padding:9px 12px;font-size:12px;color:#4ECBA0;margin-top:10px;line-height:1.55">
+      <strong>Warum?</strong> Der Sling-Pivot reagiert auf echte Marktstruktur. Ein durchgehend aktiver protective SL f&auml;ngt pl&ouml;tzliche Reversals ab &mdash; auch wenn HARSI noch kein Exit-Signal gibt.
     </div>
   </div>
   <div style="margin-top:14px">
@@ -2325,14 +2359,14 @@ Beispiel:
     </div>
     <div class="step-row">
       <div class="step-n">8</div>
-      <div class="step-t">TP2 ausgel&ouml;st &rarr; <strong>Trailing SL auf TP1-Preis</strong> (TP1-Gewinn gesichert) &nbsp;<a href="#sec-trailing" style="font-size:11px;padding:1px 6px;border-radius:4px;background:#0d2820;color:#4ECBA0;text-decoration:none">&#x2192; Trailing SL</a></div>
+      <div class="step-t">TP2 ausgel&ouml;st &rarr; <strong>Kein SL-Nachzug</strong> (SL bleibt auf Entry/Avg &mdash; Schutz vor Liquidit&auml;ts-Pool Stop-Hunt) &nbsp;<a href="#sec-trailing" style="font-size:11px;padding:1px 6px;border-radius:4px;background:#0d2820;color:#4ECBA0;text-decoration:none">&#x2192; Trailing SL</a></div>
     </div>
     <div class="step-row">
       <div class="step-n">9</div>
-      <div class="step-t">TP3 ausgel&ouml;st &rarr; <strong>Trailing SL auf TP2-Preis</strong> (TP2-Gewinn gesichert) &nbsp;<a href="#sec-trailing" style="font-size:11px;padding:1px 6px;border-radius:4px;background:#0d2820;color:#4ECBA0;text-decoration:none">&#x2192; Trailing SL</a></div>
+      <div class="step-t">TP3 ausgel&ouml;st &rarr; <strong>SL auf max(TP1-Preis, letzter Sling-Pivot)</strong> (Sling-SL l&auml;uft durchgehend weiter) &nbsp;<a href="#sec-trailing" style="font-size:11px;padding:1px 6px;border-radius:4px;background:#0d2820;color:#4ECBA0;text-decoration:none">&#x2192; Trailing SL</a></div>
     </div>
   </div>
-  <div class="info" style="margin-top:12px"><strong>Automatisiert durch Railway:</strong> Entry-Rangliste-Scoring (v4.22) &middot; DCA-Orders &middot; TP1&ndash;TP4 (15/20/25/40%) &middot; SL auf Entry nach TP1 &middot; TP-Anpassung nach Nachkauf &middot; Auto-SL (&minus;25%) bei fehlendem Stop Loss &middot; Trailing SL: TP2&rarr;SL@TP1-Preis, TP3&rarr;SL@TP2-Preis &middot; Daily P&amp;L Report um 23:59 &middot; HARSI SL-Anpassung via Alarm 4c / Sling-SL &middot; <strong>Abweichungswarnungen (Hebel / Kelly / R:R)</strong> &middot; Telegram bei jedem Schritt.</div>
+  <div class="info" style="margin-top:12px"><strong>Automatisiert durch Railway:</strong> Entry-Rangliste-Scoring (v4.22) &middot; DCA-Orders &middot; SYNORA Modell 3: TP1&ndash;TP6 (25/12.5/25/12.5/12.5/12.5% bei 10/15/20/30/40/50% ROI) &middot; SL auf Entry nach TP1 &middot; TP2: kein SL-Nachzug &middot; TP3 &rarr; SL auf max(TP1-Preis, Sling-Pivot) &middot; Sling-SL durchgehend aktiv &middot; TP-Anpassung nach Nachkauf &middot; Auto-SL (&minus;25%) bei fehlendem Stop Loss &middot; Daily P&amp;L Report um 23:59 &middot; HARSI SL-Anpassung via Alarm 4c &middot; <strong>Abweichungswarnungen (Hebel / Kelly / R:R)</strong> &middot; Telegram bei jedem Schritt.</div>
   <div class="hint" style="margin-top:8px"><strong>H4-Alarme (1/1b) optional:</strong> k&ouml;nnen als fr&uuml;he Vorlaufbenachrichtigung aktiv bleiben, sind aber f&uuml;r den Ablauf nicht mehr zwingend n&ouml;tig.</div>
   <div class="success" style="margin-top:8px"><strong>&#x1F4A1; Manueller Alarm 3 / 3b obsolet:</strong> Ab v4.22 wird HARSI_EXIT automatisch &uuml;ber die universellen Alarme 4c (HARSI-SL) und Sling-SL in die Entry-Queue eingespeist. Die alten Alarme 3 / 3b sind weiter dokumentiert f&uuml;r historischen Kontext, aber <strong>nicht mehr aktiv zu erstellen</strong>.</div>
 </div>
