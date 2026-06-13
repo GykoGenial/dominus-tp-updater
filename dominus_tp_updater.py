@@ -1610,6 +1610,15 @@ h4_buffer:     list = []
 h4_buffer_lock = __import__("threading").Lock()
 H4_BUFFER_SEC  = _env_int("H4_BUFFER_SEC", 300)  # 5 Min
 
+# v4.60: H4-Trigger State Machine (Railway-Gate Modus mit DOM-LIQ v2.0)
+# Key: "{symbol}_{direction}"  z.B. "ETHUSDT_long"
+# Value: {"ts": float (unix), "entry": float, "active": bool}
+#   active=True  → H4-Trigger aktiv, wartet auf erstes H2-Signal
+#   active=False → H4-Trigger konsumiert (erstes H2 wurde verarbeitet)
+h4_trigger_state: dict = {}
+H4_GATE_ENABLED      = os.environ.get("H4_GATE_ENABLED", "1").strip() not in ("0", "false", "False", "no")
+H4_JOCHEN_WINDOW_SEC = _env_int("H4_JOCHEN_WINDOW_SEC", 120)  # Jochen-Regel: H4+H2 innerhalb N Sek = H2 verwerfen
+
 # HARSI-Warn-Buffer: sammelt harsi_warn=1 Signale, sendet gebündelt
 harsi_warn_buffer:      list = []
 harsi_warn_buffer_lock  = __import__("threading").Lock()
@@ -10361,6 +10370,74 @@ def poll_telegram_commands():
 # WEBHOOK SERVER — empfängt TradingView Alerts
 # ═══════════════════════════════════════════════════════════════
 
+def _h4_state_update(symbol: str, direction: str, entry: float) -> None:
+    """v4.60: Setzt oder ersetzt den H4-Trigger-State für symbol+direction.
+
+    Wird beim Empfang von H4_TRIGGER aufgerufen (von DOM-LIQ v2.0 auf H4-Chart).
+
+    Logik (gemäss Dominus Handbuch Kap. 3/4/5):
+      • Buy- und Sell-Tracks sind UNABHÄNGIG voneinander (S.5).
+      • Neuer gleich-gerichteter H4-Trigger ersetzt den alten (S.4).
+      • H4-Trigger bleibt aktiv bis: (a) erstes H2-Signal konsumiert
+        ODER (b) neuer gleich-gerichteter H4-Trigger eintrifft.
+      • Jochen-Regel: Falls H2-Signal innerhalb H4_JOCHEN_WINDOW_SEC
+        VOR dem H4-Trigger eintraf → H4 bleibt aktiv, nächstes H2 ist
+        der echte erste Trigger. Dieses H2 wurde bereits in _h4_gate_check
+        verworfen (weil damals kein aktiver H4-Trigger vorlag).
+    """
+    if not H4_GATE_ENABLED:
+        return
+    key = f"{symbol}_{direction}"
+    now = time.time()
+    prev = h4_trigger_state.get(key, {})
+    h4_trigger_state[key] = {"ts": now, "entry": entry, "active": True}
+    if prev.get("active"):
+        log(f"  [H4-Gate] {key}: H4-Trigger ERSETZT (alter war noch aktiv @ {prev.get('entry', '?'):.5f})")
+    else:
+        log(f"  [H4-Gate] {key}: H4-Trigger GESETZT @ {entry:.5f} — wartet auf erstes H2-Signal")
+
+
+def _h4_gate_check(symbol: str, direction: str) -> tuple[bool, str]:
+    """v4.60: Prüft ob ein eingehendes H2_SIGNAL durch einen aktiven H4-Trigger
+    gedeckt ist. Gibt (erlaubt: bool, grund: str) zurück.
+
+    Jochen-Regel (Handbuch S.9/12):
+      Falls H4_TRIGGER und H2_SIGNAL innerhalb H4_JOCHEN_WINDOW_SEC eintreffen
+      (H4 wurde GERADE erst gesetzt als dieses H2 ankommt), ist das H2 ungültig.
+      Der H4-Trigger BLEIBT AKTIV für das nächste H2-Signal.
+
+    Normale Consumption:
+      Erstes H2-Signal nach aktivem H4-Trigger → Trade erlaubt, H4-State konsumiert.
+    """
+    if not H4_GATE_ENABLED:
+        return True, "H4-Gate deaktiviert"
+
+    key = f"{symbol}_{direction}"
+    state = h4_trigger_state.get(key)
+
+    if not state or not state.get("active"):
+        return False, f"Kein aktiver H4-Trigger für {key} — H2-Signal verworfen (Dominus: nur erstes H2 nach H4 gültig)"
+
+    # Jochen-Regel: H4 und H2 kamen quasi-simultan (innerhalb des Fensters)
+    h4_age_sec = time.time() - state["ts"]
+    if h4_age_sec < H4_JOCHEN_WINDOW_SEC:
+        # H4 gerade erst gesetzt → simultaner H4+H2 → Jochen-Regel
+        # H4 bleibt aktiv, H2 wird verworfen
+        log(f"  [H4-Gate] Jochen-Regel: {key} — H4 vor {h4_age_sec:.0f}s gesetzt, H2 zu früh. "
+            f"H4-Trigger BLEIBT AKTIV für nächstes H2-Signal.")
+        return False, (
+            f"Jochen-Regel: H4-Trigger für {symbol} {direction} vor {h4_age_sec:.0f}s gesetzt "
+            f"(< {H4_JOCHEN_WINDOW_SEC}s) — H2-Signal verworfen. H4-Trigger bleibt aktiv."
+        )
+
+    # Alles OK: H4 aktiv + H2 nach Jochen-Fenster → Trade erlauben, H4 konsumieren
+    consumed_entry = state["entry"]
+    h4_trigger_state[key]["active"] = False
+    log(f"  [H4-Gate] {key}: H4-Trigger KONSUMIERT (war @ {consumed_entry:.5f}, "
+        f"H4-Alter {h4_age_sec:.0f}s) → Trade-Freigabe!")
+    return True, f"H4-Gate OK — H4-Trigger @ {consumed_entry:.5f} konsumiert"
+
+
 def flush_h4_buffer():
     """Sendet gesammelte H4-Trigger als eine gebündelte Telegram-Nachricht."""
     global h4_buffer
@@ -11573,8 +11650,11 @@ def start_webhook_server():
             forward_to_demo(data)
             return
 
-        # H4 Trigger → gepuffert, nach 5 Min gebündelt senden
+        # H4 Trigger → State Machine updaten + gepuffert, nach 5 Min gebündelt senden
         if timeframe == "H4" or signal_type == "H4_TRIGGER":
+            # v4.60: H4-Gate State Machine aktualisieren (Railway-Gate Modus)
+            _h4_state_update(symbol, direction, entry)
+            save_state()  # H4-State persistieren (überlebt Railway-Redeploys)
             with h4_buffer_lock:
                 exists = any(
                     i["symbol"] == symbol and i["direction"] == direction
@@ -11596,6 +11676,26 @@ def start_webhook_server():
         _xmsg  = format_extreme_info_msg(symbol, direction, _xinfo, "H2_SIGNAL")
         if _xmsg:
             telegram(_xmsg, reply_markup=build_setup_buttons(symbol))
+
+        # v4.60: H4-Gate Prüfung (Railway-Gate Modus mit DOM-LIQ v2.0 auf H4-Chart)
+        # h4_gate-Feld im Webhook ("railway" oder "intern") gibt an ob Railway gaten soll.
+        _h4_gate_mode = str(data.get("h4_gate", "intern")).strip().lower()
+        if _h4_gate_mode == "railway":
+            _gate_ok, _gate_reason = _h4_gate_check(symbol, direction)
+            if not _gate_ok:
+                log(f"  [H4-Gate] {symbol} {direction} ABGELEHNT: {_gate_reason}")
+                # Jochen-Regel → stille Ablehnung (kein Telegram-Noise), H4 bleibt aktiv
+                if "Jochen-Regel" in _gate_reason:
+                    telegram(
+                        f"⏳ <b>Jochen-Regel</b> — {symbol} {direction.upper()}\n"
+                        f"H4-Trigger und H2-Signal quasi-simultan — H2 verworfen.\n"
+                        f"H4-Trigger bleibt aktiv für nächstes H2-Signal. ✅"
+                    )
+                else:
+                    # Kein aktiver H4-Trigger → H2 kommt ohne H4-Vorbedingung (normaler Reject)
+                    log(f"  [H4-Gate] Stille Ablehnung (kein H4): {symbol} {direction}")
+                return  # H2-Signal blockiert — kein Trade
+            log(f"  [H4-Gate] {symbol} {direction} FREIGEGEBEN: {_gate_reason}")
 
         # H2 Signal → H4 Puffer flushen dann sofort senden
         # 30-Min-Fenster starten: Zeitstempel für HARSI_EXIT-Prüfung speichern
@@ -12011,6 +12111,13 @@ def save_state():
                 if time.time() - float(_v.get("ts_close", 0)) < PHANTOM_REOPEN_TTL_SEC
             },
             "forum_topics":            _forum_topics,
+            # v4.60: H4-Trigger State Machine (Railway-Gate Modus)
+            # Nur aktive Trigger persistieren (konsumierte = überflüssig)
+            # Aktive Trigger < 8h behalten (H4-Trigger hat keine strikte Ablaufzeit)
+            "h4_trigger_state": {
+                k: v for k, v in h4_trigger_state.items()
+                if v.get("active") and time.time() - float(v.get("ts", 0)) < 8 * 3600
+            },
         }
         with open(STATE_FILE, "w") as f:
             json.dump(state, f)
@@ -12076,11 +12183,26 @@ def load_state():
                 pass
         # Forum-Topic-Mapping laden (Coin → thread_id)
         _forum_topics.update(s.get("forum_topics", {}))
+        # v4.60: H4-Trigger State Machine laden — nur noch aktive Trigger übernehmen
+        _h4_saved = s.get("h4_trigger_state", {})
+        _now_ts   = time.time()
+        _h4_restored = 0
+        for _k, _v in _h4_saved.items():
+            try:
+                _h4_ts = float(_v.get("ts", 0))
+                _h4_active = bool(_v.get("active", False))
+                # Aktive Trigger < 8h laden (kein Ablauf nach Handbuch, aber Sicherheitsgrenze)
+                if _h4_active and (_now_ts - _h4_ts) < 8 * 3600:
+                    h4_trigger_state[_k] = _v
+                    _h4_restored += 1
+            except Exception:
+                pass
         _me_btc = macro_extreme["btc"]["state"]
         _me_t2  = macro_extreme["total2"]["state"]
         log(f"[load_state] State geladen: {len(last_known_avg)} Position(en) | "
             f"BTC={btc_dir or '?'} Total2={t2_dir or '?'} | "
             f"Makro-Extreme BTC={_me_btc} Total2={_me_t2} | "
+            f"H4-Trigger aktiv={_h4_restored} | "
             f"Forum-Topics={len(_forum_topics)}")
     except Exception as e:
         log(f"[load_state] Fehler: {e}")
