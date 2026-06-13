@@ -1035,6 +1035,11 @@ h4_buffer:     list = []
 h4_buffer_lock = __import__("threading").Lock()
 H4_BUFFER_SEC  = _env_int("H4_BUFFER_SEC", 300)  # 5 Min
 
+# v4.60: H4-Trigger State Machine (Railway-Gate Modus mit DOM-LIQ v2.0)
+h4_trigger_state: dict = {}
+H4_GATE_ENABLED      = os.environ.get("H4_GATE_ENABLED", "1").strip() not in ("0", "false", "False", "no")
+H4_JOCHEN_WINDOW_SEC = _env_int("H4_JOCHEN_WINDOW_SEC", 120)
+
 # HARSI-Warn-Buffer: sammelt harsi_warn=1 Signale, sendet gebündelt
 harsi_warn_buffer:      list = []
 harsi_warn_buffer_lock  = __import__("threading").Lock()
@@ -8466,6 +8471,36 @@ def poll_telegram_commands():
 # WEBHOOK SERVER — empfängt TradingView Alerts
 # ═══════════════════════════════════════════════════════════════
 
+def _h4_state_update(symbol: str, direction: str, entry: float) -> None:
+    """v4.60 Demo: H4-Trigger State setzen/ersetzen (Railway-Gate Modus)."""
+    if not H4_GATE_ENABLED:
+        return
+    key  = f"{symbol}_{direction}"
+    prev = h4_trigger_state.get(key, {})
+    h4_trigger_state[key] = {"ts": time.time(), "entry": entry, "active": True}
+    if prev.get("active"):
+        log(f"  [H4-Gate] {key}: H4-Trigger ERSETZT (alter war noch aktiv @ {prev.get('entry', '?'):.5f})")
+    else:
+        log(f"  [H4-Gate] {key}: H4-Trigger GESETZT @ {entry:.5f}")
+
+
+def _h4_gate_check(symbol: str, direction: str) -> tuple[bool, str]:
+    """v4.60 Demo: H2_SIGNAL gegen H4-Trigger prüfen + Jochen-Regel."""
+    if not H4_GATE_ENABLED:
+        return True, "H4-Gate deaktiviert"
+    key   = f"{symbol}_{direction}"
+    state = h4_trigger_state.get(key)
+    if not state or not state.get("active"):
+        return False, f"Kein aktiver H4-Trigger für {key}"
+    age = time.time() - state["ts"]
+    if age < H4_JOCHEN_WINDOW_SEC:
+        log(f"  [H4-Gate] Jochen-Regel: {key} — H4 vor {age:.0f}s, H2 zu früh. H4 bleibt aktiv.")
+        return False, f"Jochen-Regel: H4 vor {age:.0f}s gesetzt (< {H4_JOCHEN_WINDOW_SEC}s)"
+    h4_trigger_state[key]["active"] = False
+    log(f"  [H4-Gate] {key}: H4-Trigger KONSUMIERT (H4-Alter {age:.0f}s) → Trade-Freigabe!")
+    return True, f"H4-Gate OK — konsumiert @ {state['entry']:.5f}"
+
+
 def flush_h4_buffer():
     """Sendet gesammelte H4-Trigger als eine gebündelte Telegram-Nachricht."""
     global h4_buffer
@@ -9270,8 +9305,11 @@ def start_webhook_server():
                 save_state()
             return  # ok: HARSI_EXIT handled
 
-        # H4 Trigger → gepuffert, nach 5 Min gebündelt senden
+        # H4 Trigger → State Machine updaten + gepuffert, nach 5 Min gebündelt senden
         if timeframe == "H4" or signal_type == "H4_TRIGGER":
+            # v4.60: H4-Gate State Machine (Railway-Gate Modus)
+            _h4_state_update(symbol, direction, entry)
+            save_state()
             with h4_buffer_lock:
                 exists = any(
                     i["symbol"] == symbol and i["direction"] == direction
@@ -9293,6 +9331,20 @@ def start_webhook_server():
         _xmsg  = format_extreme_info_msg(symbol, direction, _xinfo, "H2_SIGNAL")
         if _xmsg:
             telegram(_xmsg, reply_markup=build_setup_buttons(symbol))
+
+        # v4.60: H4-Gate Prüfung (Railway-Gate Modus)
+        _h4_gate_mode = str(data.get("h4_gate", "intern")).strip().lower()
+        if _h4_gate_mode == "railway":
+            _gate_ok, _gate_reason = _h4_gate_check(symbol, direction)
+            if not _gate_ok:
+                log(f"  [H4-Gate] {symbol} {direction} ABGELEHNT: {_gate_reason}")
+                if "Jochen-Regel" in _gate_reason:
+                    telegram(
+                        f"⏳ <b>[DEMO] Jochen-Regel</b> — {symbol} {direction.upper()}\n"
+                        f"H4+H2 quasi-simultan — H2 verworfen. H4 bleibt aktiv. ✅"
+                    )
+                return
+            log(f"  [H4-Gate] {symbol} {direction} FREIGEGEBEN: {_gate_reason}")
 
         # H2 Signal → H4 Puffer flushen dann sofort senden
         # 30-Min-Fenster starten: Zeitstempel für HARSI_EXIT-Prüfung speichern
@@ -9628,6 +9680,11 @@ def save_state():
                 _s: _v for _s, _v in recent_closes.items()
                 if time.time() - float(_v.get("ts_close", 0)) < PHANTOM_REOPEN_TTL_SEC
             },
+            # v4.60: H4-Trigger State Machine (Railway-Gate Modus)
+            "h4_trigger_state": {
+                k: v for k, v in h4_trigger_state.items()
+                if v.get("active") and time.time() - float(v.get("ts", 0)) < 8 * 3600
+            },
         }
         with open(STATE_FILE, "w") as f:
             json.dump(state, f)
@@ -9691,11 +9748,22 @@ def load_state():
                     recent_closes[_sym] = _snap
             except Exception:
                 pass
+        # v4.60: H4-Trigger State Machine laden
+        _h4_saved = s.get("h4_trigger_state", {})
+        _h4_restored = 0
+        for _k, _v in _h4_saved.items():
+            try:
+                if bool(_v.get("active", False)) and (_now_ts - float(_v.get("ts", 0))) < 8 * 3600:
+                    h4_trigger_state[_k] = _v
+                    _h4_restored += 1
+            except Exception:
+                pass
         _me_btc = macro_extreme["btc"]["state"]
         _me_t2  = macro_extreme["total2"]["state"]
         log(f"[load_state] State geladen: {len(last_known_avg)} Position(en) | "
             f"BTC={btc_dir or '?'} Total2={t2_dir or '?'} | "
-            f"Makro-Extreme BTC={_me_btc} Total2={_me_t2}")
+            f"Makro-Extreme BTC={_me_btc} Total2={_me_t2} | "
+            f"H4-Trigger aktiv={_h4_restored}")
     except Exception as e:
         log(f"[load_state] Fehler: {e}")
 
