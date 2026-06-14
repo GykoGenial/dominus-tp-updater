@@ -10699,7 +10699,7 @@ def _sim_check_tp_sl():
 
 def main():
     if PURE_SIM:
-        log("DOMINUS Demo-Bot v4.54 gestartet [PURE_SIM — kein Exchange benötigt]")
+        log("DOMINUS Demo-Bot v4.60 gestartet [PURE_SIM — kein Exchange benötigt]")
         log(f"  Virtuelles Kapital: {SIM_BALANCE:.2f} USDT")
         log("  Alle Exchange-Writes simuliert | Mark-Price (read-only) aktiv")
     else:
@@ -10708,7 +10708,7 @@ def main():
             log("In Railway → Variables eintragen (Demo-Keys aus Bitget Demo-Konto).")
             log("  → Bitget: Futures → Klassisches Demo-Trading → API-Keys erstellen")
             return
-        log("DOMINUS Demo-Bot v4.54 gestartet [DEMO-MODUS — Paper Trading]")
+        log("DOMINUS Demo-Bot v4.60 gestartet [DEMO-MODUS — Paper Trading]")
         log("  Bitget Demo-Account Keys aktiv (DEMO_API_KEY / DEMO_SECRET_KEY)")
         log("  Kein paperId-Header — Demo-Routing via separate API-Credentials")
     log(f"  Telegram Demo-Kanal: {TELEGRAM_CHAT_ID}")
