@@ -4554,8 +4554,15 @@ def set_sl_harsi(symbol: str, direction: str, harsi_price: float, cur_size: floa
             f"⚠️ Harsi-Momentum dreht — SL auf Ausstiegslinie gesetzt"
         )
     else:
+        _harsi_sl_str = f"{current_sl:.5f}" if current_sl > 0 else "—"
+        _harsi_err = (
+            f"❌ <b>Harsi-SL fehlgeschlagen — {symbol}</b>\n"
+            f"Versuch: {sl_str}  |  Bestehender SL: {_harsi_sl_str}\n"
+            f"Bestehender SL bleibt aktiv — bitte manuell prüfen!"
+        )
         log(f"  ✗ Harsi-SL fehlgeschlagen: {result.get('msg', result)}")
-        telegram_system(f"❌ <b>Harsi-SL fehlgeschlagen — {symbol}</b>\nBitte SL manuell prüfen!")
+        telegram_system(_harsi_err)
+        telegram_coin(symbol, _harsi_err)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -5854,6 +5861,7 @@ def verify_tp_orders(symbol: str, expected_count: int,
            f"FIX16: Auto-Repair wird in 5s gestartet...")
     log(msg.replace("<b>", "").replace("</b>", ""))
     telegram_system(msg)
+    telegram_coin(symbol, msg)
     return False
 
 
@@ -5959,6 +5967,10 @@ def _update_tp_for_position_impl(pos: dict, reason: str):
             if count > 0:
                 log(f"  ✓ FIX16 Auto-Repair: {count}/4 TPs neu gesetzt")
                 _verify_ok = True
+                telegram_coin(symbol,
+                    f"✅ <b>Auto-Repair — {symbol}</b>\n"
+                    f"{count}/4 TPs erfolgreich neu gesetzt."
+                )
             else:
                 log(f"  ✗ FIX16 Auto-Repair fehlgeschlagen — /refresh empfohlen")
                 telegram_system(
@@ -10458,28 +10470,47 @@ def flush_h4_buffer():
     if longs:
         lines.append("🟢↗️ <b>LONG:</b>")
         for item in longs:
-            lnk = tv_chart_links(item["symbol"])
-            lines.append(f"  \u2022 {item['symbol']}  @ {item['entry']:.5f}")
-            lines.append(f"    {lnk['coin_h4']}")
+            sym = item["symbol"].replace("USDT", "")
+            lines.append(f"  \u2022 {sym}  @ {item['entry']:.5f}")
     if longs and shorts:
         lines.append("")
     if shorts:
         lines.append("🔴↘️ <b>SHORT:</b>")
         for item in shorts:
-            lnk = tv_chart_links(item["symbol"])
-            lines.append(f"  \u2022 {item['symbol']}  @ {item['entry']:.5f}")
-            lines.append(f"    {lnk['coin_h4']}")
+            sym = item["symbol"].replace("USDT", "")
+            lines.append(f"  \u2022 {sym}  @ {item['entry']:.5f}")
+    lines.append("")
+    lines.append("\u23f1 H2-Alarm f\u00fcr relevante Coins aktivieren")
 
+    # Inline-Keyboard aufbauen (3 Buttons pro Zeile)
+    def _chunk(lst, n):
+        for i in range(0, len(lst), n):
+            yield lst[i:i + n]
+
+    keyboard = []
+    if longs:
+        long_btns = [
+            {"text": f"\U0001f4c8 {i['symbol'].replace('USDT', '')}",
+             "url": tv_chart_links(i["symbol"])["coin_h4"]}
+            for i in longs
+        ]
+        keyboard += list(_chunk(long_btns, 3))
+    if longs and shorts:
+        keyboard.append([{"text": "\u2014\u2014 SHORT \u2014\u2014", "callback_data": "noop"}])
+    if shorts:
+        short_btns = [
+            {"text": f"\U0001f4c9 {i['symbol'].replace('USDT', '')}",
+             "url": tv_chart_links(i["symbol"])["coin_h4"]}
+            for i in shorts
+        ]
+        keyboard += list(_chunk(short_btns, 3))
     btc_lnk = tv_chart_links("BTCUSDT")
-    lines += [
-        "",
-        "\u23f1 H2-Alarm f\u00fcr relevante Coins aktivieren",
-        "",
-        "\U0001f4c8 Markt:",
-        f"BTC H2: {btc_lnk['btc_h2']}",
-        f"Total2: {btc_lnk['total2']}",
-    ]
-    telegram("\n".join(lines))
+    keyboard.append([
+        {"text": "\U0001f4ca BTC H2", "url": btc_lnk["btc_h2"]},
+        {"text": "\U0001f310 Total2",  "url": btc_lnk["total2"]},
+    ])
+
+    telegram("\n".join(lines), reply_markup={"inline_keyboard": keyboard})
     log(f"H4-Zusammenfassung gesendet: {len(longs)} Long, {len(shorts)} Short")
 
 
@@ -13106,7 +13137,7 @@ def main():
         log("In Railway → Variables eintragen.")
         return
 
-    log("DOMINUS Trade-Automatisierung v4.59 gestartet — Bybit-Integration + Quarter-Kelly + Circuit-Breaker")
+    log("DOMINUS Trade-Automatisierung v4.60 gestartet — H4-Gate + Bybit + Quarter-Kelly + Circuit-Breaker")
     log(f"Intervall: {POLL_INTERVAL}s")
     log("Warte auf neue Trades...")
     log("─" * 55)
